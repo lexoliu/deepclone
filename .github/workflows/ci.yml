@@ -1,10 +1,10 @@
 name: ci
 on:
   pull_request:
-    paths: ["Cargo.toml", "Cargo.lock", "src/**", "tests/**", "export/**", ".github/workflows/ci.yml"]
+    paths: ["Cargo.toml", "Cargo.lock", "src/**", "tests/**", "export/**", "dist-workspace.toml", "release-plz.toml", ".github/**"]
   push:
     branches: [main]
-    paths: ["Cargo.toml", "Cargo.lock", "src/**", "tests/**", "export/**", ".github/workflows/ci.yml"]
+    paths: ["Cargo.toml", "Cargo.lock", "src/**", "tests/**", "export/**", "dist-workspace.toml", "release-plz.toml", ".github/**"]
   workflow_dispatch:
 permissions:
   contents: read
@@ -38,3 +38,21 @@ jobs:
       - run: uv run --directory export --locked ruff check .
       - run: uv run --directory export --locked ruff format --check .
       - run: uv run --directory export --locked python -m unittest discover -s tests
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
+        with:
+          tool: cargo-dist@0.34.0,actionlint@1.7.12
+      - run: actionlint
+      - run: python3 -m unittest discover -s .github/scripts
+      - run: dist plan --output-format=json > dist-plan.json
+      - run: python3 .github/scripts/check_release.py dist-plan.json
+      - name: Verify release packaging without publishing
+        run: |
+          dist build --artifacts=local --output-format=json > local-dist-manifest.json
+          dist build --artifacts=global --output-format=json > global-dist-manifest.json
+          python3 .github/scripts/release_assets.py local-dist-manifest.json global-dist-manifest.json
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: deepclone-release-preview
+          path: target/release-assets/
+          if-no-files-found: error
+          retention-days: 90
