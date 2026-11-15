@@ -1,8 +1,8 @@
 """Collect only cargo-dist's declared upload files from local and global builds."""
 
+import argparse
 import json
 import shutil
-import sys
 from pathlib import Path
 
 
@@ -22,7 +22,11 @@ def collect(manifests, output):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("manifests", type=Path, nargs="+")
+    args = parser.parse_args()
     collect(
-        [json.loads(Path(path).read_text()) for path in sys.argv[1:]],
-        Path("target/release-assets"),
+        [json.loads(path.read_text()) for path in args.manifests],
+        args.output,
     )

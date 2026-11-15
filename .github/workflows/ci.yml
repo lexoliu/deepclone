@@ -57,11 +57,11 @@ jobs:
           dist build --artifacts=local --output-format=json > local-dist-manifest.json
           cp local-dist-manifest.json target/distrib/aarch64-apple-darwin-dist-manifest.json
           dist build --artifacts=global --output-format=json > global-dist-manifest.json
-          python3 .github/scripts/release_assets.py local-dist-manifest.json global-dist-manifest.json
-          python3 .github/scripts/check_release_artifacts.py target/release-assets
+          python3 .github/scripts/release_assets.py --output "$RUNNER_TEMP/release-assets" local-dist-manifest.json global-dist-manifest.json
+          python3 .github/scripts/check_release_artifacts.py "$RUNNER_TEMP/release-assets"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: deepclone-release-preview
-          path: target/release-assets/
+          path: ${{ runner.temp }}/release-assets/
           if-no-files-found: error
           retention-days: 90
