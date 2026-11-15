@@ -47,6 +47,8 @@ pub enum Error {
     PrematureEos,
     #[error("inference worker stopped without completing the session")]
     WorkerStopped,
+    #[error("text forwarding stopped without EOF")]
+    InputStopped,
     #[error("session cancelled")]
     Cancelled,
 }

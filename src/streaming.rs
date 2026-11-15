@@ -93,7 +93,7 @@ pub struct Voice {
 struct Request {
     language: String,
     options: Options,
-    text: Receiver<String>,
+    text: Receiver<Option<String>>,
     audio: Sender<Result<AudioChunk, Error>>,
     completion: Sender<Generation>,
 }
@@ -169,7 +169,14 @@ impl Voice {
         let cancellation = output.clone();
         let policy = options.clone();
         let feeder = runtime.spawn(async move {
-            let result = feed(text, input, policy).await;
+            // Keep a sender alive until the error is published and cancellation
+            // is signalled. A worker cannot mistake this gap for normal EOF.
+            let input_lifetime = input.clone();
+            let result = future::race(feed(text, input, policy), async {
+                input_lifetime.closed().await;
+                Ok(())
+            })
+            .await;
             tracing::debug!("text forwarding ended");
             if let Err(error) = result {
                 let _ = input_error.send(error).await;
@@ -237,16 +244,19 @@ fn serve<T: TokenSampler, S: TokenSampler>(
                 } else if !session.finished {
                     tracing::trace!("waiting for text");
                     match request.text.recv_blocking() {
-                        Ok(text) => {
+                        Ok(Some(text)) => {
                             tracing::trace!(bytes = text.len(), "text received");
                             session.push_text(&text)?;
+                        }
+                        Ok(None) => {
+                            tracing::debug!("finishing text input");
+                            session.finish_input()?;
                         }
                         Err(_) => {
                             if request.audio.is_closed() {
                                 return Ok(());
                             }
-                            tracing::debug!("finishing text input");
-                            session.finish_input()?;
+                            return Err(Error::InputStopped);
                         }
                     }
                 }
@@ -340,7 +350,7 @@ impl<E> Stream for AudioStream<'_, E> {
             if result.is_err() {
                 this.cancel();
                 this.terminal = true;
-                return Poll::Ready(Some(Err(StreamError::Inference(Error::WorkerStopped))));
+                return Poll::Ready(Some(Err(StreamError::Inference(Error::InputStopped))));
             }
             // The producer may have completed between the earlier poll and
             // this one. Its error always takes precedence over worker EOF.
@@ -376,7 +386,7 @@ impl<E> Stream for AudioStream<'_, E> {
     }
 }
 
-async fn feed<I, E>(input: I, output: Sender<String>, options: Options) -> Result<(), E>
+async fn feed<I, E>(input: I, output: Sender<Option<String>>, options: Options) -> Result<(), E>
 where
     I: Stream<Item = Result<String, E>>,
 {
@@ -411,7 +421,11 @@ where
                     count += 1;
                     changed = Instant::now();
                     if count == options.text_chunk_chars.get() {
-                        if output.send(std::mem::take(&mut buffer)).await.is_err() {
+                        if output
+                            .send(Some(std::mem::take(&mut buffer)))
+                            .await
+                            .is_err()
+                        {
                             return Ok(());
                         }
                         count = 0;
@@ -420,7 +434,11 @@ where
                 // A sentence boundary can advance immediately. It still goes
                 // through incremental tokenization; no utterance is restarted.
                 if buffer.ends_with(['。', '！', '？', '.', '!', '?', '\n']) {
-                    if output.send(std::mem::take(&mut buffer)).await.is_err() {
+                    if output
+                        .send(Some(std::mem::take(&mut buffer)))
+                        .await
+                        .is_err()
+                    {
                         return Ok(());
                     }
                     count = 0;
@@ -428,13 +446,18 @@ where
             }
             Some(None) => {
                 tracing::debug!("text source ended");
-                if !buffer.is_empty() {
-                    let _ = output.send(buffer).await;
+                if !buffer.is_empty() && output.send(Some(buffer)).await.is_err() {
+                    return Ok(());
                 }
+                let _ = output.send(None).await;
                 return Ok(());
             }
             None => {
-                if output.send(std::mem::take(&mut buffer)).await.is_err() {
+                if output
+                    .send(Some(std::mem::take(&mut buffer)))
+                    .await
+                    .is_err()
+                {
                     return Ok(());
                 }
                 count = 0;
@@ -479,7 +502,7 @@ mod tests {
             tokio::task::yield_now().await;
             assert_eq!(rx.len(), 1);
             let mut combined = String::new();
-            while let Ok(part) = rx.recv().await {
+            while let Ok(Some(part)) = rx.recv().await {
                 assert!(part.chars().count() <= 4);
                 combined.push_str(&part);
             }
@@ -506,6 +529,7 @@ mod tests {
             let text = tokio::time::timeout(Duration::from_secs(1), rx.recv())
                 .await
                 .unwrap()
+                .unwrap()
                 .unwrap();
             assert!(!text.is_empty());
             assert!(text.len() < 100);
@@ -514,21 +538,26 @@ mod tests {
         });
     }
 
-    #[test]
-    fn output_drop_cancels_an_idle_input_source() {
+    fn pending_input(
+        dropped: Arc<AtomicBool>,
+    ) -> impl Stream<Item = Result<String, Infallible>> + Send {
         struct Guard(Arc<AtomicBool>);
         impl Drop for Guard {
             fn drop(&mut self) {
                 self.0.store(true, Ordering::SeqCst);
             }
         }
+        futures_lite::stream::unfold(Guard(dropped), |guard| async {
+            future::pending::<()>().await;
+            Some((Ok::<_, Infallible>(String::new()), guard))
+        })
+    }
+
+    #[test]
+    fn output_drop_cancels_an_idle_input_source() {
         runtime().block_on(async {
             let dropped = Arc::new(AtomicBool::new(false));
-            let guard = Guard(dropped.clone());
-            let input = futures_lite::stream::unfold(guard, |guard| async {
-                future::pending::<()>().await;
-                Some((Ok::<_, Infallible>(String::new()), guard))
-            });
+            let input = pending_input(dropped.clone());
             let (requests, incoming) = async_channel::bounded(1);
             let mut voice = Voice {
                 requests,
@@ -568,6 +597,51 @@ mod tests {
             assert!(stream.next().await.is_none());
             assert!(stream.generation().is_none());
             assert!(request.audio.is_closed());
+        });
+    }
+
+    #[test]
+    fn worker_exit_cancels_input_without_polling_audio() {
+        runtime().block_on(async {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let (requests, incoming) = async_channel::bounded(1);
+            let mut voice = Voice {
+                requests,
+                sample_rate: 24000,
+            };
+            let audio = voice
+                .synthesize(pending_input(dropped.clone()), "English", options())
+                .await
+                .unwrap();
+            let request = incoming.recv().await.unwrap();
+            drop(request);
+            tokio::task::yield_now().await;
+            assert!(dropped.load(Ordering::SeqCst));
+            drop(audio);
+        });
+    }
+
+    #[test]
+    fn producer_panic_does_not_send_eof() {
+        runtime().block_on(async {
+            let (requests, incoming) = async_channel::bounded(1);
+            let mut voice = Voice {
+                requests,
+                sample_rate: 24000,
+            };
+            let input =
+                futures_lite::stream::poll_fn(|_| -> Poll<Option<Result<String, Infallible>>> {
+                    panic!("producer fixture failure")
+                });
+            let mut audio = voice.synthesize(input, "English", options()).await.unwrap();
+            let request = incoming.recv().await.unwrap();
+            assert!(request.text.recv().await.is_err());
+            assert!(matches!(
+                audio.next().await,
+                Some(Err(StreamError::Inference(Error::InputStopped)))
+            ));
+            assert!(audio.next().await.is_none());
+            assert!(audio.generation().is_none());
         });
     }
 }
