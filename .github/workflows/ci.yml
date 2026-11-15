@@ -41,6 +41,10 @@ jobs:
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
         with:
           tool: cargo-dist@0.34.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: stable
+          cache: false
       - name: Check workflows
         run: |
           go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
