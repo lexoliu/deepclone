@@ -31,6 +31,11 @@ jobs:
           fetch-depth: 0
       - id: gate
         run: python3 .github/scripts/release_gate.py
+      - name: Attach the tested commit to the release PR base branch
+        if: steps.gate.outputs.kind == 'pr'
+        env:
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: git switch -C main "$TESTED_SHA"
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         if: steps.gate.outputs.kind != 'skip'
         with:
