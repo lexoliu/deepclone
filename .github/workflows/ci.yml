@@ -40,8 +40,11 @@ jobs:
       - run: uv run --directory export --locked python -m unittest discover -s tests
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
         with:
-          tool: cargo-dist@0.34.0,actionlint@1.7.12
-      - run: actionlint
+          tool: cargo-dist@0.34.0
+      - name: Check workflows
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          "$(go env GOPATH)/bin/actionlint"
       - run: python3 -m unittest discover -s .github/scripts
       - run: dist plan --output-format=json > dist-plan.json
       - run: python3 .github/scripts/check_release.py dist-plan.json
