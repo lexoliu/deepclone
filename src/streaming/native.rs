@@ -21,7 +21,7 @@
 //! ```
 use super::{Clock, Options};
 use crate::{
-    inference::{AudioChunk, Engine, Error, Generation, Reference, Sampling, Synthesis, Waveform},
+    inference::{AudioChunk, Engine, Error, Generation, Reference, Synthesis, Waveform},
     sampling::TokenSampler,
 };
 use async_channel::{Receiver, Sender};
@@ -118,7 +118,7 @@ impl Voice {
     #[cfg(all(feature = "coreml", target_vendor = "apple"))]
     pub async fn load<T: TokenSampler + Send + 'static, S: TokenSampler + Send + 'static>(
         load: Load,
-        sampling: Sampling<T, S>,
+        sampling: crate::inference::Sampling<T, S>,
     ) -> Result<Self, Error> {
         Self::load_with(
             move || async move {

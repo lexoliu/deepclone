@@ -2510,6 +2510,7 @@ dependencies = [
  "burn",
  "clap",
  "futures-lite",
+ "getrandom 0.4.3",
  "gloo-timers",
  "hound",
  "js-sys",
