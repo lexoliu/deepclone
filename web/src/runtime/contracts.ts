@@ -27,6 +27,7 @@ export type Event =
   | { kind: "conditioned" }
   | { kind: "started" }
   | { kind: "done" }
+  | { kind: "cancelled" }
   | { kind: "accepted"; id: number }
   | { kind: "audio"; id: number; samples: Float32Array; sampleRate: number }
   | { kind: "error"; message: string };

@@ -8,6 +8,8 @@ export function useVoice() {
     new Map<string, { resolve: () => void; reject: (error: Error) => void }>(),
   );
   const sequence = useRef(0);
+  const cancelling = useRef(false);
+  const operation = useRef(0);
   const audioUrl = useRef<string | null>(null);
   const [status, setStatus] = useState("Choose a model to begin");
   const [loaded, setLoaded] = useState(false);
@@ -29,6 +31,7 @@ export function useVoice() {
   }
   function fail(reason: unknown) {
     const value = reason instanceof Error ? reason : new Error(String(reason));
+    if (cancelling.current) return;
     setError(value.message);
     setBusy(false);
     setRunning(false);
@@ -46,6 +49,15 @@ export function useVoice() {
       fail(new Error(event.message || "Inference worker failed."));
     instance.onmessage = (message: MessageEvent<Event>) => {
       const event = message.data;
+      if (event.kind === "cancelled") {
+        for (const request of pending.current.values())
+          request.reject(new DOMException("Cancelled", "AbortError"));
+        pending.current.clear();
+        setRunning(false);
+        setBusy(false);
+        setStatus("Cancelled");
+        return;
+      }
       if (event.kind === "error") {
         fail(new Error(event.message));
         return;
@@ -83,6 +95,7 @@ export function useVoice() {
         void active
           ?.finish()
           .then(() => {
+            if (cancelling.current) return;
             if (audioUrl.current) URL.revokeObjectURL(audioUrl.current);
             audioUrl.current = URL.createObjectURL(active.wav());
             setAudio(audioUrl.current);
@@ -104,6 +117,7 @@ export function useVoice() {
     };
   }, []);
   async function load(model: ModelEntry, context: number, seed: bigint) {
+    cancelling.current = false;
     setError(null);
     setBusy(true);
     setLoaded(false);
@@ -134,23 +148,30 @@ export function useVoice() {
     chunkFrames: number,
     live: boolean,
   ) {
+    cancelling.current = false;
     setError(null);
     setBusy(true);
     setSeconds(0);
     setAudio(null);
     setStatus("Preparing reference voice");
+    const current = ++operation.current;
     try {
       if (player.current) await player.current.close();
+      if (current !== operation.current) return;
       player.current = new Player();
       await player.current.resume();
       const samples = await referenceAudio(file);
+      if (current !== operation.current) return;
       const conditioned = wait("conditioned");
       send({ kind: "reference", samples, transcript }, [samples.buffer]);
       await conditioned;
+      if (current !== operation.current) return;
       const started = wait("started");
       send({ kind: "start", language, frames, chunkFrames });
       await started;
+      if (current !== operation.current) return;
       await push(text);
+      if (current !== operation.current) return;
       if (!live) send({ kind: "finish" });
     } catch (reason) {
       fail(reason);
@@ -161,11 +182,11 @@ export function useVoice() {
     setStatus("Finishing speech");
   }
   function cancel() {
+    operation.current++;
+    cancelling.current = true;
     send({ kind: "cancel" });
     void player.current?.close();
-    setRunning(false);
-    setBusy(false);
-    setStatus("Cancelled");
+    setStatus("Cancelling…");
   }
   return {
     status,

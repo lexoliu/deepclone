@@ -61,6 +61,7 @@ export class Player {
     return encodeWav(this.chunks, this.rate);
   }
   async close() {
+    if (this.context.state === "closed") return;
     for (const source of this.sources) source.stop();
     await this.context.close();
   }

@@ -123,3 +123,51 @@ test("recording requires confirmation and can be replaced", async ({
   await expect(page.getByLabel("Review your recording")).toHaveCount(0);
   await context.close();
 });
+
+test("cancellation waits for the inference worker before allowing another request", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "gpu", { value: {}, configurable: true });
+    class TestWorker {
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onerror = null;
+      postMessage(command: { kind: string }) {
+        if (command.kind === "cancel") {
+          (
+            window as unknown as { completeCancellation: () => void }
+          ).completeCancellation = () => {
+            this.onmessage?.(
+              new MessageEvent("message", { data: { kind: "cancelled" } }),
+            );
+          };
+        }
+      }
+      terminate() {}
+    }
+    Object.defineProperty(window, "Worker", { value: TestWorker });
+  });
+  await page.route("**/models.json", (route) =>
+    route.fulfill({
+      json: [
+        {
+          size: "0.6b",
+          manifest: "https://example.test/model.json",
+          sha256: "0".repeat(64),
+        },
+      ],
+    }),
+  );
+  await page.goto("/");
+  await page.getByRole("button", { name: "Load model" }).click();
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(page.getByText("Cancelling…", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("Model", { exact: true })).toBeDisabled();
+  await page.evaluate(() =>
+    (
+      window as unknown as { completeCancellation: () => void }
+    ).completeCancellation(),
+  );
+  await expect(page.getByText("Cancelled", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Load model" })).toBeEnabled();
+});
