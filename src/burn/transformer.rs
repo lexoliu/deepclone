@@ -1,5 +1,5 @@
 use super::{
-    Error, Weights,
+    Error, WeightSource,
     layers::{Linear, RmsNorm},
 };
 use burn::tensor::{Tensor, activation};
@@ -34,7 +34,7 @@ struct Layer {
 }
 impl Layer {
     fn load(
-        w: &Weights<'_>,
+        w: &impl WeightSource,
         prefix: &str,
         c: &DecoderConfig,
         capacity: usize,
@@ -56,8 +56,8 @@ impl Layer {
             gate: Linear::load(w, &format!("{prefix}.mlp.gate_proj"))?,
             up: Linear::load(w, &format!("{prefix}.mlp.up_proj"))?,
             down: Linear::load(w, &format!("{prefix}.mlp.down_proj"))?,
-            keys: Tensor::<4>::zeros(shape, &w.device).cast(w.dtype),
-            values: Tensor::<4>::zeros(shape, &w.device).cast(w.dtype),
+            keys: Tensor::<4>::zeros(shape, w.device()).cast(w.dtype()),
+            values: Tensor::<4>::zeros(shape, w.device()).cast(w.dtype()),
         })
     }
     fn forward(
@@ -148,7 +148,7 @@ pub struct Decoder {
 }
 impl Decoder {
     pub fn load(
-        weights: &Weights<'_>,
+        weights: &impl WeightSource,
         prefix: &str,
         config: DecoderConfig,
         capacity: std::num::NonZeroUsize,
@@ -168,8 +168,8 @@ impl Decoder {
             });
         }
         let (cosine, sine) = super::audio_transformer::rotary_tables(
-            &weights.device,
-            weights.dtype,
+            weights.device(),
+            weights.dtype(),
             capacity,
             config.head_dim,
             config.rope_theta,

@@ -1,5 +1,5 @@
 use super::{
-    Error, Weights,
+    Error, WeightSource,
     layers::{LayerNorm, Linear, RmsNorm},
 };
 use burn::tensor::{DType, Device, Int, Tensor, TensorData, activation};
@@ -15,11 +15,11 @@ pub struct AttentionConfig {
     pub rope_theta: f32,
 }
 pub(crate) trait Norm: Sized {
-    fn load(w: &Weights<'_>, p: &str, epsilon: f32) -> Result<Self, Error>;
+    fn load(w: &impl WeightSource, p: &str, epsilon: f32) -> Result<Self, Error>;
     fn apply(&self, x: Tensor<3>) -> Tensor<3>;
 }
 impl Norm for RmsNorm {
-    fn load(w: &Weights<'_>, p: &str, e: f32) -> Result<Self, Error> {
+    fn load(w: &impl WeightSource, p: &str, e: f32) -> Result<Self, Error> {
         Self::load(w, p, e)
     }
     fn apply(&self, x: Tensor<3>) -> Tensor<3> {
@@ -27,7 +27,7 @@ impl Norm for RmsNorm {
     }
 }
 impl Norm for LayerNorm {
-    fn load(w: &Weights<'_>, p: &str, e: f32) -> Result<Self, Error> {
+    fn load(w: &impl WeightSource, p: &str, e: f32) -> Result<Self, Error> {
         Self::load(w, p, e)
     }
     fn apply(&self, x: Tensor<3>) -> Tensor<3> {
@@ -35,7 +35,7 @@ impl Norm for LayerNorm {
     }
 }
 pub(crate) trait FeedForward: Sized {
-    fn load(w: &Weights<'_>, p: &str) -> Result<Self, Error>;
+    fn load(w: &impl WeightSource, p: &str) -> Result<Self, Error>;
     fn apply(&self, x: Tensor<3>) -> Tensor<3>;
 }
 pub(crate) struct Gated {
@@ -44,7 +44,7 @@ pub(crate) struct Gated {
     down: Linear,
 }
 impl FeedForward for Gated {
-    fn load(w: &Weights<'_>, p: &str) -> Result<Self, Error> {
+    fn load(w: &impl WeightSource, p: &str) -> Result<Self, Error> {
         Ok(Self {
             gate: Linear::load(w, &format!("{p}.gate_proj"))?,
             up: Linear::load(w, &format!("{p}.up_proj"))?,
@@ -61,7 +61,7 @@ pub(crate) struct Gelu {
     last: Linear,
 }
 impl FeedForward for Gelu {
-    fn load(w: &Weights<'_>, p: &str) -> Result<Self, Error> {
+    fn load(w: &impl WeightSource, p: &str) -> Result<Self, Error> {
         Ok(Self {
             first: Linear::load(w, &format!("{p}.fc1"))?,
             last: Linear::load(w, &format!("{p}.fc2"))?,
@@ -83,7 +83,7 @@ struct Layer<N, F> {
     mlp_scale: Tensor<1>,
 }
 impl<N: Norm, F: FeedForward> Layer<N, F> {
-    fn load(w: &Weights<'_>, p: &str, e: f32) -> Result<Self, Error> {
+    fn load(w: &impl WeightSource, p: &str, e: f32) -> Result<Self, Error> {
         Ok(Self {
             input: N::load(w, &format!("{p}.input_layernorm"), e)?,
             post: N::load(w, &format!("{p}.post_attention_layernorm"), e)?,
@@ -149,7 +149,7 @@ pub(crate) struct AudioTransformer<N, F> {
 }
 impl<N: Norm, F: FeedForward> AudioTransformer<N, F> {
     pub fn load(
-        w: &Weights<'_>,
+        w: &impl WeightSource,
         p: &str,
         c: AttentionConfig,
         epsilon: f32,

@@ -2510,7 +2510,9 @@ dependencies = [
  "burn",
  "clap",
  "futures-lite",
+ "gloo-timers",
  "hound",
+ "js-sys",
  "ondevice",
  "ondevice-coreml",
  "rand 0.10.3",
@@ -2524,6 +2526,9 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-time",
 ]
 
 [[package]]

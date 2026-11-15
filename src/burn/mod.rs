@@ -67,7 +67,7 @@ impl<'a> Weights<'a> {
         };
         let data = TensorData::from_bytes_vec(source.data().to_vec(), source.shape(), dtype)
             .convert_dtype(self.dtype);
-        Ok(Tensor::from_data(data, &self.device))
+        Ok(Tensor::from_data(data, (&self.device, self.dtype)))
     }
     pub fn indices<const D: usize>(&self, name: &str) -> Result<Tensor<D, Int>, Error> {
         let source = self.tensors.tensor(name)?;
@@ -109,3 +109,102 @@ pub async fn read<const D: usize>(tensor: Tensor<D>) -> Result<Vec<f32>, Error> 
         .try_into_vec::<f32>()
         .map_err(|e| Error::Execution(e.to_string()))
 }
+
+mod model;
+pub use model::{AudioConfig, Burn, SpeechConfig};
+
+/// Weight providers separate model construction from file or network storage.
+pub trait WeightSource {
+    fn device(&self) -> &Device;
+    fn dtype(&self) -> DType;
+    fn tensor<const D: usize>(&self, name: &str) -> Result<Tensor<D>, Error>;
+    fn optional<const D: usize>(&self, name: &str) -> Result<Option<Tensor<D>>, Error>;
+}
+impl WeightSource for Weights<'_> {
+    fn device(&self) -> &Device {
+        &self.device
+    }
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+    fn tensor<const D: usize>(&self, name: &str) -> Result<Tensor<D>, Error> {
+        self.tensor(name)
+    }
+    fn optional<const D: usize>(&self, name: &str) -> Result<Option<Tensor<D>>, Error> {
+        self.optional(name)
+    }
+}
+/// GPU-resident shards. Each source byte buffer may be released after upload.
+pub struct UploadedWeights {
+    device: Device,
+    dtype: DType,
+    tensors: std::collections::BTreeMap<String, (Tensor<1>, Vec<usize>)>,
+}
+impl UploadedWeights {
+    pub fn new(device: Device, dtype: DType) -> Self {
+        Self {
+            device,
+            dtype,
+            tensors: Default::default(),
+        }
+    }
+    pub fn upload(&mut self, bytes: &[u8], dtype: DType) -> Result<(), Error> {
+        let shard = SafeTensors::deserialize(bytes)?;
+        for (name, source) in shard.tensors() {
+            if self.tensors.contains_key(&name) {
+                return Err(Error::Tensor {
+                    name,
+                    reason: "duplicate tensor in weight shards".into(),
+                });
+            }
+            let source_dtype = match source.dtype() {
+                Dtype::F32 => DType::F32,
+                Dtype::F16 => DType::F16,
+                Dtype::BF16 => DType::BF16,
+                other => {
+                    return Err(Error::Tensor {
+                        name,
+                        reason: format!("unsupported dtype {other:?}"),
+                    });
+                }
+            };
+            let shape = source.shape().to_vec();
+            let elements = shape.iter().product::<usize>();
+            let data = TensorData::from_bytes_vec(source.data().to_vec(), [elements], source_dtype)
+                .convert_dtype(dtype);
+            self.tensors.insert(
+                name,
+                (Tensor::from_data(data, (&self.device, dtype)), shape),
+            );
+        }
+        Ok(())
+    }
+}
+impl WeightSource for UploadedWeights {
+    fn device(&self) -> &Device {
+        &self.device
+    }
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+    fn tensor<const D: usize>(&self, name: &str) -> Result<Tensor<D>, Error> {
+        let (tensor, shape) = self.tensors.get(name).ok_or_else(|| Error::Tensor {
+            name: name.into(),
+            reason: "missing tensor".into(),
+        })?;
+        let shape: [usize; D] = shape.clone().try_into().map_err(|_| Error::Tensor {
+            name: name.into(),
+            reason: format!("expected rank {D}"),
+        })?;
+        Ok(tensor.clone().reshape(shape))
+    }
+    fn optional<const D: usize>(&self, name: &str) -> Result<Option<Tensor<D>>, Error> {
+        if self.tensors.contains_key(name) {
+            self.tensor(name).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+pub mod package;

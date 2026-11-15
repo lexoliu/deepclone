@@ -1,0 +1,12 @@
+[
+  {
+    "size": "0.6b",
+    "manifest": "https://huggingface.co/lexoliu/deepclone-qwen3-tts-burn/resolve/e01cb51156312e0a4e589e33ff22704fac148d04/0.6b/manifest.json",
+    "sha256": "152346e3f3649ad8ce921ff9f2004e3c12818764fe3790c72807c2056dd9f6ad"
+  },
+  {
+    "size": "1.7b",
+    "manifest": "https://huggingface.co/lexoliu/deepclone-qwen3-tts-burn/resolve/e01cb51156312e0a4e589e33ff22704fac148d04/1.7b/manifest.json",
+    "sha256": "0aa6ddd9b54f78ddc0fe38651ee135165e526335769da047354a8565230008a4"
+  }
+]

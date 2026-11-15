@@ -1,4 +1,4 @@
-use super::{Error, Weights};
+use super::{Error, WeightSource};
 use burn::tensor::{DType, Tensor};
 
 pub(crate) struct Linear {
@@ -6,7 +6,7 @@ pub(crate) struct Linear {
     bias: Option<Tensor<1>>,
 }
 impl Linear {
-    pub fn load(weights: &Weights<'_>, prefix: &str) -> Result<Self, Error> {
+    pub fn load(weights: &impl WeightSource, prefix: &str) -> Result<Self, Error> {
         Ok(Self {
             weight: weights
                 .tensor::<2>(&format!("{prefix}.weight"))?
@@ -28,7 +28,7 @@ pub(crate) struct RmsNorm {
     epsilon: f32,
 }
 impl RmsNorm {
-    pub fn load(weights: &Weights<'_>, prefix: &str, epsilon: f32) -> Result<Self, Error> {
+    pub fn load(weights: &impl WeightSource, prefix: &str, epsilon: f32) -> Result<Self, Error> {
         Ok(Self {
             weight: weights.tensor(&format!("{prefix}.weight"))?,
             epsilon,
@@ -93,7 +93,7 @@ pub(crate) struct Conv<P> {
 }
 impl<P: Padding> Conv<P> {
     pub fn load(
-        weights: &Weights<'_>,
+        weights: &impl WeightSource,
         prefix: &str,
         stride: usize,
         dilation: usize,
@@ -125,7 +125,7 @@ pub(crate) struct LayerNorm {
     epsilon: f64,
 }
 impl LayerNorm {
-    pub fn load(weights: &Weights<'_>, prefix: &str, epsilon: f32) -> Result<Self, Error> {
+    pub fn load(weights: &impl WeightSource, prefix: &str, epsilon: f32) -> Result<Self, Error> {
         Ok(Self {
             weight: weights.tensor(&format!("{prefix}.weight"))?,
             bias: weights.optional(&format!("{prefix}.bias"))?,
@@ -143,7 +143,7 @@ pub(crate) struct TransposeConv {
     stride: usize,
 }
 impl TransposeConv {
-    pub fn load(weights: &Weights<'_>, prefix: &str, stride: usize) -> Result<Self, Error> {
+    pub fn load(weights: &impl WeightSource, prefix: &str, stride: usize) -> Result<Self, Error> {
         Ok(Self {
             weight: weights.tensor(&format!("{prefix}.weight"))?,
             bias: weights.optional(&format!("{prefix}.bias"))?,

@@ -49,3 +49,23 @@ fn wgpu_incremental_decoder_matches_official_multilingual_outputs() {
         }
     });
 }
+
+#[test]
+#[ignore = "requires pinned multilingual embedding fixtures"]
+fn uploaded_and_file_weights_preserve_fp16_precision() {
+    futures_lite::future::block_on(async {
+        let fixture =
+            std::path::PathBuf::from(std::env::var_os("DEEPCLONE_BURN_FIXTURES").unwrap());
+        let bytes = std::fs::read(fixture.join("decoder-fixtures.safetensors")).unwrap();
+        let device = Device::wgpu_options().init_async().await.unwrap();
+        let source = Weights::new(&bytes, device.clone(), DType::F16).unwrap();
+        let mut uploaded = deepclone::burn::UploadedWeights::new(device, DType::F16);
+        uploaded.upload(&bytes, DType::F16).unwrap();
+        use deepclone::burn::WeightSource;
+        let a = source.tensor::<3>("input.0").unwrap();
+        let b = uploaded.tensor::<3>("input.0").unwrap();
+        assert_eq!(a.dtype(), DType::F16);
+        assert_eq!(b.dtype(), DType::F16);
+        assert_eq!(read(a).await.unwrap(), read(b).await.unwrap());
+    });
+}

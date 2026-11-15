@@ -1,5 +1,5 @@
 use super::{
-    Error, Weights,
+    Error, WeightSource,
     audio_transformer::{AttentionConfig, AudioTransformer, Gelu},
     layers::{Causal, CausalEdge, Conv, LayerNorm},
 };
@@ -25,7 +25,12 @@ struct Residual {
     shortcut: Option<Conv<Causal>>,
 }
 impl Residual {
-    fn load(w: &Weights<'_>, p: &str, dilation: usize, shortcut: bool) -> Result<Self, Error> {
+    fn load(
+        w: &impl WeightSource,
+        p: &str,
+        dilation: usize,
+        shortcut: bool,
+    ) -> Result<Self, Error> {
         Ok(Self {
             first: Conv::load(w, &format!("{p}.block.1.conv"), 1, dilation, 1, Causal)?,
             last: Conv::load(w, &format!("{p}.block.3.conv"), 1, 1, 1, Causal)?,
@@ -63,7 +68,7 @@ struct Quantizer {
     codebooks: Vec<Tensor<2>>,
 }
 impl Quantizer {
-    fn load(w: &Weights<'_>, p: &str, groups: usize) -> Result<Self, Error> {
+    fn load(w: &impl WeightSource, p: &str, groups: usize) -> Result<Self, Error> {
         let codebooks = (0..groups)
             .map(|i| {
                 let p = format!("{p}.layers.{i}.codebook");
@@ -111,7 +116,7 @@ pub struct CodecEncoder {
 }
 impl CodecEncoder {
     pub fn load(
-        w: &Weights<'_>,
+        w: &impl WeightSource,
         c: &EncoderConfig,
         groups: usize,
         downsample_rate: usize,
@@ -215,6 +220,7 @@ impl CodecEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::burn::Weights;
     use burn::tensor::{DType, Device};
     #[test]
     #[ignore = "requires pinned audio fixtures and model weights"]

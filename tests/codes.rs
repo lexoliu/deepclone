@@ -1,4 +1,4 @@
-#![cfg(all(feature = "inference", target_vendor = "apple"))]
+#![cfg(feature = "inference")]
 
 use deepclone::inference::AcousticCodes;
 use std::num::NonZeroUsize;

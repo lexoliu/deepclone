@@ -1,5 +1,5 @@
 use super::{
-    Error, Weights,
+    Error, WeightSource,
     audio_transformer::{AttentionConfig, AudioTransformer, Gated},
     layers::{Causal, Conv, LayerNorm, Linear, RmsNorm, TransposeConv},
 };
@@ -23,7 +23,7 @@ struct Quantizer {
     output: Conv<Causal>,
 }
 impl Quantizer {
-    fn load(w: &Weights<'_>, p: &str, groups: usize) -> Result<Self, Error> {
+    fn load(w: &impl WeightSource, p: &str, groups: usize) -> Result<Self, Error> {
         let codebooks = (0..groups)
             .map(|i| {
                 let p = format!("{p}.vq.layers.{i}._codebook");
@@ -62,7 +62,7 @@ struct Snake {
     inverse_beta: Tensor<3>,
 }
 impl Snake {
-    fn load(w: &Weights<'_>, p: &str) -> Result<Self, Error> {
+    fn load(w: &impl WeightSource, p: &str) -> Result<Self, Error> {
         let alpha = w.tensor::<1>(&format!("{p}.alpha"))?.exp();
         let channels = alpha.dims()[0];
         // SnakeBeta specifies a 1e-9 denominator stabilizer.
@@ -84,7 +84,7 @@ struct Residual {
     conv2: Conv<Causal>,
 }
 impl Residual {
-    fn load(w: &Weights<'_>, p: &str, dilation: usize) -> Result<Self, Error> {
+    fn load(w: &impl WeightSource, p: &str, dilation: usize) -> Result<Self, Error> {
         Ok(Self {
             act1: Snake::load(w, &format!("{p}.act1"))?,
             conv1: Conv::load(w, &format!("{p}.conv1.conv"), 1, dilation, 1, Causal)?,
@@ -105,7 +105,7 @@ struct Upsample {
     residuals: Vec<Residual>,
 }
 impl Upsample {
-    fn load(w: &Weights<'_>, p: &str, stride: usize) -> Result<Self, Error> {
+    fn load(w: &impl WeightSource, p: &str, stride: usize) -> Result<Self, Error> {
         Ok(Self {
             activation: Snake::load(w, &format!("{p}.block.0"))?,
             conv: TransposeConv::load(w, &format!("{p}.block.1.conv"), stride)?,
@@ -133,7 +133,7 @@ struct ConvNext {
     gamma: Tensor<1>,
 }
 impl ConvNext {
-    fn load(w: &Weights<'_>, p: &str, channels: usize) -> Result<Self, Error> {
+    fn load(w: &impl WeightSource, p: &str, channels: usize) -> Result<Self, Error> {
         Ok(Self {
             depthwise: Conv::load(w, &format!("{p}.dwconv.conv"), 1, 1, channels, Causal)?,
             // Qwen3TTSTokenizerV2ConvNeXtBlock fixes LayerNorm epsilon to 1e-6.
@@ -174,7 +174,7 @@ pub struct CodecDecoder {
     last: Conv<Causal>,
 }
 impl CodecDecoder {
-    pub fn load(w: &Weights<'_>, c: &CodecDecoderConfig) -> Result<Self, Error> {
+    pub fn load(w: &impl WeightSource, c: &CodecDecoderConfig) -> Result<Self, Error> {
         if c.num_semantic_quantizers == 0 || c.num_quantizers <= c.num_semantic_quantizers {
             return Err(Error::Tensor {
                 name: "codec quantizer".into(),

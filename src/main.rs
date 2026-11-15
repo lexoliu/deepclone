@@ -1,13 +1,16 @@
 mod cli_io;
 
 use clap::{Parser, Subcommand};
+#[cfg(all(feature = "coreml", target_vendor = "apple"))]
+use deepclone::streaming::Load;
 use deepclone::{
     inference::Sampling,
     models::{Bundle, Installed, Store, Zenwave},
     sampling::{Greedy, Multinomial, Parameters, RepetitionPenalty, TokenSampler},
-    streaming::{Load, Options, ReferenceAudio, Voice},
+    streaming::{Options, ReferenceAudio, Voice},
 };
 use futures_lite::{Stream, StreamExt};
+#[cfg(all(feature = "coreml", target_vendor = "apple"))]
 use ondevice_coreml::ComputeUnits;
 use rand::{SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
@@ -55,9 +58,13 @@ fn parse_model(value: &str) -> Result<Bundle<'static>, String> {
 
 #[derive(clap::Args)]
 struct Synthesize {
-    #[arg(long, required_unless_present = "model", conflicts_with = "model")]
+    #[arg(long, conflicts_with_all=["model","transformers","audio_models"], help="Load a local Burn/WebGPU model package")]
+    burn_model: Option<PathBuf>,
+    #[arg(long, default_value = "2048", help = "KV context capacity for Burn")]
+    context: NonZeroUsize,
+    #[arg(long, required_unless_present_any = ["model", "burn_model"], conflicts_with = "model")]
     transformers: Option<PathBuf>,
-    #[arg(long, required_unless_present = "model", conflicts_with = "model")]
+    #[arg(long, required_unless_present_any = ["model", "burn_model"], conflicts_with = "model")]
     audio_models: Option<PathBuf>,
     #[arg(long, value_parser = parse_model, requires = "cache_dir", help = "Download or reuse published model: 0.6b or 1.7b")]
     model: Option<Bundle<'static>>,
@@ -257,21 +264,26 @@ async fn run<T: TokenSampler + Send + 'static, S: TokenSampler + Send + 'static>
     talker: T,
     predictor: S,
 ) -> Result<(), Box<dyn Error>> {
+    #[cfg(all(feature = "coreml", target_vendor = "apple"))]
     let units = match args.compute_units.as_str() {
         "cpu" => ComputeUnits::CpuOnly,
         "cpu-and-ne" => ComputeUnits::CpuAndNeuralEngine,
         "all" => ComputeUnits::All,
         _ => unreachable!("clap validates compute units"),
     };
-    let (transformers, audio) = match (&args.model, &args.cache_dir) {
-        (Some(model), Some(cache)) => {
-            let installed = download(model, cache).await?;
-            (installed.transformers(), installed.audio())
-        }
-        _ => (
-            args.transformers.clone().ok_or("missing --transformers")?,
-            args.audio_models.clone().ok_or("missing --audio-models")?,
-        ),
+    let paths = if args.burn_model.is_some() {
+        None
+    } else {
+        Some(match (&args.model, &args.cache_dir) {
+            (Some(model), Some(cache)) => {
+                let installed = download(model, cache).await?;
+                (installed.transformers(), installed.audio())
+            }
+            _ => (
+                args.transformers.clone().ok_or("missing --transformers")?,
+                args.audio_models.clone().ok_or("missing --audio-models")?,
+            ),
+        })
     };
     let mut reader = hound::WavReader::open(&args.reference)?;
     let spec = reader.spec();
@@ -292,25 +304,56 @@ async fn run<T: TokenSampler + Send + 'static, S: TokenSampler + Send + 'static>
     let transcript: Transcript =
         serde_json::from_reader(BufReader::new(File::open(&args.transcript)?))?;
     tracing::info!("loading models and encoding reference");
-    let mut voice = Voice::load(
-        Load {
-            transformers,
-            audio_models: audio,
-            compute_units: units,
-            reference: ReferenceAudio {
-                samples,
-                sample_rate: spec.sample_rate,
-                transcript: transcript.text,
-            },
-        },
-        Sampling {
-            talker,
-            predictor,
-            repetition: RepetitionPenalty::new(args.repetition_penalty)?,
-            minimum_frames: 2,
-        },
-    )
-    .await?;
+    let reference = ReferenceAudio {
+        samples,
+        sample_rate: spec.sample_rate,
+        transcript: transcript.text,
+    };
+    let sampling = Sampling {
+        talker,
+        predictor,
+        repetition: RepetitionPenalty::new(args.repetition_penalty)?,
+        minimum_frames: 2,
+    };
+    let mut voice = if let Some(path) = &args.burn_model {
+        #[cfg(feature = "burn")]
+        {
+            let path = path.clone();
+            let context = args.context;
+            Voice::load_with(
+                move || async move {
+                    deepclone::inference::Engine::from_burn_package(&path, context, sampling).await
+                },
+                reference,
+            )
+            .await?
+        }
+        #[cfg(not(feature = "burn"))]
+        {
+            let _ = path;
+            return Err("this binary was built without the burn feature".into());
+        }
+    } else {
+        #[cfg(all(feature = "coreml", target_vendor = "apple"))]
+        {
+            let (transformers, audio) = paths.ok_or("missing Core ML paths")?;
+            Voice::load(
+                Load {
+                    transformers,
+                    audio_models: audio,
+                    compute_units: units,
+                    reference,
+                },
+                sampling,
+            )
+            .await?
+        }
+        #[cfg(not(all(feature = "coreml", target_vendor = "apple")))]
+        {
+            let _ = paths;
+            return Err("Core ML is unavailable on this platform; pass --burn-model".into());
+        }
+    };
     tracing::info!(sample_rate = voice.sample_rate(), "voice ready");
     let mut options = Options::new(args.maximum_frames);
     if let Some(value) = args.audio_chunk_frames {
