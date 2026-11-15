@@ -8,10 +8,26 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from audio_models import CausalConv
 from transformer import Projection, RmsNorm, gated_silu
 
 
 class Equations(unittest.TestCase):
+    def test_causal_padding_preserves_every_stride_remainder(self):
+        for stride in [1, 2, 4, 5, 6, 8]:
+            conv = nn.Conv1d(2, 3, stride * 2, stride=stride)
+            for mode in ["constant", "replicate"]:
+                rewritten = CausalConv(
+                    SimpleNamespace(causal=True, conv=conv, pad_mode=mode)
+                )
+                for length in range(17, 17 + stride):
+                    x = torch.sin(
+                        torch.arange(2 * length).reshape(1, 2, length).float()
+                    )
+                    extra = (-length) % stride
+                    expected = conv(F.pad(x, (stride, extra), mode=mode))
+                    torch.testing.assert_close(rewritten(x), expected, rtol=0, atol=0)
+
     def test_projection_preserves_bias_and_channel_order(self):
         weight = torch.sin(torch.arange(128 * 256).reshape(128, 256).float()) / 32
         bias = torch.cos(torch.arange(128).float())

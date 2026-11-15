@@ -187,3 +187,24 @@ class CodecEmbedding(nn.Module):
 
     def forward(self, token):
         return self.embedding(token).transpose(1, 2).unsqueeze(2)
+
+
+class CodecFrame(nn.Module):
+    def __init__(self, talker):
+        super().__init__()
+        self.embeddings = nn.ModuleList(
+            [
+                talker.get_input_embeddings(),
+                *talker.code_predictor.get_input_embeddings(),
+            ]
+        )
+
+    def forward(self, codes, text):
+        embedded = torch.stack(
+            [
+                embedding(codes[:, index : index + 1])
+                for index, embedding in enumerate(self.embeddings)
+            ],
+            dim=0,
+        ).sum(dim=0)
+        return embedded.transpose(1, 2).unsqueeze(2) + text

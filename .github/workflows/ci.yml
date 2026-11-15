@@ -26,6 +26,12 @@ jobs:
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo nextest run --locked --all-features
       - run: cargo test --locked --all-features --doc
+      - run: cargo build --locked --features cli --bin deepclone
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: deepclone-aarch64-apple-darwin
+          path: target/debug/deepclone
+          retention-days: 90
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
         with:
           version: 0.9.16
