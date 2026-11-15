@@ -1,9 +1,9 @@
 #![cfg(all(feature = "cli", target_vendor = "apple"))]
 
 use deepclone::{
-    inference::Sampling,
+    inference::{Error, Sampling},
     sampling::{Greedy, Multinomial, Parameters, RepetitionPenalty},
-    streaming::{Load, Options, ReferenceAudio, Voice},
+    streaming::{Load, Options, ReferenceAudio, StreamError, Voice},
 };
 use futures_lite::{StreamExt, stream};
 use ondevice_coreml::ComputeUnits;
@@ -69,6 +69,8 @@ fn save(path: &Path, samples: &[f32], sample_rate: u32) {
 
 #[derive(Deserialize)]
 struct Baseline {
+    reached_eos: bool,
+    generated_frames: usize,
     prompt: Prompt,
     file: String,
 }
@@ -107,47 +109,75 @@ fn multilingual_streams_match_validated_codes_and_waveforms() {
                 .chars()
                 .map(|ch| Ok::<_, Infallible>(ch.to_string()))
                 .collect();
-            let result = voice
-                .synthesize(stream::iter(parts), &item.prompt.language, options())
-                .await
-                .unwrap()
-                .collect_audio()
+            let mut policy = options();
+            if !item.reached_eos {
+                policy.maximum_frames = NonZeroUsize::new(item.generated_frames).unwrap();
+            }
+            let mut audio = voice
+                .synthesize(stream::iter(parts), &item.prompt.language, policy)
                 .await
                 .unwrap();
+            let mut samples = Vec::new();
+            let mut truncated = None;
+            while let Some(chunk) = audio.next().await {
+                match chunk {
+                    Ok(chunk) => {
+                        assert_eq!(chunk.start_sample, samples.len());
+                        samples.extend(chunk.samples);
+                    }
+                    Err(StreamError::Inference(Error::FrameBudget { limit, codes }))
+                        if !item.reached_eos =>
+                    {
+                        assert_eq!(limit, item.generated_frames);
+                        truncated = Some(codes);
+                        assert!(audio.next().await.is_none());
+                        break;
+                    }
+                    Err(error) => panic!("unexpected synthesis error: {error}"),
+                }
+            }
+            let codes = if item.reached_eos {
+                audio.take_generation().expect("normal completion").codes
+            } else {
+                assert!(audio.generation().is_none());
+                truncated.expect("the truncated baseline must produce a budget error")
+            };
+            let sample_rate = audio.sample_rate();
+            drop(audio);
             let codes_path = Path::new(&item.file).with_extension("codes.json");
             let expected: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(baseline.join(codes_path)).unwrap()).unwrap();
             assert_eq!(
-                serde_json::to_value(&result.generation.codes).unwrap(),
+                serde_json::to_value(&codes).unwrap(),
                 expected["codes"],
                 "{} acoustic codes",
                 item.prompt.language
             );
             let mut reader = hound::WavReader::open(baseline.join(&item.file)).unwrap();
             let reference: Vec<_> = reader.samples::<f32>().map(Result::unwrap).collect();
-            assert_eq!(reference.len(), result.waveform.samples.len());
+            if item.reached_eos {
+                assert_eq!(reference.len(), samples.len());
+            } else {
+                assert!(!samples.is_empty() && samples.len() <= reference.len());
+            }
             let maximum = reference
                 .iter()
-                .zip(&result.waveform.samples)
+                .zip(&samples)
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
             let mse = reference
                 .iter()
-                .zip(&result.waveform.samples)
+                .zip(&samples)
                 .map(|(a, b)| f64::from(a - b).powi(2))
                 .sum::<f64>()
-                / reference.len() as f64;
-            reports.push(serde_json::json!({"language":item.prompt.language,"identical_codes":true,"samples":reference.len(),"maximum_absolute_error":maximum,"rmse":mse.sqrt()}));
+                / samples.len() as f64;
+            reports.push(serde_json::json!({"language":item.prompt.language,"identical_codes":true,"samples":samples.len(),"reached_eos":item.reached_eos,"maximum_absolute_error":maximum,"rmse":mse.sqrt()}));
             std::fs::write(
                 output.join("comparison.json"),
                 serde_json::to_vec_pretty(&reports).unwrap(),
             )
             .unwrap();
-            save(
-                &output.join(&item.file),
-                &result.waveform.samples,
-                result.waveform.sample_rate,
-            );
+            save(&output.join(&item.file), &samples, sample_rate);
             // Same Core ML graphs; allow only sub-milliscale float16 rounding.
             assert!(maximum < 1e-3, "waveform prefix changed by {maximum}");
         }

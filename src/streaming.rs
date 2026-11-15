@@ -46,6 +46,7 @@ use tokio::{
 #[derive(Clone, Debug)]
 pub struct Options {
     pub maximum_frames: NonZeroUsize,
+    /// Acoustic-code frames, not PCM samples. Published bundles use 80 ms per frame.
     pub audio_chunk_frames: NonZeroUsize,
     pub input_queue_chunks: NonZeroUsize,
     pub output_queue_chunks: NonZeroUsize,
@@ -205,6 +206,9 @@ fn serve<T: TokenSampler, S: TokenSampler>(
     requests: Receiver<Request>,
 ) {
     while let Ok(request) = requests.recv_blocking() {
+        if request.audio.is_closed() {
+            continue;
+        }
         tracing::debug!("session started");
         let result = (|| {
             let mut session = engine.session(

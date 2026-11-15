@@ -37,8 +37,12 @@ pub enum Error {
     Language(String),
     #[error("text has no stable token boundary within the configured {0}-byte buffer")]
     TextCapacity(usize),
-    #[error("generation exceeded the configured budget of {0} frames")]
-    FrameBudget(usize),
+    #[error("generation reached the configured budget of {limit} frames before EOS")]
+    FrameBudget {
+        limit: usize,
+        /// Valid acoustic codes up to the limit, including reference conditioning.
+        codes: AcousticCodes,
+    },
     #[error("model emitted audio EOS before consuming the complete text input")]
     PrematureEos,
     #[error("inference worker stopped without completing the session")]
@@ -124,7 +128,7 @@ pub struct Reference {
 
 /// Frame-major acoustic codes, including the conditioning prefix needed by
 /// the published chunked decoder. Construction validates matrix boundaries.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct AcousticCodes {
     groups: NonZeroUsize,
     values: Vec<u32>,
@@ -643,14 +647,17 @@ impl<T: TokenSampler, S: TokenSampler> CloningSession<'_, T, S> {
             self.sequence.prefill(embedded)?;
             self.prefix += 1;
         }
+        if self.codes.generated_frames() == self.maximum_frames {
+            return Err(Error::FrameBudget {
+                limit: self.maximum_frames,
+                codes: self.codes.clone(),
+            });
+        }
         let Some(text) = self.text_embedding()? else {
             return Ok(false);
         };
         match self.sequence.next_frame(&text)? {
             Some(frame) => {
-                if self.codes.generated_frames() == self.maximum_frames {
-                    return Err(Error::FrameBudget(self.maximum_frames));
-                }
                 self.codes.values.extend(frame);
             }
             None => {

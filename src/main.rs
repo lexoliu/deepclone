@@ -83,7 +83,7 @@ struct Synthesize {
     language: String,
     #[arg(
         long,
-        help = "PCM frames per audio chunk (library default when omitted)"
+        help = "Acoustic-code frames per audio chunk (library default when omitted)"
     )]
     audio_chunk_frames: Option<NonZeroUsize>,
     #[arg(long)]
