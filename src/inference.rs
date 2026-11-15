@@ -6,8 +6,8 @@ use crate::{
     sampling::{RepetitionPenalty, TokenSampler},
 };
 use ondevice_coreml::{ComputeUnits, Function, Inputs, Model, Tensor, f16};
-use serde::Deserialize;
-use std::{collections::BTreeMap, fs::File, io::BufReader, path::Path};
+use serde::{Deserialize, Serialize};
+use std::{collections::BTreeMap, fs::File, io::BufReader, num::NonZeroUsize, path::Path};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -106,13 +106,66 @@ pub struct Reference {
     text: Vec<u32>,
 }
 
-pub struct Synthesis {
+/// Frame-major acoustic codes, including the conditioning prefix needed by
+/// the published chunked decoder. Construction validates matrix boundaries.
+#[derive(Debug, Serialize)]
+pub struct AcousticCodes {
+    groups: NonZeroUsize,
+    values: Vec<u32>,
+    reference_frames: usize,
+}
+
+impl AcousticCodes {
+    pub fn new(
+        groups: NonZeroUsize,
+        values: Vec<u32>,
+        reference_frames: usize,
+    ) -> Result<Self, Error> {
+        if !values.len().is_multiple_of(groups.get()) || reference_frames > values.len() / groups {
+            return Err(Error::Contract(
+                "acoustic code matrix or reference boundary is invalid",
+            ));
+        }
+        Ok(Self {
+            groups,
+            values,
+            reference_frames,
+        })
+    }
+
+    pub fn groups(&self) -> NonZeroUsize {
+        self.groups
+    }
+    pub fn values(&self) -> &[u32] {
+        &self.values
+    }
+    pub fn reference_frames(&self) -> usize {
+        self.reference_frames
+    }
+    pub fn frames(&self) -> usize {
+        self.values.len() / self.groups
+    }
+    pub fn generated_frames(&self) -> usize {
+        self.frames() - self.reference_frames
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct Generation {
     pub model_size: String,
     pub transformer_weight_bits: u8,
+    pub codes: AcousticCodes,
+    pub reached_eos: bool,
+}
+
+pub struct Waveform {
     pub samples: Vec<f32>,
     pub sample_rate: u32,
-    pub generated_frames: usize,
-    pub reached_eos: bool,
+}
+
+pub struct Synthesis {
+    pub generation: Generation,
+    pub waveform: Waveform,
 }
 
 pub struct Engine<T, S> {
@@ -145,6 +198,18 @@ impl<T: TokenSampler, S: TokenSampler> Engine<T, S> {
     ) -> Result<Self, Error> {
         let manifest: Manifest = json(transformers.join("transformers.json"))?;
         let config: Config = json(transformers.join("config.json"))?;
+        let encoder_contract: AudioContract = json(audio.join("encoder.contract.json"))?;
+        let decoder_contract: AudioContract = json(audio.join("decoder.contract.json"))?;
+        if encoder_contract.code_groups != config.talker_config.num_code_groups
+            || decoder_contract.code_groups != encoder_contract.code_groups
+        {
+            return Err(Error::Contract(
+                "audio and speech model code groups disagree",
+            ));
+        }
+        let spectrogram = Spectrogram::new(json(audio.join("mel.json"))?)?;
+        let tokenizer = tokenizers::Tokenizer::from_file(transformers.join("tokenizer.json"))
+            .map_err(|e| Error::Tokenizer(e.to_string()))?;
         let load_decoder = |files: &DecoderFiles| {
             Decoder::open(
                 files.chunks.iter().map(|p| transformers.join(p)),
@@ -196,15 +261,6 @@ impl<T: TokenSampler, S: TokenSampler> Engine<T, S> {
             reserved_start,
             minimum_frames: sampling.minimum_frames,
         };
-        let encoder_contract: AudioContract = json(audio.join("encoder.contract.json"))?;
-        let decoder_contract: AudioContract = json(audio.join("decoder.contract.json"))?;
-        if encoder_contract.code_groups != config.talker_config.num_code_groups
-            || decoder_contract.code_groups != encoder_contract.code_groups
-        {
-            return Err(Error::Contract(
-                "audio and speech model code groups disagree",
-            ));
-        }
         Ok(Self {
             weight_bits: manifest.weight_bits,
             generator: Generator::new(networks, selection)?,
@@ -212,9 +268,8 @@ impl<T: TokenSampler, S: TokenSampler> Engine<T, S> {
             speaker: open(audio.join("speaker.mlmodelc"), units)?,
             encoder: open(audio.join("encoder.mlmodelc"), units)?,
             waveform: open(audio.join("decoder.mlmodelc"), units)?,
-            spectrogram: Spectrogram::new(json(audio.join("mel.json"))?)?,
-            tokenizer: tokenizers::Tokenizer::from_file(transformers.join("tokenizer.json"))
-                .map_err(|e| Error::Tokenizer(e.to_string()))?,
+            spectrogram,
+            tokenizer,
             config,
             encoder_contract,
             decoder_contract,
@@ -302,6 +357,21 @@ impl<T: TokenSampler, S: TokenSampler> Engine<T, S> {
         language: &str,
         maximum_frames: usize,
     ) -> Result<Synthesis, Error> {
+        let generation = self.generate(reference, text, language, maximum_frames)?;
+        let waveform = self.decode(&generation.codes)?;
+        Ok(Synthesis {
+            generation,
+            waveform,
+        })
+    }
+
+    pub fn generate(
+        &mut self,
+        reference: &Reference,
+        text: &str,
+        language: &str,
+        maximum_frames: usize,
+    ) -> Result<Generation, Error> {
         if maximum_frames == 0 || text.is_empty() {
             return Err(Error::Contract(
                 "text and generation budget must be nonempty",
@@ -369,22 +439,34 @@ impl<T: TokenSampler, S: TokenSampler> Engine<T, S> {
                 }
             }
         }
-        let generated_frames = frames.len();
-        let mut codes = reference.codes.clone();
-        codes.extend(frames);
-        let samples = self.decode(&codes)?;
-        let reference_samples = reference.codes.len() * self.decoder_contract.samples_per_frame;
-        Ok(Synthesis {
+        let groups = NonZeroUsize::new(self.encoder_contract.code_groups)
+            .ok_or(Error::Contract("codec must have at least one code group"))?;
+        let codes = AcousticCodes::new(
+            groups,
+            reference
+                .codes
+                .iter()
+                .chain(&frames)
+                .flatten()
+                .copied()
+                .collect(),
+            reference.codes.len(),
+        )?;
+        Ok(Generation {
             model_size: self.config.tts_model_size.clone(),
             transformer_weight_bits: self.weight_bits,
-            samples: samples[reference_samples..].to_vec(),
-            sample_rate: self.decoder_contract.sample_rate,
-            generated_frames,
+            codes,
             reached_eos,
         })
     }
 
-    fn decode(&mut self, codes: &[Vec<u32>]) -> Result<Vec<f32>, Error> {
+    /// Decode the complete conditioning prefix, then return only generated audio.
+    pub fn decode(&mut self, codes: &AcousticCodes) -> Result<Waveform, Error> {
+        if codes.groups.get() != self.decoder_contract.code_groups {
+            return Err(Error::Contract(
+                "code group count differs from waveform decoder",
+            ));
+        }
         // Qwen's published chunked_decode uses 300 frames plus 25 left-context
         // frames. Preserve those boundaries, including the first chunk.
         let (chunk_size, left_context) = (300, 25);
@@ -396,15 +478,15 @@ impl<T: TokenSampler, S: TokenSampler> Engine<T, S> {
         }
         let groups = self.decoder_contract.code_groups;
         let samples_per_frame = self.decoder_contract.samples_per_frame;
-        let mut result = Vec::with_capacity(codes.len() * samples_per_frame);
-        for start in (0..codes.len()).step_by(chunk_size) {
-            let end = (start + chunk_size).min(codes.len());
+        let mut result = Vec::with_capacity(codes.frames() * samples_per_frame);
+        for start in (0..codes.frames()).step_by(chunk_size) {
+            let end = (start + chunk_size).min(codes.frames());
             let context = start.min(left_context);
             let mut packed = vec![0i32; groups * capacity];
-            for (frame, values) in codes[start - context..end].iter().enumerate() {
-                if values.len() != groups {
-                    return Err(Error::Contract("code frame group count mismatch"));
-                }
+            for (frame, values) in codes.values[(start - context) * groups..end * groups]
+                .chunks_exact(groups)
+                .enumerate()
+            {
                 for (group, &value) in values.iter().enumerate() {
                     packed[group * capacity + frame] =
                         i32::try_from(value).map_err(|_| Error::Contract("code exceeds int32"))?;
@@ -430,7 +512,12 @@ impl<T: TokenSampler, S: TokenSampler> Engine<T, S> {
         if result.iter().any(|v| !v.is_finite()) {
             return Err(Error::Contract("waveform contains nonfinite values"));
         }
-        Ok(result)
+        let reference_samples = codes.reference_frames * samples_per_frame;
+        result.drain(..reference_samples);
+        Ok(Waveform {
+            samples: result,
+            sample_rate: self.decoder_contract.sample_rate,
+        })
     }
 }
 

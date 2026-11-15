@@ -33,6 +33,11 @@ struct Args {
     output: PathBuf,
     #[arg(long)]
     maximum_frames: usize,
+    #[arg(
+        long,
+        help = "Save local acoustic codes for decoder comparison or reuse"
+    )]
+    export_codes: bool,
     #[arg(long)]
     seed: u64,
     #[arg(long)]
@@ -142,23 +147,29 @@ fn run<T: TokenSampler, S: TokenSampler>(
             args.maximum_frames,
         )?;
         let seconds = started.elapsed().as_secs_f64();
+        if args.export_codes {
+            let path = args.output.join(format!("{}.codes.json", prompt.language));
+            let mut writer = BufWriter::new(File::create_new(path)?);
+            serde_json::to_writer(&mut writer, &output.generation)?;
+            writer.flush()?;
+        }
         let file = format!("{}.wav", prompt.language);
         let mut writer = hound::WavWriter::create(
             args.output.join(&file),
             hound::WavSpec {
                 channels: 1,
-                sample_rate: output.sample_rate,
+                sample_rate: output.waveform.sample_rate,
                 bits_per_sample: 32,
                 sample_format: hound::SampleFormat::Float,
             },
         )?;
-        for &sample in &output.samples {
+        for &sample in &output.waveform.samples {
             writer.write_sample(sample)?;
         }
         writer.finalize()?;
         results.push(Sample {
-            model_size: output.model_size,
-            transformer_weight_bits: output.transformer_weight_bits,
+            model_size: output.generation.model_size,
+            transformer_weight_bits: output.generation.transformer_weight_bits,
             prompt,
             file,
             backend: "Rust/Core ML",
@@ -169,16 +180,16 @@ fn run<T: TokenSampler, S: TokenSampler>(
             top_k: args.top_k.get(),
             top_p: args.top_p,
             repetition_penalty: args.repetition_penalty,
-            sample_rate: output.sample_rate,
-            samples: output.samples.len(),
-            generated_frames: output.generated_frames,
-            reached_eos: output.reached_eos,
+            sample_rate: output.waveform.sample_rate,
+            samples: output.waveform.samples.len(),
+            generated_frames: output.generation.codes.generated_frames(),
+            reached_eos: output.generation.reached_eos,
             synthesis_seconds: seconds,
         });
         let mut metadata = BufWriter::new(File::create(args.output.join("samples.json"))?);
         serde_json::to_writer_pretty(&mut metadata, &results)?;
         metadata.flush()?;
-        tracing::info!(language=%prompt.language,frames=output.generated_frames,reached_eos=output.reached_eos,seconds,"saved audio");
+        tracing::info!(language=%prompt.language,frames=output.generation.codes.generated_frames(),reached_eos=output.generation.reached_eos,seconds,"saved audio");
     }
     Ok(())
 }
