@@ -74,9 +74,7 @@ pub struct Generator<P, T, S> {
 
 pub struct Sequence<'a, P, T, S> {
     generator: &'a mut Generator<P, T, S>,
-    pending: Option<(Tensor<f16>, Vec<f32>)>,
-    trailing: std::vec::IntoIter<Tensor<f16>>,
-    padding: Tensor<f16>,
+    pending: Option<Tensor<f16>>,
     history: Vec<u32>,
     finished: bool,
 }
@@ -112,8 +110,6 @@ impl<P: PredictorProjection, T: TokenSampler, S: TokenSampler> Generator<P, T, S
     pub fn start(
         &mut self,
         prefill: impl IntoIterator<Item = Tensor<f16>>,
-        trailing: Vec<Tensor<f16>>,
-        padding: Tensor<f16>,
     ) -> Result<Sequence<'_, P, T, S>, Error> {
         self.networks.talker.reset();
         self.networks.predictor.reset();
@@ -122,12 +118,10 @@ impl<P: PredictorProjection, T: TokenSampler, S: TokenSampler> Generator<P, T, S
             last = Some(self.networks.talker.step(hidden).map_err(Error::Talker)?);
         }
         let last = last.ok_or(Error::Contract("prefill must not be empty"))?;
-        let pending = Some(head(&mut self.networks.talker_head, &last)?);
+        let pending = Some(last);
         Ok(Sequence {
             generator: self,
             pending,
-            trailing: trailing.into_iter(),
-            padding,
             history: Vec::new(),
             finished: false,
         })
@@ -135,14 +129,32 @@ impl<P: PredictorProjection, T: TokenSampler, S: TokenSampler> Generator<P, T, S
 }
 
 impl<P: PredictorProjection, T: TokenSampler, S: TokenSampler> Sequence<'_, P, T, S> {
-    pub fn next_frame(&mut self) -> Result<Option<Vec<u32>>, Error> {
-        let Some((past, mut logits)) = self.pending.take() else {
+    pub fn embed_frame(&mut self, codes: &[u32], text: &Tensor<f16>) -> Result<Tensor<f16>, Error> {
+        self.generator.embed_frame(codes, text)
+    }
+
+    /// Extend the conditioning prefix without resetting the KV state.
+    pub fn prefill(&mut self, hidden: Tensor<f16>) -> Result<(), Error> {
+        self.pending = None;
+        let hidden = self
+            .generator
+            .networks
+            .talker
+            .step(hidden)
+            .map_err(Error::Talker)?;
+        self.pending = Some(hidden);
+        Ok(())
+    }
+
+    pub fn next_frame(&mut self, text: &Tensor<f16>) -> Result<Option<Vec<u32>>, Error> {
+        let Some(hidden) = self.pending.take() else {
             return if self.finished {
                 Ok(None)
             } else {
                 Err(Error::Contract("sequence failed; start a new request"))
             };
         };
+        let (past, mut logits) = head(&mut self.generator.networks.talker_head, &hidden)?;
         let selection = &mut self.generator.selection;
         if selection.eos as usize >= logits.len()
             || selection.reserved_start as usize > logits.len()
@@ -184,10 +196,9 @@ impl<P: PredictorProjection, T: TokenSampler, S: TokenSampler> Sequence<'_, P, T
             let (_, mut logits) = head(&mut networks.predictor_heads[index], &hidden)?;
             codes.push(selection.predictor.sample(&mut logits)?);
         }
-        let text = self.trailing.next().unwrap_or_else(|| self.padding.clone());
-        let embedded = frame(&mut networks.codec_frame, &codes, &text)?;
+        let embedded = frame(&mut networks.codec_frame, &codes, text)?;
         let hidden = networks.talker.step(embedded).map_err(Error::Talker)?;
-        self.pending = Some(head(&mut networks.talker_head, &hidden)?);
+        self.pending = Some(hidden);
         self.history.push(first);
         Ok(Some(codes))
     }

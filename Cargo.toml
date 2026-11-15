@@ -13,9 +13,10 @@ sampling = ["dep:rand", "dep:thiserror"]
 coreml = ["dep:ondevice-coreml", "dep:thiserror"]
 generation = ["coreml", "sampling"]
 inference = ["generation", "dep:serde", "dep:serde_json", "dep:tokenizers", "dep:realfft"]
+streaming = ["inference", "dep:tracing", "dep:async-channel", "dep:futures-lite", "dep:tokio"]
 download = ["dep:ondevice"]
 http = ["download", "ondevice/zenwave"]
-cli = ["inference", "http", "dep:futures-lite", "dep:clap", "dep:hound", "dep:tracing", "dep:tracing-subscriber", "rand/std_rng"]
+cli = ["streaming", "dep:async-io", "dep:rustix", "tokio/fs", "tokio/io-util", "http", "dep:futures-lite", "dep:clap", "dep:hound", "dep:tracing", "dep:tracing-subscriber", "rand/std_rng"]
 
 [[bin]]
 name = "deepclone"
@@ -23,6 +24,10 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [dependencies]
+rustix = { version = "1.1.6", default-features = false, features = ["std"], optional = true }
+async-io = { version = "2.6.0", default-features = false, optional = true }
+async-channel = { version = "2.5.0", default-features = false, features = ["std"], optional = true }
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "time"], optional = true }
 ondevice = { git = "https://github.com/May-Agent/ondevice", branch = "dev", default-features = false, features = ["archive"], optional = true }
 futures-lite = { version = "2.6.1", default-features = false, features = ["std"], optional = true }
 rand = { version = "0.10.3", default-features = false, features = ["std"], optional = true }
