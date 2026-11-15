@@ -2,7 +2,7 @@
 publish = false
 git_only = true
 release_always = false
-changelog_update = false
+changelog_update = true
 git_release_draft = true
 git_release_generate_notes = true
 git_release_body = ""
