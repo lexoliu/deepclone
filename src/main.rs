@@ -1,6 +1,7 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use deepclone::{
     inference::{Engine, Sampling},
+    models::{Bundle, Installed, Store, Zenwave},
     sampling::{Greedy, Multinomial, Parameters, RepetitionPenalty, TokenSampler},
 };
 use ondevice_coreml::ComputeUnits;
@@ -19,10 +20,44 @@ use std::{
 #[derive(Parser)]
 #[command(about = "Local Qwen3-TTS voice cloning through Core ML")]
 struct Args {
-    #[arg(long)]
-    transformers: PathBuf,
-    #[arg(long)]
-    audio_models: PathBuf,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Clone a voice from reference audio and synthesize complete texts.
+    Synthesize(Box<Synthesize>),
+    /// Download and verify a published model without loading it.
+    Download(Download),
+}
+
+#[derive(clap::Args)]
+struct Download {
+    #[arg(long, value_parser = parse_model, help = "Published model: 0.6b or 1.7b")]
+    model: Bundle<'static>,
+    #[arg(long, help = "Content-addressed model cache directory")]
+    cache_dir: PathBuf,
+}
+
+fn parse_model(value: &str) -> Result<Bundle<'static>, String> {
+    match value {
+        "0.6b" => Ok(deepclone::models::qwen3_tts_0_6b()),
+        "1.7b" => Ok(deepclone::models::qwen3_tts_1_7b()),
+        _ => Err("model must be 0.6b or 1.7b".into()),
+    }
+}
+
+#[derive(clap::Args)]
+struct Synthesize {
+    #[arg(long, required_unless_present = "model", conflicts_with = "model")]
+    transformers: Option<PathBuf>,
+    #[arg(long, required_unless_present = "model", conflicts_with = "model")]
+    audio_models: Option<PathBuf>,
+    #[arg(long, value_parser = parse_model, requires = "cache_dir", help = "Download or reuse published model: 0.6b or 1.7b")]
+    model: Option<Bundle<'static>>,
+    #[arg(long, requires = "model")]
+    cache_dir: Option<PathBuf>,
     #[arg(long, help = "Mono or multichannel WAV at the model sample rate")]
     reference: PathBuf,
     #[arg(long, help = "JSON object containing the exact reference text")]
@@ -53,6 +88,74 @@ struct Args {
     top_p: f32,
     #[arg(long, default_value_t = 1.05)]
     repetition_penalty: f32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn command_contracts() {
+        Args::command().debug_assert();
+        assert!(
+            Args::try_parse_from([
+                "deepclone",
+                "download",
+                "--model",
+                "0.6b",
+                "--cache-dir",
+                "cache"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Args::try_parse_from([
+                "deepclone",
+                "download",
+                "--model",
+                "unknown",
+                "--cache-dir",
+                "cache"
+            ])
+            .is_err()
+        );
+        assert!(Args::try_parse_from(["deepclone", "download", "--model", "1.7b"]).is_err());
+        let shared = [
+            "deepclone",
+            "synthesize",
+            "--reference",
+            "ref.wav",
+            "--transcript",
+            "ref.json",
+            "--prompts",
+            "prompts.json",
+            "--output",
+            "out",
+            "--maximum-frames",
+            "256",
+            "--seed",
+            "42",
+        ];
+        let parse = |source: &[&str]| {
+            Args::try_parse_from(shared.iter().copied().chain(source.iter().copied()))
+        };
+        assert!(parse(&["--model", "1.7b", "--cache-dir", "cache"]).is_ok());
+        assert!(parse(&["--transformers", "transformers", "--audio-models", "audio"]).is_ok());
+        assert!(parse(&["--model", "0.6b"]).is_err());
+        assert!(parse(&["--transformers", "transformers"]).is_err());
+        assert!(
+            parse(&[
+                "--model",
+                "0.6b",
+                "--cache-dir",
+                "cache",
+                "--transformers",
+                "local"
+            ])
+            .is_err()
+        );
+    }
 }
 #[derive(Deserialize)]
 struct Transcript {
@@ -85,7 +188,7 @@ struct Sample<'a> {
 }
 
 fn run<T: TokenSampler, S: TokenSampler>(
-    args: &Args,
+    args: &Synthesize,
     talker: T,
     predictor: S,
 ) -> Result<(), Box<dyn Error>> {
@@ -95,11 +198,21 @@ fn run<T: TokenSampler, S: TokenSampler>(
         "all" => ComputeUnits::All,
         _ => unreachable!("clap validates compute units"),
     };
+    let (transformers, audio) = match (&args.model, &args.cache_dir) {
+        (Some(model), Some(cache)) => {
+            let installed = download(model, cache)?;
+            (installed.transformers(), installed.audio())
+        }
+        _ => (
+            args.transformers.clone().ok_or("missing --transformers")?,
+            args.audio_models.clone().ok_or("missing --audio-models")?,
+        ),
+    };
     tracing::info!("loading models");
     let loading_started = Instant::now();
     let mut engine = Engine::open(
-        &args.transformers,
-        &args.audio_models,
+        &transformers,
+        &audio,
         units,
         Sampling {
             talker,
@@ -137,7 +250,7 @@ fn run<T: TokenSampler, S: TokenSampler>(
     let prompts: Vec<Prompt> = serde_json::from_reader(BufReader::new(File::open(&args.prompts)?))?;
     std::fs::create_dir_all(&args.output)?;
     let mut results = Vec::new();
-    for prompt in &prompts {
+    for (index, prompt) in prompts.iter().enumerate() {
         tracing::info!(language=%prompt.language,"synthesizing");
         let started = Instant::now();
         let output = engine.synthesize(
@@ -148,12 +261,12 @@ fn run<T: TokenSampler, S: TokenSampler>(
         )?;
         let seconds = started.elapsed().as_secs_f64();
         if args.export_codes {
-            let path = args.output.join(format!("{}.codes.json", prompt.language));
+            let path = args.output.join(format!("{index:04}.codes.json"));
             let mut writer = BufWriter::new(File::create_new(path)?);
             serde_json::to_writer(&mut writer, &output.generation)?;
             writer.flush()?;
         }
-        let file = format!("{}.wav", prompt.language);
+        let file = format!("{index:04}.wav");
         let mut writer = hound::WavWriter::create(
             args.output.join(&file),
             hound::WavSpec {
@@ -194,6 +307,43 @@ fn run<T: TokenSampler, S: TokenSampler>(
     Ok(())
 }
 
+fn download(model: &Bundle<'_>, cache: &std::path::Path) -> Result<Installed, Box<dyn Error>> {
+    let store = Store::new(cache, Zenwave);
+    let mut last_report = Instant::now();
+    let installed = futures_lite::future::block_on(model.download(&store, |progress| {
+        if last_report.elapsed().as_secs() >= 1 || progress.received == progress.total {
+            tracing::info!(
+                received = progress.received,
+                total = progress.total,
+                "downloading model"
+            );
+            last_report = Instant::now();
+        }
+    }))?;
+    tracing::info!(path = %installed.root().display(), "model available");
+    Ok(installed)
+}
+
+fn execute(command: Command) -> Result<(), Box<dyn Error>> {
+    let args = match command {
+        Command::Download(args) => {
+            download(&args.model, &args.cache_dir)?;
+            return Ok(());
+        }
+        Command::Synthesize(args) => args,
+    };
+    if args.greedy {
+        run(&args, Greedy, Greedy)
+    } else {
+        let parameters = Parameters::new(args.temperature, Some(args.top_k), args.top_p)?;
+        run(
+            &args,
+            Multinomial::new(StdRng::seed_from_u64(args.seed), parameters),
+            Multinomial::new(StdRng::seed_from_u64(args.seed), parameters),
+        )
+    }
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
     let subscriber = tracing_subscriber::fmt()
@@ -201,23 +351,11 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .finish();
     tracing::subscriber::with_default(subscriber, || {
-        let result = if args.greedy {
-            run(&args, Greedy, Greedy)
-        } else {
-            Parameters::new(args.temperature, Some(args.top_k), args.top_p)
-                .map_err(|e| Box::new(e) as Box<dyn Error>)
-                .and_then(|parameters| {
-                    run(
-                        &args,
-                        Multinomial::new(StdRng::seed_from_u64(args.seed), parameters),
-                        Multinomial::new(StdRng::seed_from_u64(args.seed), parameters),
-                    )
-                })
-        };
+        let result = execute(args.command);
         match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                tracing::error!(%error,"voice cloning failed");
+                tracing::error!(%error,"command failed");
                 ExitCode::FAILURE
             }
         }

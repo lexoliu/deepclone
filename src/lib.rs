@@ -1,4 +1,7 @@
 //! Native voice cloning components for Apple hardware.
+#[cfg(feature = "download")]
+pub mod models;
+
 #[cfg(feature = "sampling")]
 pub mod sampling;
 
