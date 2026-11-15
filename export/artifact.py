@@ -1,8 +1,9 @@
 """Shared Core ML conversion, weight compression, and placement reporting."""
 
 import json
-import shutil
+import tempfile
 from collections import Counter
+from pathlib import Path
 
 import coremltools as ct
 import numpy as np
@@ -28,16 +29,23 @@ def save(model, output, weight_bits):
             ),
         )
     output.parent.mkdir(parents=True, exist_ok=True)
-    package = output.with_suffix(".mlpackage")
-    model.save(str(package))
-    ct.models.utils.compile_model(str(package), destination_path=str(output))
-    shutil.rmtree(package)
-    report = placement(output)
-    report["weight_bits"] = weight_bits
-    report["compiled_bytes"] = sum(
-        p.stat().st_size for p in output.rglob("*") if p.is_file()
-    )
-    output.with_suffix(".json").write_text(json.dumps(report, indent=2) + "\n")
+    with tempfile.TemporaryDirectory(
+        prefix=f".{output.stem}-", dir=output.parent
+    ) as staging:
+        staging = Path(staging)
+        package = staging / output.with_suffix(".mlpackage").name
+        compiled = staging / output.name
+        model.save(str(package))
+        ct.models.utils.compile_model(str(package), destination_path=str(compiled))
+        report = placement(compiled)
+        report["weight_bits"] = weight_bits
+        report["compiled_bytes"] = sum(
+            p.stat().st_size for p in compiled.rglob("*") if p.is_file()
+        )
+        report_path = staging / output.with_suffix(".json").name
+        report_path.write_text(json.dumps(report, indent=2) + "\n")
+        compiled.rename(output)
+        report_path.replace(output.with_suffix(".json"))
 
 
 def placement(path):

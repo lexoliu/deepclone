@@ -2,12 +2,14 @@
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 
 import torch
 from qwen_tts import Qwen3TTSModel
 
 from artifact import convert
+from provenance import snapshot, verify_or_record
 from transformer import (
     CodecEmbedding,
     CodecFrame,
@@ -26,10 +28,15 @@ def export(reference, output, context, chunk_layers, weight_bits, resume=False):
     def component(module, inputs, names, outputs, name, states=()):
         path = output / (name + ".mlmodelc")
         if resume and path.exists():
-            report = json.loads(path.with_suffix(".json").read_text())
-            if report["weight_bits"] != weight_bits:
-                raise ValueError(f"{name}: existing weight precision differs")
-            return path.name
+            report_path = path.with_suffix(".json")
+            if report_path.exists():
+                report = json.loads(report_path.read_text())
+                if report["weight_bits"] != weight_bits:
+                    raise ValueError(f"{name}: existing weight precision differs")
+                return path.name
+            # The component was interrupted before its completion report was
+            # published. The run's provenance has already been checked.
+            shutil.rmtree(path)
         convert(module.half(), inputs, names, outputs, path, weight_bits, states)
         return path.name
 
@@ -145,6 +152,18 @@ def main():
     if args.context <= 0 or args.chunk_layers <= 0:
         parser.error("context and chunk-layers must be positive")
     args.output.mkdir(parents=True, exist_ok=args.resume)
+    verify_or_record(
+        args.output,
+        snapshot(
+            args.source,
+            {
+                "context": args.context,
+                "chunk_layers": args.chunk_layers,
+                "weight_bits": args.weight_bits,
+            },
+        ),
+        args.resume,
+    )
     reference = Qwen3TTSModel.from_pretrained(
         str(args.source),
         device_map="cpu",
