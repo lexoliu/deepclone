@@ -28,11 +28,18 @@ def main():
         help="Mel frames, audio samples, or codec frames",
     )
     parser.add_argument("--weight-bits", type=int, choices=[4, 8, 16, 32])
-    parser.add_argument("--compute-precision", choices=["fp16", "fp32"], default="fp16")
+    parser.add_argument(
+        "--compute-precision",
+        choices=["fp16", "fp32"],
+        help="Defaults to fp32 for reference conditioning and fp16 for waveform decoding",
+    )
     args = parser.parse_args()
     if args.capacity <= 0:
         parser.error("capacity must be positive")
-    precision_bits = 32 if args.compute_precision == "fp32" else 16
+    compute_precision = args.compute_precision or (
+        "fp16" if args.component == "decoder" else "fp32"
+    )
+    precision_bits = 32 if compute_precision == "fp32" else 16
     weight_bits = args.weight_bits or precision_bits
     if weight_bits not in (4, 8, precision_bits):
         parser.error("uncompressed weight width must match compute precision")
@@ -104,7 +111,7 @@ def main():
         inputs=[ct.TensorType(name=input_name, shape=input_shape, dtype=input_dtype)],
         outputs=[ct.TensorType(name=output_name, dtype=output_dtype)],
         compute_precision=ct.precision.FLOAT32
-        if args.compute_precision == "fp32"
+        if compute_precision == "fp32"
         else ct.transform.FP16ComputePrecision(
             op_selector=lambda op: (
                 "NearestCode"
@@ -118,7 +125,7 @@ def main():
         json.dumps(
             {
                 "component": args.component,
-                "compute_precision": args.compute_precision,
+                "compute_precision": compute_precision,
                 "weight_bits": weight_bits,
                 "capacity": args.capacity,
                 "sample_rate": codec.input_sample_rate,
