@@ -1,0 +1,20 @@
+[project]
+name = "deepclone-export"
+version = "0.0.0"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "coremltools==9.0",
+  "numpy==2.2.6",
+  "qwen-tts==0.1.1",
+  "torch==2.15.0",
+  "torchaudio==2.11.1",
+  "safetensors>=0.6.2",
+]
+
+[tool.uv]
+environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.17.5",
+]
