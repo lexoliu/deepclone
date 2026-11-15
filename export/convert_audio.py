@@ -27,11 +27,15 @@ def main():
         required=True,
         help="Mel frames, audio samples, or codec frames",
     )
-    parser.add_argument("--weight-bits", type=int, choices=[4, 8, 16], default=16)
+    parser.add_argument("--weight-bits", type=int, choices=[4, 8, 16, 32])
     parser.add_argument("--compute-precision", choices=["fp16", "fp32"], default="fp16")
     args = parser.parse_args()
     if args.capacity <= 0:
         parser.error("capacity must be positive")
+    precision_bits = 32 if args.compute_precision == "fp32" else 16
+    weight_bits = args.weight_bits or precision_bits
+    if weight_bits not in (4, 8, precision_bits):
+        parser.error("uncompressed weight width must match compute precision")
     reference = Qwen3TTSModel.from_pretrained(
         str(args.source),
         device_map="cpu",
@@ -41,6 +45,17 @@ def main():
     codec = reference.model.speech_tokenizer.model
     if args.component == "speaker":
         module = reference.model.speaker_encoder
+        # Reflection padding must be smaller than the time axis. Every temporal
+        # convolution in this speaker encoder preserves length with SAME padding.
+        minimum_frames = 1 + max(
+            ((layer.kernel_size[0] - 1) * layer.dilation[0] + 1) // 2
+            for layer in module.modules()
+            if isinstance(layer, torch.nn.Conv1d)
+            and layer.padding == "same"
+            and layer.padding_mode == "reflect"
+        )
+        if args.capacity < minimum_frames:
+            parser.error("speaker capacity is shorter than its reflection padding")
         shape = (
             1,
             args.capacity,
@@ -50,7 +65,9 @@ def main():
         input_shape = (
             1,
             ct.RangeDim(
-                lower_bound=2, upper_bound=args.capacity, default=args.capacity
+                lower_bound=minimum_frames,
+                upper_bound=args.capacity,
+                default=args.capacity,
             ),
             shape[-1],
         )
@@ -63,7 +80,9 @@ def main():
             1,
             1,
             ct.RangeDim(
-                lower_bound=1920, upper_bound=args.capacity, default=args.capacity
+                lower_bound=codec.encode_downsample_rate,
+                upper_bound=args.capacity,
+                default=args.capacity,
             ),
         )
         input_name, output_name = "audio", "codes"
@@ -94,13 +113,13 @@ def main():
         ),
         skip_model_load=True,
     )
-    save(model, args.output, args.weight_bits)
+    save(model, args.output, weight_bits)
     args.output.with_suffix(".contract.json").write_text(
         json.dumps(
             {
                 "component": args.component,
                 "compute_precision": args.compute_precision,
-                "weight_bits": args.weight_bits,
+                "weight_bits": weight_bits,
                 "capacity": args.capacity,
                 "sample_rate": codec.input_sample_rate,
                 "samples_per_frame": codec.decode_upsample_rate,

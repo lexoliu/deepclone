@@ -18,7 +18,7 @@ from coremltools.optimize.coreml import (
 def save(model, output, weight_bits):
     if output.exists():
         raise FileExistsError(output)
-    if weight_bits != 16:
+    if weight_bits in (4, 8):
         model = linear_quantize_weights(
             model,
             config=OptimizationConfig(

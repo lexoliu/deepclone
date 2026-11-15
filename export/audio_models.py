@@ -124,10 +124,13 @@ def causal_mask(length, window=None):
     distance = positions[:, None] - positions[None, :]
     allowed = distance >= 0
     if window is not None:
-        allowed &= distance < window
-    return torch.where(allowed, 0.0, torch.finfo(torch.float32).min).reshape(
-        1, 1, length, length
+        allowed = allowed & (distance < window)
+    mask = torch.where(
+        allowed,
+        torch.zeros_like(allowed, dtype=torch.float32),
+        torch.full_like(allowed, torch.finfo(torch.float32).min, dtype=torch.float32),
     )
+    return mask.unsqueeze(0).unsqueeze(0)
 
 
 class AudioEncoder(nn.Module):
