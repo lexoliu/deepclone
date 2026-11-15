@@ -41,3 +41,8 @@ rand = { version = "0.10.3", default-features = false, features = ["std", "std_r
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 ondevice-coreml = { git = "https://github.com/May-Agent/ondevice", branch = "dev", default-features = false, optional = true }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

@@ -1,0 +1,67 @@
+name: release-plz
+on:
+  workflow_run:
+    workflows: [ci]
+    branches: [main]
+    types: [completed]
+permissions:
+  contents: read
+concurrency:
+  group: release-plz
+  cancel-in-progress: false
+jobs:
+  coordinate:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    outputs:
+      released: ${{ steps.release.outputs.releases_created }}
+      releases: ${{ steps.release.outputs.releases || '[]' }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+      - id: gate
+        run: python3 .github/scripts/release_gate.py
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        if: steps.gate.outputs.kind != 'skip'
+        with:
+          toolchain: stable
+      - id: release
+        if: steps.gate.outputs.kind == 'release'
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b
+        with:
+          command: release
+          version: 0.4.3
+      - id: pr
+        if: steps.gate.outputs.kind == 'pr'
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b
+        with:
+          command: release-pr
+          version: 0.4.3
+      - name: Run CI on the release PR
+        if: steps.pr.outputs.prs_created == 'true'
+        env:
+          RELEASE_PR: ${{ steps.pr.outputs.pr }}
+        run: |
+          branch=$(jq -er '.head_branch' <<< "$RELEASE_PR")
+          gh workflow run ci.yml --ref "$branch"
+  artifacts:
+    needs: coordinate
+    if: needs.coordinate.outputs.released == 'true'
+    strategy:
+      matrix:
+        release: ${{ fromJSON(needs.coordinate.outputs.releases) }}
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ matrix.release.tag }}
+    permissions:
+      contents: write
