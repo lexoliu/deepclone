@@ -32,18 +32,13 @@ jobs:
           tool: cargo-dist@0.34.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - name: Build archives and installers
-        run: |
-          dist build --tag "$RELEASE_TAG" --artifacts=local --output-format=json > local-dist-manifest.json
-          cp local-dist-manifest.json target/distrib/aarch64-apple-darwin-dist-manifest.json
-          dist build --tag "$RELEASE_TAG" --artifacts=global --output-format=json > global-dist-manifest.json
-          python3 .github/scripts/release_assets.py local-dist-manifest.json global-dist-manifest.json
-          python3 .github/scripts/check_release_artifacts.py target/release-assets
+        run: python3 .github/scripts/package_release.py --tag "$RELEASE_TAG" --output "$RUNNER_TEMP/release-assets"
       - id: name
         run: echo "artifact=release-${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: ${{ steps.name.outputs.artifact }}
-          path: target/release-assets/
+          path: ${{ runner.temp }}/release-assets/
           if-no-files-found: error
           retention-days: 90
   publish:
