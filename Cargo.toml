@@ -1,0 +1,23 @@
+[package]
+name = "deepclone"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lexoliu/deepclone"
+description = "Qwen3-TTS voice cloning on Apple hardware through Core ML"
+
+[features]
+default = []
+sampling = ["dep:rand", "dep:thiserror"]
+coreml = ["dep:ondevice-coreml", "dep:thiserror"]
+
+[dependencies]
+rand = { version = "0.10.3", default-features = false, features = ["std"], optional = true }
+thiserror = { version = "2.0.21", default-features = false, optional = true }
+
+[dev-dependencies]
+rand = { version = "0.10.3", default-features = false, features = ["std", "std_rng"] }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+ondevice-coreml = { git = "https://github.com/May-Agent/ondevice", branch = "dev", default-features = false, optional = true }

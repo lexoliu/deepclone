@@ -1,0 +1,34 @@
+name: ci
+on:
+  pull_request:
+    paths: ["Cargo.toml", "Cargo.lock", "src/**", "tests/**", "export/**", ".github/workflows/ci.yml"]
+  push:
+    branches: [main]
+    paths: ["Cargo.toml", "Cargo.lock", "src/**", "tests/**", "export/**", ".github/workflows/ci.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo nextest run --locked --all-features
+      - run: cargo test --locked --all-features --doc
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+        with:
+          version: 0.9.16
+      - run: uv run --directory export --locked ruff check .
+      - run: uv run --directory export --locked ruff format --check .
+      - run: uv run --directory export --locked python -m unittest discover -s tests
