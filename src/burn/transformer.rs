@@ -118,8 +118,10 @@ impl Layer {
             .reshape([1, 1, c.num_attention_heads * c.head_dim]);
         let x = x + self.output.forward(mixed);
         let normalized = self.post.forward(x.clone());
-        let gate = activation::silu(self.gate.forward(normalized.clone()));
-        x + self.down.forward(gate * self.up.forward(normalized))
+        x + self.down.gated(
+            self.gate.forward(normalized.clone()),
+            self.up.forward(normalized),
+        )
     }
 }
 pub(crate) fn rotary(x: Tensor<4>, cosine: &Tensor<4>, sine: &Tensor<4>) -> Tensor<4> {
@@ -210,6 +212,12 @@ impl Decoder {
         for layer in &mut self.layers {
             hidden = layer.forward(hidden, self.position, &self.config, &cosine, &sine);
         }
+        // Submit each autoregressive step without waiting for GPU completion.
+        // This keeps a long reference prefix from accumulating one fusion queue.
+        hidden
+            .device()
+            .flush()
+            .map_err(|error| Error::Execution(error.to_string()))?;
         self.position += 1;
         Ok(hidden)
     }

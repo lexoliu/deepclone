@@ -53,7 +53,7 @@ impl FeedForward for Gated {
     }
     fn apply(&self, x: Tensor<3>) -> Tensor<3> {
         self.down
-            .forward(activation::silu(self.gate.forward(x.clone())) * self.up.forward(x))
+            .gated(self.gate.forward(x.clone()), self.up.forward(x))
     }
 }
 pub(crate) struct Gelu {

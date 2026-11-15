@@ -43,7 +43,40 @@ def main():
                 outputs.append(result.last_hidden_state)
                 cache = result.past_key_values
             tensors[f"output.{index}"] = torch.cat(outputs, dim=1).contiguous()
+            predictor = talker.code_predictor
+            past = outputs[-1]
+            code = talker.codec_head(past).argmax(-1)
+            inputs = [predictor.small_to_mtp_projection(past)]
+            inputs.append(
+                predictor.small_to_mtp_projection(talker.get_input_embeddings()(code))
+            )
+            predicted = []
+            cache = None
+            for position in range(talker.config.num_code_groups + 1):
+                result = predictor.model(
+                    inputs_embeds=inputs[position],
+                    past_key_values=cache,
+                    use_cache=True,
+                )
+                predicted.append(result.last_hidden_state)
+                cache = result.past_key_values
+                if 1 <= position < talker.config.num_code_groups:
+                    code = predictor.lm_head[position - 1](
+                        result.last_hidden_state
+                    ).argmax(-1)
+                    inputs.append(
+                        predictor.small_to_mtp_projection(
+                            predictor.get_input_embeddings()[position - 1](code)
+                        )
+                    )
+            tensors[f"predictor_input.{index}"] = torch.cat(inputs, dim=1).contiguous()
+            tensors[f"predictor_output.{index}"] = torch.cat(
+                predicted, dim=1
+            ).contiguous()
     save_file(tensors, args.output / "decoder-fixtures.safetensors")
+    (args.output / "predictor-config.json").write_text(
+        json.dumps(talker.config.code_predictor_config.to_dict(), indent=2) + "\n"
+    )
     (args.output / "config.json").write_text(
         json.dumps(talker.config.to_dict(), indent=2) + "\n"
     )

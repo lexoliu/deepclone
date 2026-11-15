@@ -1,5 +1,5 @@
 use super::{Error, WeightSource};
-use burn::tensor::{DType, Tensor};
+use burn::tensor::{DType, Tensor, activation};
 
 pub(crate) struct Linear {
     weight: Tensor<2>,
@@ -14,10 +14,17 @@ impl Linear {
             bias: weights.optional(&format!("{prefix}.bias"))?,
         })
     }
+    pub fn gated(&self, gate: Tensor<3>, up: Tensor<3>) -> Tensor<3> {
+        // Qwen's gated intermediate can exceed FP16 while its projection fits.
+        let dtype = gate.dtype();
+        let product = activation::silu(gate.cast(DType::F32)) * up.cast(DType::F32);
+        self.forward(product).cast(dtype)
+    }
     pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
-        let y = x.matmul(self.weight.clone().unsqueeze());
+        let dtype = x.dtype();
+        let y = x.matmul(self.weight.clone().cast(dtype).unsqueeze());
         match &self.bias {
-            Some(bias) => y + bias.clone().unsqueeze(),
+            Some(bias) => y + bias.clone().cast(dtype).unsqueeze(),
             None => y,
         }
     }
@@ -160,5 +167,38 @@ impl TransposeConv {
         );
         let [b, c, _] = y.dims();
         y.slice([0..b, 0..c, 0..frames])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::tensor::{Device, TensorData};
+
+    #[test]
+    #[ignore = "requires a WebGPU adapter"]
+    fn gated_projection_preserves_large_intermediates() {
+        futures_lite::future::block_on(async {
+            let device = Device::wgpu_options().init_async().await.unwrap();
+            let projection = Linear {
+                weight: Tensor::from_data(
+                    TensorData::new(vec![0.125f32], [1, 1]),
+                    (&device, DType::F16),
+                ),
+                bias: None,
+            };
+            let gate = Tensor::from_data(
+                TensorData::new(vec![400f32], [1, 1, 1]),
+                (&device, DType::F16),
+            );
+            let up = Tensor::from_data(
+                TensorData::new(vec![200f32], [1, 1, 1]),
+                (&device, DType::F16),
+            );
+            let result = super::super::read(projection.gated(gate, up))
+                .await
+                .unwrap();
+            assert_eq!(result, vec![10000.0]);
+        });
     }
 }
