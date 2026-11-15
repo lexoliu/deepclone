@@ -13,7 +13,12 @@ import { Progress } from "@/components/ui/progress";
 import { useVoice } from "@/runtime/use-voice";
 import type { ModelEntry } from "@/runtime/contracts";
 
+import { ReferenceRecorder } from "./ReferenceRecorder";
+
 export default function App() {
+  const [referenceMode, setReferenceMode] = useState<"record" | "upload">(
+    "record",
+  );
   const voice = useVoice();
   const [catalog, setCatalog] = useState<ModelEntry[]>([]);
   const [catalogError, setCatalogError] = useState<string | null>(null);
@@ -235,54 +240,103 @@ export default function App() {
               <div className="mb-5 flex items-center gap-2 text-sm font-medium">
                 <span className="text-muted-foreground">01</span>Reference voice
               </div>
-              <input
-                ref={picker}
-                type="file"
-                accept="audio/*"
-                className="sr-only"
-                aria-label="Reference recording"
-                disabled={voice.busy}
-                onChange={(event) => setFile(event.target.files?.[0] ?? null)}
-              />
-              <button
-                type="button"
-                disabled={voice.busy}
-                onClick={() => picker.current?.click()}
-                onDragOver={(event) => event.preventDefault()}
-                onDrop={(event) => {
-                  event.preventDefault();
-                  if (!voice.busy) setFile(event.dataTransfer.files[0] ?? null);
-                }}
-                className="flex min-h-36 w-full flex-col items-center justify-center rounded-lg border border-dashed bg-white px-5 text-center hover:bg-secondary/30 disabled:opacity-50"
+              <div
+                className="mb-5 flex gap-1 rounded-md bg-secondary/60 p-1"
+                role="group"
+                aria-label="Reference source"
               >
-                <UploadIcon className="mb-3 size-5 text-muted-foreground" />
-                <span className="max-w-full truncate text-sm font-medium">
-                  {file ? file.name : "Choose a recording"}
-                </span>
-                <span className="mt-1 text-xs text-muted-foreground">
-                  {file
-                    ? "Click to replace"
-                    : "Drop an audio file here, or browse"}
-                </span>
-              </button>
-              <label
-                htmlFor="transcript"
-                className="mt-6 mb-2 block text-xs font-medium"
-              >
-                Reference transcript
-              </label>
-              <Textarea
-                id="transcript"
-                value={transcript}
-                onChange={(event) => setTranscript(event.target.value)}
-                disabled={voice.busy}
-                placeholder="The exact words spoken in your recording"
-                className="min-h-36 bg-white text-sm shadow-none"
-              />
-              <p className="mt-2 text-xs leading-5 text-muted-foreground">
-                Use a clear recording and its exact transcript for the closest
-                match.
-              </p>
+                <Button
+                  className="flex-1"
+                  size="sm"
+                  variant={referenceMode === "record" ? "outline" : "ghost"}
+                  disabled={voice.busy}
+                  onClick={() => {
+                    if (referenceMode === "record") return;
+                    setReferenceMode("record");
+                    setFile(null);
+                    setTranscript("");
+                  }}
+                >
+                  Record my voice
+                </Button>
+                <Button
+                  className="flex-1"
+                  size="sm"
+                  variant={referenceMode === "upload" ? "outline" : "ghost"}
+                  disabled={voice.busy}
+                  onClick={() => {
+                    if (referenceMode === "upload") return;
+                    setReferenceMode("upload");
+                    setFile(null);
+                    setTranscript("");
+                  }}
+                >
+                  Upload audio
+                </Button>
+              </div>
+              {referenceMode === "record" ? (
+                <ReferenceRecorder
+                  disabled={voice.busy}
+                  onUse={(recording, words) => {
+                    setFile(recording);
+                    setTranscript(words);
+                  }}
+                />
+              ) : (
+                <>
+                  <input
+                    ref={picker}
+                    type="file"
+                    accept="audio/*"
+                    className="sr-only"
+                    aria-label="Reference recording"
+                    disabled={voice.busy}
+                    onChange={(event) =>
+                      setFile(event.target.files?.[0] ?? null)
+                    }
+                  />
+                  <button
+                    type="button"
+                    disabled={voice.busy}
+                    onClick={() => picker.current?.click()}
+                    onDragOver={(event) => event.preventDefault()}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      if (!voice.busy)
+                        setFile(event.dataTransfer.files[0] ?? null);
+                    }}
+                    className="flex min-h-36 w-full flex-col items-center justify-center rounded-lg border border-dashed bg-white px-5 text-center hover:bg-secondary/30 disabled:opacity-50"
+                  >
+                    <UploadIcon className="mb-3 size-5 text-muted-foreground" />
+                    <span className="max-w-full truncate text-sm font-medium">
+                      {file ? file.name : "Choose a recording"}
+                    </span>
+                    <span className="mt-1 text-xs text-muted-foreground">
+                      {file
+                        ? "Click to replace"
+                        : "Drop an audio file here, or browse"}
+                    </span>
+                  </button>
+                  <label
+                    htmlFor="transcript"
+                    className="mt-6 mb-2 block text-xs font-medium"
+                  >
+                    Reference transcript
+                  </label>
+                  <Textarea
+                    id="transcript"
+                    value={transcript}
+                    onChange={(event) => setTranscript(event.target.value)}
+                    disabled={voice.busy}
+                    placeholder="The exact words spoken in your recording"
+                    className="min-h-36 bg-white text-sm shadow-none"
+                  />
+                  <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                    Use a clear recording and its exact transcript for the
+                    closest match.
+                  </p>
+                </>
+              )}
             </section>
             <section className="min-w-0">
               <div className="mb-5 flex items-center gap-2 text-sm font-medium">
