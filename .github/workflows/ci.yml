@@ -53,12 +53,7 @@ jobs:
       - run: dist plan --output-format=json > dist-plan.json
       - run: python3 .github/scripts/check_release.py dist-plan.json
       - name: Verify release packaging without publishing
-        run: |
-          dist build --artifacts=local --output-format=json > local-dist-manifest.json
-          cp local-dist-manifest.json target/distrib/aarch64-apple-darwin-dist-manifest.json
-          dist build --artifacts=global --output-format=json > global-dist-manifest.json
-          python3 .github/scripts/release_assets.py --output "$RUNNER_TEMP/release-assets" local-dist-manifest.json global-dist-manifest.json
-          python3 .github/scripts/check_release_artifacts.py "$RUNNER_TEMP/release-assets"
+        run: python3 .github/scripts/package_release.py --output "$RUNNER_TEMP/release-assets"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: deepclone-release-preview
