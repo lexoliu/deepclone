@@ -78,7 +78,9 @@ def export(reference, output, context, chunk_layers, weight_bits, resume=False):
         (
             "predictor",
             talker.code_predictor,
-            talker.config.num_code_groups + 1,
+            # Two prefix positions produce the first residual code; only the
+            # remaining groups feed another token. Total positions = groups.
+            talker.config.num_code_groups,
             talker.code_predictor.lm_head,
         ),
     ]:

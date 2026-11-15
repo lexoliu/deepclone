@@ -100,12 +100,15 @@ class DecoderLayer(nn.Module):
         key = rotary(self.key_norm(key), cosine, sine)
         # Fixed-shape cache rotation keeps cache updates inside the execution
         # graph. The caller rejects context exhaustion instead of dropping tokens.
-        keys = torch.cat((keys[:, :, :, 1:], key), dim=3)
+        keys = torch.cat((keys[:, :, 1:, :], key.transpose(2, 3)), dim=2)
         values = torch.cat((values[:, :, 1:, :], value.transpose(2, 3)), dim=2)
         expanded_keys = keys.repeat_interleave(self.groups, dim=1)
         expanded_values = values.repeat_interleave(self.groups, dim=1)
         scores = (
-            torch.matmul(query.transpose(2, 3) * self.scaling, expanded_keys) + mask
+            torch.matmul(
+                query.transpose(2, 3) * self.scaling, expanded_keys.transpose(2, 3)
+            )
+            + mask
         )
         attention = torch.softmax(scores, dim=-1)
         mixed = torch.matmul(attention, expanded_values).transpose(2, 3)
@@ -129,8 +132,8 @@ class DecoderChunk(nn.Module):
                 torch.zeros(
                     1,
                     config.num_key_value_heads,
-                    config.head_dim,
                     context,
+                    config.head_dim,
                     dtype=torch.float16,
                 ),
             )

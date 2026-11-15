@@ -9,12 +9,23 @@ use ondevice_coreml::{Function, Inputs, Tensor, f16};
 pub enum Error {
     #[error(transparent)]
     CoreMl(#[from] ondevice_coreml::Error),
-    #[error(transparent)]
-    Decoder(#[from] crate::decoder::Error),
+    #[error("Talker: {0}")]
+    Talker(crate::decoder::Error),
+    #[error("code predictor: {0}")]
+    Predictor(crate::decoder::Error),
     #[error(transparent)]
     Sampling(#[from] crate::sampling::Error),
     #[error("generation contract: {0}")]
     Contract(&'static str),
+    #[error("token embedding {token}: {source}")]
+    Embedding {
+        token: u32,
+        source: ondevice_coreml::Error,
+    },
+    #[error("codec frame embedding: {0}")]
+    Frame(ondevice_coreml::Error),
+    #[error("output head: {0}")]
+    Head(ondevice_coreml::Error),
 }
 
 /// The predictor input mapping is identity for 0.6B and learned for 1.7B.
@@ -108,7 +119,7 @@ impl<P: PredictorProjection, T: TokenSampler, S: TokenSampler> Generator<P, T, S
         self.networks.predictor.reset();
         let mut last = None;
         for hidden in prefill {
-            last = Some(self.networks.talker.step(hidden)?);
+            last = Some(self.networks.talker.step(hidden).map_err(Error::Talker)?);
         }
         let last = last.ok_or(Error::Contract("prefill must not be empty"))?;
         let pending = Some(head(&mut self.networks.talker_head, &last)?);
@@ -161,18 +172,21 @@ impl<P: PredictorProjection, T: TokenSampler, S: TokenSampler> Sequence<'_, P, T
         let networks = &mut self.generator.networks;
         networks.predictor.reset();
         let past = networks.predictor_projection.project(past)?;
-        networks.predictor.step(past)?;
+        networks.predictor.step(past).map_err(Error::Predictor)?;
         let mut codes = vec![first];
         for index in 0..networks.predictor_heads.len() {
             let embedded = embed(&mut networks.codec_embeddings[index], codes[index])?;
             let projected = networks.predictor_projection.project(embedded)?;
-            let hidden = networks.predictor.step(projected)?;
+            let hidden = networks
+                .predictor
+                .step(projected)
+                .map_err(Error::Predictor)?;
             let (_, mut logits) = head(&mut networks.predictor_heads[index], &hidden)?;
             codes.push(selection.predictor.sample(&mut logits)?);
         }
         let text = self.trailing.next().unwrap_or_else(|| self.padding.clone());
         let embedded = frame(&mut networks.codec_frame, &codes, &text)?;
-        let hidden = networks.talker.step(embedded)?;
+        let hidden = networks.talker.step(embedded).map_err(Error::Talker)?;
         self.pending = Some(head(&mut networks.talker_head, &hidden)?);
         self.history.push(first);
         Ok(Some(codes))
@@ -188,21 +202,31 @@ fn frame(function: &mut Function, codes: &[u32], text: &Tensor<f16>) -> Result<T
     let mut inputs = Inputs::new();
     inputs.insert("codes", &ids)?;
     inputs.insert("text", text)?;
-    Ok(function.predict(&inputs)?.tensor("hidden")?)
+    Ok(function
+        .predict(&inputs)
+        .map_err(Error::Frame)?
+        .tensor("hidden")?)
 }
 
 pub fn embed(function: &mut Function, token: u32) -> Result<Tensor<f16>, Error> {
+    let identifier = token;
     let token = i32::try_from(token).map_err(|_| Error::Contract("token exceeds int32"))?;
     let tensor = Tensor::from_slice(&[1, 1], &[token])?;
     let mut inputs = Inputs::new();
     inputs.insert("token", &tensor)?;
-    Ok(function.predict(&inputs)?.tensor("hidden")?)
+    Ok(function
+        .predict(&inputs)
+        .map_err(|source| Error::Embedding {
+            token: identifier,
+            source,
+        })?
+        .tensor("hidden")?)
 }
 
 fn head(function: &mut Function, hidden: &Tensor<f16>) -> Result<(Tensor<f16>, Vec<f32>), Error> {
     let mut inputs = Inputs::new();
     inputs.insert("hidden", hidden)?;
-    let prediction = function.predict(&inputs)?;
+    let prediction = function.predict(&inputs).map_err(Error::Head)?;
     let logits = prediction
         .tensor::<f16>("logits")?
         .read()

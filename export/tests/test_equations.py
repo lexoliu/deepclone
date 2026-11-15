@@ -8,11 +8,30 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from audio_models import CausalConv
+from audio_models import CausalConv, CausalTranspose
 from transformer import Projection, RmsNorm, gated_silu
 
 
 class Equations(unittest.TestCase):
+    def test_causal_transpose_preserves_phases_and_boundaries(self):
+        for stride in [1, 2, 4, 5, 6, 8]:
+            for kernel in [stride, stride * 2, stride * 2 + 1]:
+                for bias in [False, True]:
+                    conv = nn.ConvTranspose1d(3, 5, kernel, stride=stride, bias=bias)
+                    module = CausalTranspose(
+                        SimpleNamespace(
+                            conv=conv, left_pad=0, right_pad=kernel - stride
+                        )
+                    )
+                    for length in [1, 3, 11]:
+                        x = torch.sin(
+                            torch.arange(3 * length).reshape(1, 3, length).float()
+                        )
+                        expected = conv(x)[..., : length * stride]
+                        torch.testing.assert_close(
+                            module(x), expected, rtol=1e-5, atol=1e-6
+                        )
+
     def test_causal_padding_preserves_every_stride_remainder(self):
         for stride in [1, 2, 4, 5, 6, 8]:
             conv = nn.Conv1d(2, 3, stride * 2, stride=stride)

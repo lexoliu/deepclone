@@ -3,9 +3,71 @@
 import copy
 
 import torch
+from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+    Qwen3TTSTokenizerV2CausalTransConvNet,
+)
 from torch import nn
 from torch.nn import functional as F
 from transformers.models.mimi.modeling_mimi import MimiConv1d, MimiEuclideanCodebook
+
+
+class CausalTranspose(nn.Module):
+    """Exact polyphase form of a causal, right-trimmed transposed convolution."""
+
+    def __init__(self, original):
+        super().__init__()
+        conv = original.conv
+        self.stride = conv.stride[0]
+        if (
+            conv.groups != 1
+            or conv.dilation != (1,)
+            or conv.padding != (0,)
+            or conv.output_padding != (0,)
+        ):
+            raise ValueError(
+                "Causal transpose requires ungrouped, undilated, unpadded convolution"
+            )
+        if (
+            original.left_pad != 0
+            or original.right_pad != conv.kernel_size[0] - self.stride
+        ):
+            raise ValueError(
+                "Causal transpose requires the upstream right-trim boundary"
+            )
+        self.taps = (conv.kernel_size[0] + self.stride - 1) // self.stride
+        weight = F.pad(
+            conv.weight.detach(), (0, self.taps * self.stride - conv.kernel_size[0])
+        )
+        weight = weight.reshape(
+            conv.in_channels, conv.out_channels, self.taps, self.stride
+        )
+        weight = (
+            weight.permute(1, 3, 0, 2)
+            .flip(-1)
+            .reshape(conv.out_channels * self.stride, conv.in_channels, 1, self.taps)
+        )
+        self.weight = nn.Parameter(weight.contiguous())
+        self.bias = (
+            None if conv.bias is None else nn.Parameter(conv.bias.detach().clone())
+        )
+        self.channels = conv.out_channels
+
+    def forward(self, hidden):
+        x = F.pad(hidden.unsqueeze(2), (self.taps - 1, 0))
+        output = F.conv2d(x, self.weight)
+        output = output.reshape(
+            hidden.shape[0], self.channels, self.stride, hidden.shape[-1]
+        )
+        output = output.transpose(2, 3).reshape(hidden.shape[0], self.channels, -1)
+        return output if self.bias is None else output + self.bias.reshape(1, -1, 1)
+
+
+def lower_decoder(module):
+    for name, child in list(module.named_children()):
+        if isinstance(child, Qwen3TTSTokenizerV2CausalTransConvNet):
+            setattr(module, name, CausalTranspose(child))
+        else:
+            lower_decoder(child)
 
 
 class CausalConv(nn.Module):
@@ -97,7 +159,8 @@ class AudioEncoder(nn.Module):
 class AudioDecoder(nn.Module):
     def __init__(self, decoder, frames):
         super().__init__()
-        self.decoder = decoder
+        self.decoder = copy.deepcopy(decoder)
+        lower_decoder(self.decoder)
         self.register_buffer("full_mask", causal_mask(frames))
         self.register_buffer(
             "sliding_mask", causal_mask(frames, decoder.config.sliding_window)

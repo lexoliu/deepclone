@@ -12,6 +12,12 @@ pub enum Error {
     ContextExhausted(usize),
     #[error("decoder sequence failed; reset before continuing")]
     InvalidState,
+    #[error("decoder chunk {chunk}, position {position}: {source}")]
+    Prediction {
+        chunk: usize,
+        position: usize,
+        source: ondevice_coreml::Error,
+    },
 }
 
 /// Independently owned chunk states for one request. Output tensors remain in
@@ -151,13 +157,20 @@ impl Decoder {
         // Prevent accidental continuation after a partially completed chain.
         let next_position = position + 1;
         self.position = None;
-        for chunk in &mut self.chunks {
+        for (index, chunk) in self.chunks.iter_mut().enumerate() {
             let mut inputs = Inputs::new();
             inputs.insert("hidden", &hidden)?;
             inputs.insert("cosine", &cosine)?;
             inputs.insert("sine", &sine)?;
             inputs.insert("mask", &mask)?;
-            hidden = chunk.predict(&inputs)?.tensor("hidden_out")?;
+            hidden = chunk
+                .predict(&inputs)
+                .map_err(|source| Error::Prediction {
+                    chunk: index,
+                    position,
+                    source,
+                })?
+                .tensor("hidden_out")?;
         }
         self.position = Some(next_position);
         Ok(hidden)

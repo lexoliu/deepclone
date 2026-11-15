@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
     fs::File,
-    io::{BufReader, BufWriter},
+    io::{BufReader, BufWriter, Write},
     num::NonZeroUsize,
     path::PathBuf,
     process::ExitCode,
@@ -86,6 +86,8 @@ fn run<T: TokenSampler, S: TokenSampler>(
         "all" => ComputeUnits::All,
         _ => unreachable!("clap validates compute units"),
     };
+    tracing::info!("loading models");
+    let loading_started = Instant::now();
     let mut engine = Engine::open(
         &args.transformers,
         &args.audio_models,
@@ -98,6 +100,10 @@ fn run<T: TokenSampler, S: TokenSampler>(
             minimum_frames: 2,
         },
     )?;
+    tracing::info!(
+        seconds = loading_started.elapsed().as_secs_f64(),
+        "models loaded"
+    );
     let mut reader = hound::WavReader::open(&args.reference)?;
     let spec = reader.spec();
     let interleaved = match spec.sample_format {
@@ -116,7 +122,9 @@ fn run<T: TokenSampler, S: TokenSampler>(
         .collect::<Vec<_>>();
     let transcript: Transcript =
         serde_json::from_reader(BufReader::new(File::open(&args.transcript)?))?;
+    tracing::info!("encoding reference");
     let reference = engine.reference(&samples, spec.sample_rate, &transcript.text)?;
+    tracing::info!("reference encoded");
     let prompts: Vec<Prompt> = serde_json::from_reader(BufReader::new(File::open(&args.prompts)?))?;
     std::fs::create_dir_all(&args.output)?;
     let mut results = Vec::new();
@@ -159,10 +167,9 @@ fn run<T: TokenSampler, S: TokenSampler>(
             reached_eos: output.reached_eos,
             synthesis_seconds: seconds,
         });
-        serde_json::to_writer_pretty(
-            BufWriter::new(File::create(args.output.join("samples.json"))?),
-            &results,
-        )?;
+        let mut metadata = BufWriter::new(File::create(args.output.join("samples.json"))?);
+        serde_json::to_writer_pretty(&mut metadata, &results)?;
+        metadata.flush()?;
         tracing::info!(language=%prompt.language,frames=output.generated_frames,reached_eos=output.reached_eos,seconds,"saved audio");
     }
     Ok(())
@@ -171,6 +178,7 @@ fn run<T: TokenSampler, S: TokenSampler>(
 fn main() -> ExitCode {
     let args = Args::parse();
     let subscriber = tracing_subscriber::fmt()
+        .without_time()
         .with_writer(std::io::stderr)
         .finish();
     tracing::subscriber::with_default(subscriber, || {

@@ -38,7 +38,15 @@ def main():
     parser.add_argument("--models", type=Path, required=True)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--compute-units", choices=["CPU_ONLY", "CPU_AND_NE", "both"], default="both"
+    )
     args = parser.parse_args()
+    units_to_check = (
+        [ct.ComputeUnit.CPU_ONLY, ct.ComputeUnit.CPU_AND_NE]
+        if args.compute_units == "both"
+        else [getattr(ct.ComputeUnit, args.compute_units)]
+    )
     reference = Qwen3TTSModel.from_pretrained(
         str(args.source),
         device_map="cpu",
@@ -74,7 +82,7 @@ def main():
             )
             print(name, value, flush=True)
 
-        for units in [ct.ComputeUnit.CPU_ONLY, ct.ComputeUnit.CPU_AND_NE]:
+        for units in units_to_check:
             native = ct.models.CompiledMLModel(
                 str(args.models / "speaker.mlmodelc"), compute_units=units
             )
@@ -85,13 +93,18 @@ def main():
         ]
         short = codes[..., :capacity]
         expected = codec.decoder(short).numpy()
-        rewritten = AudioDecoder(codec.decoder, capacity)(short).numpy()
+        padded_codes = torch.nn.functional.pad(short, (0, capacity - short.shape[-1]))
+        rewritten = AudioDecoder(codec.decoder, capacity)(padded_codes).numpy()[
+            ..., : expected.shape[-1]
+        ]
         record("decoder_equations", metrics(rewritten, expected))
-        for units in [ct.ComputeUnit.CPU_ONLY, ct.ComputeUnit.CPU_AND_NE]:
+        for units in units_to_check:
             native = ct.models.CompiledMLModel(
                 str(args.models / "decoder.mlmodelc"), compute_units=units
             )
-            actual = native.predict({"codes": short.numpy().astype(np.int32)})["audio"]
+            actual = native.predict({"codes": padded_codes.numpy().astype(np.int32)})[
+                "audio"
+            ][..., : expected.shape[-1]]
             record("decoder_" + units.name, metrics(actual, expected))
             sf.write(
                 args.output / ("decoded_reference_" + units.name + ".wav"),

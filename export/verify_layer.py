@@ -30,7 +30,7 @@ def main():
         rewritten = DecoderLayer(layer, talker.config).eval()
         config = talker.config
         context = embeddings.shape[1]
-        keys = torch.zeros(1, config.num_key_value_heads, config.head_dim, context)
+        keys = torch.zeros(1, config.num_key_value_heads, context, config.head_dim)
         values = torch.zeros(1, config.num_key_value_heads, context, config.head_dim)
         cache = DynamicCache()
         max_error = 0.0

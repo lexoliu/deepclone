@@ -28,6 +28,7 @@ def main():
         help="Mel frames, audio samples, or codec frames",
     )
     parser.add_argument("--weight-bits", type=int, choices=[4, 8, 16], default=16)
+    parser.add_argument("--compute-precision", choices=["fp16", "fp32"], default="fp16")
     args = parser.parse_args()
     if args.capacity <= 0:
         parser.error("capacity must be positive")
@@ -83,7 +84,9 @@ def main():
         minimum_deployment_target=ct.target.macOS15,
         inputs=[ct.TensorType(name=input_name, shape=input_shape, dtype=input_dtype)],
         outputs=[ct.TensorType(name=output_name, dtype=output_dtype)],
-        compute_precision=ct.transform.FP16ComputePrecision(
+        compute_precision=ct.precision.FLOAT32
+        if args.compute_precision == "fp32"
+        else ct.transform.FP16ComputePrecision(
             op_selector=lambda op: (
                 "NearestCode"
                 not in op.scopes.get(ScopeSource.TORCHSCRIPT_MODULE_TYPE, [])
@@ -96,6 +99,8 @@ def main():
         json.dumps(
             {
                 "component": args.component,
+                "compute_precision": args.compute_precision,
+                "weight_bits": args.weight_bits,
                 "capacity": args.capacity,
                 "sample_rate": codec.input_sample_rate,
                 "samples_per_frame": codec.decode_upsample_rate,
