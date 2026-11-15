@@ -9,6 +9,19 @@ on:
 permissions:
   contents: read
 jobs:
+  dependencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
+        with:
+          tool: cargo-audit
+      - run: python3 -m unittest discover -s .github/scripts
+      - run: python3 .github/scripts/check_dependencies.py
   check:
     runs-on: macos-15
     timeout-minutes: 20

@@ -22,3 +22,6 @@ mod text;
 
 #[cfg(all(feature = "streaming", target_vendor = "apple"))]
 pub mod streaming;
+
+#[cfg(feature = "burn")]
+pub mod burn;
