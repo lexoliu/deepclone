@@ -34,8 +34,10 @@ jobs:
       - name: Build archives and installers
         run: |
           dist build --tag "$RELEASE_TAG" --artifacts=local --output-format=json > local-dist-manifest.json
+          cp local-dist-manifest.json target/distrib/aarch64-apple-darwin-dist-manifest.json
           dist build --tag "$RELEASE_TAG" --artifacts=global --output-format=json > global-dist-manifest.json
           python3 .github/scripts/release_assets.py local-dist-manifest.json global-dist-manifest.json
+          python3 .github/scripts/check_release_artifacts.py target/release-assets
       - id: name
         run: echo "artifact=release-${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
