@@ -16,3 +16,9 @@ pub mod mel;
 
 #[cfg(all(feature = "inference", target_vendor = "apple"))]
 pub mod inference;
+
+#[cfg(all(feature = "inference", target_vendor = "apple"))]
+mod text;
+
+#[cfg(all(feature = "streaming", target_vendor = "apple"))]
+pub mod streaming;
