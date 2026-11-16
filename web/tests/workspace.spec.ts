@@ -1,5 +1,22 @@
 import { test, expect } from "@playwright/test";
 
+function referenceWav() {
+  const wav = Buffer.alloc(44 + 4800);
+  wav.write("RIFF");
+  wav.writeUInt32LE(wav.length - 8, 4);
+  wav.write("WAVEfmt ", 8);
+  wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20);
+  wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(24000, 24);
+  wav.writeUInt32LE(48000, 28);
+  wav.writeUInt16LE(2, 32);
+  wav.writeUInt16LE(16, 34);
+  wav.write("data", 36);
+  wav.writeUInt32LE(4800, 40);
+  return { name: "reference.wav", mimeType: "audio/wav", buffer: wav };
+}
+
 test.beforeEach(async ({ page }) => {
   // UI tests never download real weights; GPU contract tests initialize explicitly.
   await page.route("**/models.json", (route) => route.fulfill({ json: [] }));
@@ -279,25 +296,9 @@ test("background preparation stays usable and cancellation terminates an unrespo
   await expect(page.getByLabel("What should your voice say?")).toBeEnabled();
   await expect(page.locator("body")).not.toContainText("Technical model label");
   await page.getByRole("button", { name: "Upload audio", exact: true }).click();
-  // A real, short PCM WAV exercises the reference decoding path.
-  const wav = Buffer.alloc(44 + 4800);
-  wav.write("RIFF");
-  wav.writeUInt32LE(wav.length - 8, 4);
-  wav.write("WAVEfmt ", 8);
-  wav.writeUInt32LE(16, 16);
-  wav.writeUInt16LE(1, 20);
-  wav.writeUInt16LE(1, 22);
-  wav.writeUInt32LE(24000, 24);
-  wav.writeUInt32LE(48000, 28);
-  wav.writeUInt16LE(2, 32);
-  wav.writeUInt16LE(16, 34);
-  wav.write("data", 36);
-  wav.writeUInt32LE(4800, 40);
-  await page.getByLabel("Reference recording", { exact: true }).setInputFiles({
-    name: "reference.wav",
-    mimeType: "audio/wav",
-    buffer: wav,
-  });
+  await page
+    .getByLabel("Reference recording", { exact: true })
+    .setInputFiles(referenceWav());
   await page
     .getByLabel("Reference transcript")
     .fill("法律让人安心。規則への信頼。규칙에 대한 신뢰.");
@@ -368,12 +369,13 @@ test("cancel terminates a real worker that cannot process messages", async ({
     });
   });
   await page.goto("/");
-  await page.getByRole("button", { name: "Start recording" }).click();
-  await page.getByRole("button", { name: "Stop recording" }).click();
-  await page.getByRole("button", { name: "Use this recording" }).click();
-  await expect(
-    page.getByText("Saved on this device", { exact: true }),
-  ).toBeVisible();
+  await page.getByRole("button", { name: "Upload audio", exact: true }).click();
+  await page
+    .getByLabel("Reference recording", { exact: true })
+    .setInputFiles(referenceWav());
+  await page
+    .getByLabel("Reference transcript")
+    .fill("法律让人安心。規則への信頼。규칙에 대한 신뢰.");
   await page
     .getByLabel("What should your voice say?")
     .fill("法律让人安心。規則への信頼。규칙에 대한 신뢰.");
@@ -388,7 +390,7 @@ test("cancel terminates a real worker that cannot process messages", async ({
       page.getByRole("button", { name: "Generate speech" }),
     ).toBeEnabled();
     await expect(
-      page.getByRole("button", { name: "Record again" }),
+      page.getByRole("button", { name: "Upload audio", exact: true }),
     ).toBeEnabled();
   }
 });
