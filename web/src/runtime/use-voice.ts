@@ -10,6 +10,7 @@ export function useVoice() {
   const preparation = useRef<Promise<void> | null>(null);
   const catalogAbort = useRef<AbortController | null>(null);
   const prepared = useRef(false);
+  const reference = useRef<{ file: File; transcript: string } | null>(null);
   const sequence = useRef(0);
   const cancelling = useRef(false);
   const operation = useRef(0);
@@ -68,6 +69,7 @@ export function useVoice() {
     pending.current.clear();
     preparation.current = null;
     prepared.current = false;
+    reference.current = null;
     setLoaded(false);
   }
   function initializeWorker() {
@@ -233,17 +235,25 @@ export function useVoice() {
       const active = new Player();
       player.current = active;
       // Resume during the click gesture, before waiting for background preparation.
+      const reusable =
+        reference.current?.file === file &&
+        reference.current.transcript === transcript;
       const [, , , samples] = await Promise.all([
         active.resume(),
         previous?.close(),
         ensurePrepared(),
-        referenceAudio(file),
+        reusable ? Promise.resolve(null) : referenceAudio(file),
       ]);
       if (current !== operation.current) return;
       times.ready = performance.now();
-      const conditioned = wait("conditioned");
-      send({ kind: "reference", samples, transcript }, [samples.buffer]);
-      await conditioned;
+      if (samples) {
+        reference.current = null;
+        const conditioned = wait("conditioned");
+        send({ kind: "reference", samples, transcript }, [samples.buffer]);
+        await conditioned;
+        if (current !== operation.current) return;
+        reference.current = { file, transcript };
+      }
       times.conditioned = performance.now();
       if (current !== operation.current) return;
       const started = wait("started");

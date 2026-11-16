@@ -254,6 +254,13 @@ test("background preparation stays usable and cancellation terminates an unrespo
             }),
           );
         }
+        if (command.kind === "reference") {
+          Object.assign(window, {
+            referenceCount:
+              ((window as unknown as { referenceCount?: number })
+                .referenceCount ?? 0) + 1,
+          });
+        }
         const event =
           command.kind === "reference"
             ? { kind: "conditioned" }
@@ -338,6 +345,21 @@ test("background preparation stays usable and cancellation terminates an unrespo
     page.getByRole("button", { name: "Generate speech" }),
   ).toBeEnabled();
   await expect(page.getByRole("progressbar")).toHaveCount(0);
+  for (const expected of [1, 2]) {
+    if (expected === 2)
+      await page
+        .getByLabel("Reference transcript")
+        .fill("规则让人安心。規則を信頼する。규칙을 믿는다.");
+    await page.getByRole("button", { name: "Generate speech" }).click();
+    await expect(
+      page.getByRole("link", { name: "Download WAV" }),
+    ).toBeVisible();
+    expect(
+      await page.evaluate(
+        () => (window as unknown as { referenceCount: number }).referenceCount,
+      ),
+    ).toBe(expected);
+  }
 });
 
 test("cancel terminates a real worker that cannot process messages", async ({

@@ -49,20 +49,9 @@ page.on("console", (event) => {
 try {
   await page.goto(values.url!);
   const adapter = await page.evaluate(async () => {
-    const gpu = (
-      navigator as Navigator & {
-        gpu: {
-          requestAdapter(): Promise<{
-            info: {
-              vendor: string;
-              architecture: string;
-              isFallbackAdapter: boolean;
-            };
-          }>;
-        };
-      }
-    ).gpu;
-    const { info } = await gpu.requestAdapter();
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) throw new Error("A WebGPU adapter is required for profiling");
+    const { info } = adapter;
     return {
       vendor: info.vendor,
       architecture: info.architecture,
