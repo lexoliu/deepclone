@@ -2519,7 +2519,7 @@ dependencies = [
  "rand 0.10.3",
  "realfft",
  "rustix 1.1.6",
- "safetensors 0.8.0",
+ "safetensors 0.9.0-dev.0",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -6182,6 +6182,17 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "safetensors"
+version = "0.9.0-dev.0"
+source = "git+https://github.com/lexoliu/safetensors?branch=fix%2Fwasm32-tensor-sizes#27e5185fd0ff43003e2ad0d8b91c2ab4f17b7a9a"
+dependencies = [
+ "hashbrown 0.17.1",
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
