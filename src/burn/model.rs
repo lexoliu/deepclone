@@ -4,7 +4,7 @@ use super::{
     SpeakerConfig, WeightSource, layers::Linear, read,
 };
 use crate::{generation::Model, inference::Error};
-use burn::tensor::{DType, Device, Int, Tensor, TensorData, activation};
+use burn::tensor::{DType, Device, Tensor, TensorData, activation};
 use serde::Deserialize;
 use std::num::NonZeroUsize;
 
@@ -52,6 +52,7 @@ pub struct Burn {
     speaker: Speaker,
     encoder: CodecEncoder,
     decoder: CodecDecoder,
+    decoder_cache: super::codec_decoder::CodecCache,
     device: Device,
     dtype: DType,
 }
@@ -82,6 +83,8 @@ impl Burn {
         } else {
             None
         };
+        let decoder = CodecDecoder::load(audio, &codec.decoder_config)?;
+        let decoder_cache = decoder.cache();
         Ok(Self {
             talker: Decoder::load(speech, "talker.model", c.decoder, capacity)?,
             predictor: Decoder::load(
@@ -107,7 +110,8 @@ impl Burn {
                 codec.encoder_valid_num_quantizers,
                 codec.encode_downsample_rate,
             )?,
-            decoder: CodecDecoder::load(audio, &codec.decoder_config)?,
+            decoder,
+            decoder_cache,
             device: speech.device().clone(),
             dtype: speech.dtype(),
         })
@@ -136,6 +140,7 @@ impl Model for Burn {
     fn reset(&mut self) {
         self.talker.reset();
         self.predictor.reset();
+        self.decoder_cache = self.decoder.cache();
     }
     fn reset_predictor(&mut self) {
         self.predictor.reset();
@@ -242,9 +247,16 @@ impl Model for Burn {
     ) -> Result<Vec<f32>, Error> {
         #[cfg(all(feature = "browser", target_arch = "wasm32"))]
         let started = js_sys::Date::now();
-        let codes =
-            Tensor::<3, Int>::from_data(TensorData::new(packed, [1, groups, frames]), &self.device);
-        let samples = read(self.decoder.forward(codes)).await?;
+        let samples = self
+            .decoder
+            .prefix(
+                packed,
+                groups,
+                frames,
+                &mut self.decoder_cache,
+                &self.device,
+            )
+            .await?;
         #[cfg(all(feature = "browser", target_arch = "wasm32"))]
         codec_timing("Speech codec timing", frames, js_sys::Date::now() - started);
         Ok(samples)

@@ -103,6 +103,7 @@ impl<N: Norm, F: FeedForward> Layer<N, F> {
         cosine: &Tensor<4>,
         sine: &Tensor<4>,
         mask: &Tensor<4, burn::tensor::Bool>,
+        history: &mut Option<(Tensor<4>, Tensor<4>)>,
     ) -> Tensor<3> {
         let [b, t, _] = x.dims();
         let n = self.input.apply(x.clone());
@@ -123,10 +124,19 @@ impl<N: Norm, F: FeedForward> Layer<N, F> {
             .swap_dims(1, 2);
         let q = super::transformer::rotary(q, cosine, sine);
         let k = super::transformer::rotary(k, cosine, sine);
+        let (k, v) = match history.take() {
+            Some((keys, values)) => (
+                Tensor::cat(vec![keys, k], 2),
+                Tensor::cat(vec![values, v], 2),
+            ),
+            None => (k, v),
+        };
+        *history = Some((k.clone(), v.clone()));
+        let keys = k.dims()[2];
         let expand = |x: Tensor<4>| {
-            x.reshape([b, c.num_key_value_heads, 1, t, c.head_dim])
+            x.reshape([b, c.num_key_value_heads, 1, keys, c.head_dim])
                 .repeat_dim(2, c.num_attention_heads / c.num_key_value_heads)
-                .reshape([b, c.num_attention_heads, t, c.head_dim])
+                .reshape([b, c.num_attention_heads, keys, c.head_dim])
         };
         let scores = (q * (c.head_dim as f32).sqrt().recip())
             .matmul(expand(k).swap_dims(2, 3))
@@ -146,6 +156,10 @@ pub(crate) struct AudioTransformer<N, F> {
     layers: Vec<Layer<N, F>>,
     config: AttentionConfig,
     window: Option<usize>,
+}
+pub(crate) struct AudioHistory {
+    layers: Vec<Option<(Tensor<4>, Tensor<4>)>>,
+    frames: usize,
 }
 impl<N: Norm, F: FeedForward> AudioTransformer<N, F> {
     pub fn load(
@@ -173,26 +187,39 @@ impl<N: Norm, F: FeedForward> AudioTransformer<N, F> {
             window,
         })
     }
-    pub fn forward(&self, mut x: Tensor<3>) -> Tensor<3> {
+    pub fn history(&self) -> AudioHistory {
+        AudioHistory {
+            layers: (0..self.layers.len()).map(|_| None).collect(),
+            frames: 0,
+        }
+    }
+    pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+        self.stream(x, &mut self.history())
+    }
+    pub fn stream(&self, mut x: Tensor<3>, history: &mut AudioHistory) -> Tensor<3> {
         let t = x.dims()[1];
         let device = x.device();
-        let (cosine, sine) = rotary_tables(
+        let (cosine, sine) = rotary_tables_at(
             &device,
             x.dtype(),
+            history.frames,
             t,
             self.config.head_dim,
             self.config.rope_theta,
         );
-        let positions = Tensor::<1, Int>::arange(0..t as i64, &device);
-        let distance = positions.clone().reshape([t, 1]) - positions.reshape([1, t]);
+        let total = history.frames + t;
+        let queries = Tensor::<1, Int>::arange(history.frames as i64..total as i64, &device);
+        let keys = Tensor::<1, Int>::arange(0..total as i64, &device);
+        let distance = queries.reshape([t, 1]) - keys.reshape([1, total]);
         let mut mask = distance.clone().lower_elem(0);
         if let Some(window) = self.window {
             mask = mask.bool_or(distance.greater_equal_elem(window as i64));
         }
-        let mask = mask.reshape([1, 1, t, t]);
-        for layer in &self.layers {
-            x = layer.forward(x, &self.config, &cosine, &sine, &mask);
+        let mask = mask.reshape([1, 1, t, total]);
+        for (layer, past) in self.layers.iter().zip(&mut history.layers) {
+            x = layer.forward(x, &self.config, &cosine, &sine, &mask, past);
         }
+        history.frames = total;
         x
     }
 }
@@ -203,9 +230,19 @@ pub(crate) fn rotary_tables(
     width: usize,
     theta: f32,
 ) -> (Tensor<4>, Tensor<4>) {
+    rotary_tables_at(device, dtype, 0, frames, width, theta)
+}
+fn rotary_tables_at(
+    device: &Device,
+    dtype: DType,
+    start: usize,
+    frames: usize,
+    width: usize,
+    theta: f32,
+) -> (Tensor<4>, Tensor<4>) {
     let mut cosines = Vec::with_capacity(frames * width);
     let mut sines = Vec::with_capacity(frames * width);
-    for position in 0..frames {
+    for position in start..start + frames {
         for index in 0..width {
             let frequency = theta.powf(-((2 * (index % (width / 2))) as f32) / width as f32);
             let (s, c) = (position as f32 * frequency).sin_cos();

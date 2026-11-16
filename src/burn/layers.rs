@@ -122,12 +122,37 @@ impl<P: Padding> Conv<P> {
     pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let kernel = (self.weight.dims()[2] - 1) * self.options.dilation[0] + 1;
         let x = self.padding.apply(x, kernel, self.options.stride[0]);
+        self.convolve(x)
+    }
+    fn convolve(&self, x: Tensor<3>) -> Tensor<3> {
         burn::tensor::module::conv1d(
             x,
             self.weight.clone(),
             self.bias.clone(),
             self.options.clone(),
         )
+    }
+}
+
+/// Only the causal receptive field survives between codec spans.
+#[derive(Default)]
+pub(crate) struct ConvHistory {
+    input: Option<Tensor<3>>,
+}
+impl Conv<Causal> {
+    pub fn stream(&self, x: Tensor<3>, history: &mut ConvHistory) -> Tensor<3> {
+        // Every convolution in Qwen's waveform decoder has unit stride.
+        debug_assert_eq!(self.options.stride[0], 1);
+        let context = (self.weight.dims()[2] - 1) * self.options.dilation[0];
+        let x = match history.input.take() {
+            Some(previous) => Tensor::cat(vec![previous, x], 2),
+            None => self.padding.apply(x, context + 1, 1),
+        };
+        let [b, c, t] = x.dims();
+        if context > 0 {
+            history.input = Some(x.clone().slice([0..b, 0..c, t - context..t]));
+        }
+        self.convolve(x)
     }
 }
 
@@ -172,6 +197,26 @@ impl TransposeConv {
         );
         let [b, c, _] = y.dims();
         y.slice([0..b, 0..c, 0..frames])
+    }
+}
+
+impl TransposeConv {
+    pub fn stream(&self, x: Tensor<3>, history: &mut ConvHistory) -> Tensor<3> {
+        let context = (self.weight.dims()[2] - self.stride).div_ceil(self.stride);
+        let (x, previous) = match history.input.take() {
+            Some(previous) => {
+                let frames = previous.dims()[2];
+                (Tensor::cat(vec![previous, x], 2), frames)
+            }
+            None => (x, 0),
+        };
+        let [b, c, t] = x.dims();
+        if context > 0 {
+            history.input = Some(x.clone().slice([0..b, 0..c, t.saturating_sub(context)..t]));
+        }
+        let y = self.forward(x);
+        let [b, c, t] = y.dims();
+        y.slice([0..b, 0..c, previous * self.stride..t])
     }
 }
 

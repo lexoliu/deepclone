@@ -1,7 +1,7 @@
 use super::{
     Error, WeightSource,
-    audio_transformer::{AttentionConfig, AudioTransformer, Gated},
-    layers::{Causal, Conv, LayerNorm, Linear, RmsNorm, TransposeConv},
+    audio_transformer::{AttentionConfig, AudioHistory, AudioTransformer, Gated},
+    layers::{Causal, Conv, ConvHistory, LayerNorm, Linear, RmsNorm, TransposeConv},
 };
 use burn::tensor::{Int, Tensor, activation, module};
 use serde::Deserialize;
@@ -92,12 +92,17 @@ impl Residual {
             conv2: Conv::load(w, &format!("{p}.conv2.conv"), 1, 1, 1, Causal)?,
         })
     }
-    fn forward(&self, x: Tensor<3>) -> Tensor<3> {
-        x.clone()
-            + self
-                .conv2
-                .forward(self.act2.forward(self.conv1.forward(self.act1.forward(x))))
+    fn stream(&self, x: Tensor<3>, history: &mut ResidualHistory) -> Tensor<3> {
+        let y = self
+            .conv1
+            .stream(self.act1.forward(x.clone()), &mut history.first);
+        x + self.conv2.stream(self.act2.forward(y), &mut history.last)
     }
+}
+#[derive(Default)]
+struct ResidualHistory {
+    first: ConvHistory,
+    last: ConvHistory,
 }
 struct Upsample {
     activation: Snake,
@@ -117,13 +122,29 @@ impl Upsample {
                 .collect::<Result<_, _>>()?,
         })
     }
-    fn forward(&self, x: Tensor<3>) -> Tensor<3> {
-        let mut x = self.conv.forward(self.activation.forward(x));
-        for residual in &self.residuals {
-            x = residual.forward(x);
+    fn history(&self) -> UpsampleHistory {
+        UpsampleHistory {
+            conv: ConvHistory::default(),
+            residuals: self
+                .residuals
+                .iter()
+                .map(|_| ResidualHistory::default())
+                .collect(),
+        }
+    }
+    fn stream(&self, x: Tensor<3>, history: &mut UpsampleHistory) -> Tensor<3> {
+        let mut x = self
+            .conv
+            .stream(self.activation.forward(x), &mut history.conv);
+        for (residual, past) in self.residuals.iter().zip(&mut history.residuals) {
+            x = residual.stream(x, past);
         }
         x
     }
+}
+struct UpsampleHistory {
+    conv: ConvHistory,
+    residuals: Vec<ResidualHistory>,
 }
 struct ConvNext {
     depthwise: Conv<Causal>,
@@ -143,10 +164,10 @@ impl ConvNext {
             gamma: w.tensor(&format!("{p}.gamma"))?,
         })
     }
-    fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+    fn stream(&self, x: Tensor<3>, history: &mut ConvHistory) -> Tensor<3> {
         let y = self
             .norm
-            .forward(self.depthwise.forward(x.clone()).swap_dims(1, 2));
+            .forward(self.depthwise.stream(x.clone(), history).swap_dims(1, 2));
         let y = self.last.forward(activation::gelu(self.first.forward(y)))
             * self.gamma.clone().unsqueeze();
         x + y.swap_dims(1, 2)
@@ -155,6 +176,26 @@ impl ConvNext {
 struct PreUpsample {
     conv: TransposeConv,
     block: ConvNext,
+}
+#[derive(Default)]
+struct PreUpsampleHistory {
+    conv: ConvHistory,
+    block: ConvHistory,
+}
+struct CodecHistory {
+    preconv: ConvHistory,
+    transformer: AudioHistory,
+    preupsample: Vec<PreUpsampleHistory>,
+    first: ConvHistory,
+    upsample: Vec<UpsampleHistory>,
+    last: ConvHistory,
+}
+/// The supplied prefix identifies the block, including its official left context.
+pub(crate) struct CodecCache {
+    packed: Vec<i32>,
+    frames: usize,
+    samples: Vec<f32>,
+    history: CodecHistory,
 }
 /// Causal codec reconstruction. Chunk boundaries and left context are owned by
 /// the shared synthesis session; this component decodes the supplied code span.
@@ -237,7 +278,74 @@ impl CodecDecoder {
             )?,
         })
     }
+    pub(crate) fn cache(&self) -> CodecCache {
+        CodecCache {
+            packed: Vec::new(),
+            frames: 0,
+            samples: Vec::new(),
+            history: self.history(),
+        }
+    }
+    pub(crate) async fn prefix(
+        &self,
+        packed: Vec<i32>,
+        groups: usize,
+        frames: usize,
+        cache: &mut CodecCache,
+        device: &burn::tensor::Device,
+    ) -> Result<Vec<f32>, Error> {
+        let extends = frames >= cache.frames
+            && (0..groups).all(|group| {
+                packed[group * frames..group * frames + cache.frames]
+                    == cache.packed[group * cache.frames..(group + 1) * cache.frames]
+            });
+        if !extends {
+            *cache = self.cache();
+        }
+        let appended = frames - cache.frames;
+        if appended > 0 {
+            let suffix: Vec<_> = (0..groups)
+                .flat_map(|group| {
+                    packed[group * frames + cache.frames..(group + 1) * frames]
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            let codes = Tensor::<3, Int>::from_data(
+                burn::tensor::TensorData::new(suffix, [1, groups, appended]),
+                device,
+            );
+            let samples = match super::read(self.stream(codes, &mut cache.history)).await {
+                Ok(samples) => samples,
+                Err(error) => {
+                    *cache = self.cache();
+                    return Err(error);
+                }
+            };
+            cache.samples.extend(samples);
+            cache.frames = frames;
+            cache.packed = packed;
+        }
+        Ok(cache.samples.clone())
+    }
+    fn history(&self) -> CodecHistory {
+        CodecHistory {
+            preconv: ConvHistory::default(),
+            transformer: self.transformer.history(),
+            preupsample: self
+                .preupsample
+                .iter()
+                .map(|_| PreUpsampleHistory::default())
+                .collect(),
+            first: ConvHistory::default(),
+            upsample: self.upsample.iter().map(Upsample::history).collect(),
+            last: ConvHistory::default(),
+        }
+    }
     pub fn forward(&self, codes: Tensor<3, Int>) -> Tensor<3> {
+        self.stream(codes, &mut self.history())
+    }
+    fn stream(&self, codes: Tensor<3, Int>, history: &mut CodecHistory) -> Tensor<3> {
         let [b, g, t] = codes.dims();
         let x = self
             .semantic
@@ -245,20 +353,127 @@ impl CodecDecoder {
             + self
                 .acoustic
                 .decode(codes.slice([0..b, self.semantic_groups..g, 0..t]));
-        let x = self.input.forward(self.preconv.forward(x).swap_dims(1, 2));
+        let x = self
+            .input
+            .forward(self.preconv.stream(x, &mut history.preconv).swap_dims(1, 2));
         let mut x = self
             .output
-            .forward(self.norm.forward(self.transformer.forward(x)))
+            .forward(
+                self.norm
+                    .forward(self.transformer.stream(x, &mut history.transformer)),
+            )
             .swap_dims(1, 2);
-        for stage in &self.preupsample {
-            x = stage.block.forward(stage.conv.forward(x));
+        for (stage, past) in self.preupsample.iter().zip(&mut history.preupsample) {
+            x = stage
+                .block
+                .stream(stage.conv.stream(x, &mut past.conv), &mut past.block);
         }
-        x = self.first.forward(x);
-        for stage in &self.upsample {
-            x = stage.forward(x);
+        x = self.first.stream(x, &mut history.first);
+        for (stage, past) in self.upsample.iter().zip(&mut history.upsample) {
+            x = stage.stream(x, past);
         }
         self.last
-            .forward(self.last_activation.forward(x))
+            .stream(self.last_activation.forward(x), &mut history.last)
             .clamp(-1.0, 1.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::burn::{Weights, read};
+    use burn::tensor::{DType, Device};
+    use std::path::PathBuf;
+
+    #[test]
+    #[ignore = "requires real codec fixtures, pinned official weights and a GPU adapter"]
+    fn cached_codec_prefixes_match_full_decoding_and_official_waveforms() {
+        futures_lite::future::block_on(async {
+            let source = PathBuf::from(std::env::var_os("DEEPCLONE_BURN_SOURCE").unwrap());
+            let fixture = PathBuf::from(std::env::var_os("DEEPCLONE_BURN_FIXTURES").unwrap());
+            let config: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(source.join("speech_tokenizer/config.json")).unwrap(),
+            )
+            .unwrap();
+            let config: CodecDecoderConfig =
+                serde_json::from_value(config["decoder_config"].clone()).unwrap();
+            let device = Device::wgpu_options().init_async().await.unwrap();
+            let bytes = std::fs::read(source.join("speech_tokenizer/model.safetensors")).unwrap();
+            let weights = Weights::new(&bytes, device.clone(), DType::F32).unwrap();
+            let decoder = CodecDecoder::load(&weights, &config).unwrap();
+            let bytes = std::fs::read(fixture.join("audio-fixtures.safetensors")).unwrap();
+            let data = Weights::new(&bytes, device.clone(), DType::F32).unwrap();
+            let codes = data.indices::<3>("codes.80").unwrap();
+            let [_, groups, frames] = codes.dims();
+            let packed = codes
+                .into_data_async()
+                .await
+                .unwrap()
+                .try_into_vec::<i32>()
+                .unwrap();
+            let mut cache = decoder.cache();
+            // Uneven spans cross the 72-frame sliding attention window; repeated
+            // and shorter prefixes exercise reuse and block/session invalidation.
+            for stop in [1, 8, 20, 51, 80, 80, 8, 80] {
+                let prefix: Vec<_> = (0..groups)
+                    .flat_map(|g| packed[g * frames..g * frames + stop].iter().copied())
+                    .collect();
+                let full = read(decoder.forward(Tensor::<3, Int>::from_data(
+                    burn::tensor::TensorData::new(prefix.clone(), [1, groups, stop]),
+                    &device,
+                )))
+                .await
+                .unwrap();
+                let actual = decoder
+                    .prefix(prefix, groups, stop, &mut cache, &device)
+                    .await
+                    .unwrap();
+                assert_eq!(actual.len(), full.len());
+                let error = actual
+                    .iter()
+                    .zip(&full)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(error < 1e-3, "{stop}-frame cached/full error: {error}");
+                if stop == 80 {
+                    let expected = read(data.tensor::<3>("waveform.80").unwrap())
+                        .await
+                        .unwrap();
+                    let error = actual
+                        .iter()
+                        .zip(&expected)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    assert!(error < 1e-3, "cached/official error: {error}");
+                }
+            }
+            // A different real-code span with the same shape cannot reuse state.
+            let mut cache = decoder.cache();
+            for offset in [0, 1] {
+                let prefix: Vec<_> = (0..groups)
+                    .flat_map(|g| {
+                        packed[g * frames + offset..g * frames + offset + 8]
+                            .iter()
+                            .copied()
+                    })
+                    .collect();
+                let full = read(decoder.forward(Tensor::<3, Int>::from_data(
+                    burn::tensor::TensorData::new(prefix.clone(), [1, groups, 8]),
+                    &device,
+                )))
+                .await
+                .unwrap();
+                let actual = decoder
+                    .prefix(prefix, groups, 8, &mut cache, &device)
+                    .await
+                    .unwrap();
+                let error = actual
+                    .iter()
+                    .zip(&full)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(error < 1e-3, "changed-prefix error: {error}");
+            }
+        });
     }
 }
