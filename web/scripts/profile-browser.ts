@@ -53,6 +53,9 @@ const profiler =
 const shaderCaptures: Promise<void>[] = [];
 let shaderIndex = 0;
 let profileSession: string | undefined;
+profiler?.on("Target.detachedFromTarget", ({ sessionId }) => {
+  if (profileSession === sessionId) profileSession = undefined;
+});
 let commandId = 0;
 const replies = new Map<
   number,
@@ -93,12 +96,10 @@ async function profileCommand(
 page.on("console", (event) => {
   if (values.shaders && event.text().startsWith("Speech shader failure")) {
     const path = join(values.shaders, `shader-${shaderIndex++}.json`);
-    shaderCaptures.push(
-      event
-        .args()[1]
-        .jsonValue()
-        .then((value) => writeFile(path, JSON.stringify(value, null, 2))),
+    const value = JSON.parse(
+      event.text().slice("Speech shader failure ".length),
     );
+    shaderCaptures.push(writeFile(path, JSON.stringify(value, null, 2)));
     return;
   }
   if (event.type() === "error") process.stderr.write(`${event.text()}\n`);
