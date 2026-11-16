@@ -1,0 +1,236 @@
+//! Single-query grouped attention directly over the live KV cache.
+use burn::cubecl;
+use burn::{
+    backend::{
+        Backend, Dispatch, TensorMetadata, backend_extension, cubecl::dtype_to_storage_type,
+        ops::FloatTensorOps, tensor::FloatTensor, wgpu::CubeBackend,
+    },
+    cubecl::{ir::ElemType, prelude::*},
+    tensor::{FloatDType, Shape, Tensor as BurnTensor},
+};
+
+#[backend_extension(Cube, Fusion)]
+trait DecodeAttention: Backend {
+    #[fusion(dtype = query, shape = query.clone())]
+    fn decode_attention(
+        query: FloatTensor<Self>,
+        keys: FloatTensor<Self>,
+        values: FloatTensor<Self>,
+        length: usize,
+    ) -> FloatTensor<Self>;
+}
+
+pub(super) fn decode(
+    query: BurnTensor<4>,
+    keys: BurnTensor<4>,
+    values: BurnTensor<4>,
+    length: usize,
+) -> BurnTensor<4> {
+    BurnTensor::from_dispatch(Dispatch::decode_attention(
+        query.into_dispatch(),
+        keys.into_dispatch(),
+        values.into_dispatch(),
+        length,
+    ))
+}
+
+impl DecodeAttention for CubeBackend {
+    fn decode_attention(
+        query: FloatTensor<Self>,
+        keys: FloatTensor<Self>,
+        values: FloatTensor<Self>,
+        length: usize,
+    ) -> FloatTensor<Self> {
+        let shape = query.shape();
+        let output = Self::float_empty(shape.clone(), &query.device, query.dtype.into());
+        let scores = Self::float_empty(
+            Shape::from([shape[1], length]),
+            &query.device,
+            FloatDType::F32,
+        );
+        let dim = CubeDim::new(&query.client, length.max(shape[3]));
+        decode_kernel::launch(
+            &query.client,
+            CubeCount::Static(shape[1] as u32, 1, 1),
+            dim,
+            query.clone().into_tensor_arg(),
+            keys.into_tensor_arg(),
+            values.into_tensor_arg(),
+            scores.into_tensor_arg(),
+            output.clone().into_tensor_arg(),
+            length as u32,
+            dim.num_elems() as usize,
+            dtype_to_storage_type(query.dtype),
+        );
+        output
+    }
+}
+
+#[cube(launch)]
+fn decode_kernel<F: Float>(
+    query: &Tensor<F>,
+    keys: &Tensor<F>,
+    values: &Tensor<F>,
+    scores: &mut Tensor<f32>,
+    output: &mut Tensor<F>,
+    length: u32,
+    #[comptime] lanes: usize,
+    #[define(F)] _dtype: ElemType,
+) {
+    let head = CUBE_POS;
+    let kv_head = head / (query.shape(1) / keys.shape(1));
+    let width = query.shape(3);
+    let length = length as usize;
+    let score_offset = head * length;
+    let mut partial = Shared::<[f32]>::new_slice(lanes);
+    let maximum = RuntimeCell::<f32>::new(-f32::MAX);
+    let mut token = UNIT_POS as usize;
+    while token < length {
+        let dot = RuntimeCell::<f32>::new(0f32);
+        for column in 0..width {
+            dot.store(
+                dot.read()
+                    + f32::cast_from(query[head * query.stride(1) + column * query.stride(3)])
+                        * f32::cast_from(
+                            keys[kv_head * keys.stride(1)
+                                + token * keys.stride(2)
+                                + column * keys.stride(3)],
+                        ),
+            );
+        }
+        // The unfused path stores QK in the activation dtype before FP32 softmax.
+        let score = f32::cast_from(F::cast_from(dot.consume()));
+        scores[score_offset + token] = score;
+        maximum.store(f32::max(maximum.read(), score));
+        token += CUBE_DIM as usize;
+    }
+    partial[UNIT_POS as usize] = maximum.consume();
+    sync_cube();
+    #[unroll]
+    for stage in 0..lanes.ilog2() as usize {
+        let distance = comptime!(lanes >> (stage + 1));
+        if (UNIT_POS as usize) < distance {
+            partial[UNIT_POS as usize] = f32::max(
+                partial[UNIT_POS as usize],
+                partial[UNIT_POS as usize + distance],
+            );
+        }
+        sync_cube();
+    }
+    let maximum = partial[0];
+    // All lanes must read the maximum before reusing the reduction storage.
+    sync_cube();
+    let sum = RuntimeCell::<f32>::new(0f32);
+    let mut token = UNIT_POS as usize;
+    while token < length {
+        let weight = f32::exp(scores[score_offset + token] - maximum);
+        scores[score_offset + token] = weight;
+        sum.store(sum.read() + weight);
+        token += CUBE_DIM as usize;
+    }
+    partial[UNIT_POS as usize] = sum.consume();
+    sync_cube();
+    #[unroll]
+    for stage in 0..lanes.ilog2() as usize {
+        let distance = comptime!(lanes >> (stage + 1));
+        if (UNIT_POS as usize) < distance {
+            partial[UNIT_POS as usize] += partial[UNIT_POS as usize + distance];
+        }
+        sync_cube();
+    }
+    let denominator = partial[0];
+    let mut token = UNIT_POS as usize;
+    while token < length {
+        // Qwen casts softmax probabilities back before multiplying V.
+        scores[score_offset + token] =
+            f32::cast_from(F::cast_from(scores[score_offset + token] / denominator));
+        token += CUBE_DIM as usize;
+    }
+    sync_storage();
+    let mut column = UNIT_POS as usize;
+    while column < width {
+        let mixed = RuntimeCell::<f32>::new(0f32);
+        for token in 0..length {
+            mixed.store(
+                mixed.read()
+                    + scores[score_offset + token]
+                        * f32::cast_from(
+                            values[kv_head * values.stride(1)
+                                + token * values.stride(2)
+                                + column * values.stride(3)],
+                        ),
+            );
+        }
+        let offset = head * output.stride(1) + column;
+        output[offset] = F::cast_from(mixed.consume());
+        column += CUBE_DIM as usize;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::tensor::{DType, Device, TensorData, activation};
+
+    #[test]
+    #[ignore = "requires a WebGPU adapter"]
+    fn decode_attention_matches_unfused_grouped_attention() {
+        futures_lite::future::block_on(async {
+            let device = Device::wgpu_options().init_async().await.unwrap();
+            for dtype in [DType::F16, DType::F32] {
+                for (heads, kv_heads, width, length, capacity) in [
+                    (4, 2, 16, 1, 7),
+                    (16, 8, 128, 15, 32),
+                    (16, 8, 128, 163, 256),
+                    (4, 1, 64, 1027, 2048),
+                    (2, 1, 16, 8193, 9000),
+                ] {
+                    let tensor = |shape: [usize; 4], salt: usize| {
+                        let n = shape.iter().product::<usize>();
+                        BurnTensor::<4>::from_data(
+                            TensorData::new(
+                                (0..n)
+                                    .map(|i| (((i * salt + 7) % 113) as f32 - 56.) / 64.)
+                                    .collect::<Vec<_>>(),
+                                shape,
+                            ),
+                            (&device, dtype),
+                        )
+                    };
+                    let query = tensor([1, heads, 1, width], 19) * (width as f32).sqrt().recip();
+                    let keys = tensor([1, kv_heads, capacity, width], 31);
+                    let values = tensor([1, kv_heads, capacity, width], 47);
+                    let selection = [0..1, 0..kv_heads, 0..length, 0..width];
+                    let groups = heads / kv_heads;
+                    let q = query.clone().reshape([1, kv_heads, groups, 1, width]);
+                    let k = keys
+                        .clone()
+                        .slice(selection.clone())
+                        .reshape([1, kv_heads, 1, length, width]);
+                    let v = values
+                        .clone()
+                        .slice(selection)
+                        .reshape([1, kv_heads, 1, length, width]);
+                    let expected =
+                        activation::softmax(q.matmul(k.swap_dims(3, 4)).cast(DType::F32), 4)
+                            .cast(dtype)
+                            .matmul(v)
+                            .reshape([1, heads, 1, width]);
+                    let (actual, expected) = futures_lite::future::zip(
+                        super::super::read(decode(query, keys, values, length)),
+                        super::super::read(expected),
+                    )
+                    .await;
+                    let maximum = actual
+                        .unwrap()
+                        .into_iter()
+                        .zip(expected.unwrap())
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    let tolerance = if dtype == DType::F16 { 0.002 } else { 1e-5 };
+                    assert!(maximum < tolerance, "{dtype:?} length {length}: {maximum}");
+                }
+            }
+        });
+    }
+}

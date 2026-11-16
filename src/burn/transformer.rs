@@ -98,40 +98,50 @@ impl Layer {
             .inplace(|cache| cache.slice_assign(selection.clone(), k));
         self.values
             .inplace(|cache| cache.slice_assign(selection, v));
-        let selection = [
-            0..1,
-            0..c.num_key_value_heads,
-            0..position + tokens,
-            0..c.head_dim,
-        ];
-        let groups = c.num_attention_heads / c.num_key_value_heads;
-        // Broadcast shared K/V over query groups instead of materializing repeated heads.
-        let q = q.reshape([1, c.num_key_value_heads, groups, tokens, c.head_dim]);
-        let keys = self.keys.clone().slice(selection.clone()).reshape([
-            1,
-            c.num_key_value_heads,
-            1,
-            position + tokens,
-            c.head_dim,
-        ]);
-        let values = self.values.clone().slice(selection).reshape([
-            1,
-            c.num_key_value_heads,
-            1,
-            position + tokens,
-            c.head_dim,
-        ]);
-        let scores = (q * (c.head_dim as f32).sqrt().recip())
-            .matmul(keys.swap_dims(3, 4))
-            .cast(burn::tensor::DType::F32);
-        let scores = match mask {
-            Some(mask) => scores.mask_fill(mask.clone().unsqueeze(), f32::NEG_INFINITY),
-            None => scores,
+        let mixed = if tokens == 1 {
+            super::attention::decode(
+                q * (c.head_dim as f32).sqrt().recip(),
+                self.keys.clone(),
+                self.values.clone(),
+                position + tokens,
+            )
+        } else {
+            let selection = [
+                0..1,
+                0..c.num_key_value_heads,
+                0..position + tokens,
+                0..c.head_dim,
+            ];
+            let groups = c.num_attention_heads / c.num_key_value_heads;
+            // Broadcast shared K/V over query groups instead of materializing repeated heads.
+            let q = q.reshape([1, c.num_key_value_heads, groups, tokens, c.head_dim]);
+            let keys = self.keys.clone().slice(selection.clone()).reshape([
+                1,
+                c.num_key_value_heads,
+                1,
+                position + tokens,
+                c.head_dim,
+            ]);
+            let values = self.values.clone().slice(selection).reshape([
+                1,
+                c.num_key_value_heads,
+                1,
+                position + tokens,
+                c.head_dim,
+            ]);
+            let scores = (q * (c.head_dim as f32).sqrt().recip())
+                .matmul(keys.swap_dims(3, 4))
+                .cast(burn::tensor::DType::F32);
+            let scores = match mask {
+                Some(mask) => scores.mask_fill(mask.clone().unsqueeze(), f32::NEG_INFINITY),
+                None => scores,
+            };
+            activation::softmax(scores, 4)
+                .cast(x.dtype())
+                .matmul(values)
+                .reshape([1, c.num_attention_heads, tokens, c.head_dim])
         };
-        let mixed = activation::softmax(scores, 4)
-            .cast(x.dtype())
-            .matmul(values)
-            .reshape([1, c.num_attention_heads, tokens, c.head_dim])
+        let mixed = mixed
             .swap_dims(1, 2)
             .reshape([1, tokens, c.num_attention_heads * c.head_dim]);
         let x = x + self.output.forward(mixed);
