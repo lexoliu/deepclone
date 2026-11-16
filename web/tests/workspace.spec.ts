@@ -56,7 +56,7 @@ test("published wasm glue exports the browser inference contract", async ({
     const module = await import(url);
     await module.default();
     return [
-      typeof module.ModelBuilder.create,
+      typeof module.BrowserRuntime.create,
       typeof module.TextInput,
       typeof module.BrowserVoice,
     ];
@@ -89,6 +89,32 @@ test("guided recording supplies multilingual passages and reports microphone den
   await expect(
     page.getByRole("button", { name: "Start recording" }),
   ).toBeEnabled();
+});
+
+test("a GPU runtime remains reusable after a rejected model shard", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const rejected = await page.evaluate(async () => {
+    const url = "/wasm/deepclone.js";
+    const module = await import(url);
+    await module.default();
+    const runtime = await module.BrowserRuntime.create();
+    const first = runtime.builder(true);
+    let rejected = false;
+    try {
+      first.upload(new Uint8Array([0]), false);
+    } catch {
+      rejected = true;
+    } finally {
+      first.free();
+    }
+    const second = runtime.builder(true);
+    second.free();
+    runtime.free();
+    return rejected;
+  });
+  expect(rejected).toBe(true);
 });
 
 test("recording requires confirmation and can be replaced", async ({

@@ -5,10 +5,12 @@ import type {
   WasmModule,
   WasmVoice,
   WasmInput,
+  WasmRuntime,
 } from "./contracts";
 import { asset, manifest } from "./assets";
 const scope = self as DedicatedWorkerGlobalScope;
 let module: WasmModule | undefined;
+let runtime: WasmRuntime | undefined;
 let voice: WasmVoice | undefined;
 let input: WasmInput | undefined;
 let operation: AbortController | undefined;
@@ -36,8 +38,9 @@ async function execute(command: Command): Promise<void> {
         }
         if (!module) {
           const url = "/wasm/deepclone.js";
-          module = (await import(/* @vite-ignore */ url)) as WasmModule;
-          await module.default();
+          const loaded = (await import(/* @vite-ignore */ url)) as WasmModule;
+          await loaded.default();
+          module = loaded;
         }
         const model = await manifest(command.model, operation.signal);
         const total = model.files.reduce((sum, f) => sum + f.size, 0);
@@ -51,7 +54,8 @@ async function execute(command: Command): Promise<void> {
           send({ kind: "progress", completed, total, phase: "Loading model" });
           return bytes;
         };
-        const builder = await module.ModelBuilder.create(true);
+        runtime ??= await module.BrowserRuntime.create();
+        const builder = runtime.builder(true);
         let consumed = false;
         try {
           for (const shard of model.shards) {

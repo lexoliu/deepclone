@@ -62,6 +62,10 @@ export interface WasmBuilder {
 }
 export interface WasmModule {
   default(): Promise<unknown>;
-  ModelBuilder: { create(fp16: boolean): Promise<WasmBuilder> };
+  BrowserRuntime: { create(): Promise<WasmRuntime> };
   TextInput: new (capacity: number) => WasmInput;
+}
+export interface WasmRuntime {
+  builder(fp16: boolean): WasmBuilder;
+  free(): void;
 }

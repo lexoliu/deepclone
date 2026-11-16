@@ -7,6 +7,7 @@ export default defineConfig({
     headless: true,
     launchOptions: {
       args: [
+        "--enable-unsafe-webgpu",
         "--use-fake-device-for-media-stream",
         "--use-fake-ui-for-media-stream",
       ],

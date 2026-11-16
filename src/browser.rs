@@ -19,20 +19,30 @@ fn error(value: impl std::fmt::Display) -> JsValue {
 }
 
 #[wasm_bindgen]
+pub struct BrowserRuntime {
+    device: Device,
+}
+#[wasm_bindgen]
+impl BrowserRuntime {
+    pub async fn create() -> Result<BrowserRuntime, JsValue> {
+        let device = Device::wgpu_options().init_async().await.map_err(error)?;
+        Ok(Self { device })
+    }
+    pub fn builder(&self, fp16: bool) -> ModelBuilder {
+        let precision = if fp16 { DType::F16 } else { DType::F32 };
+        ModelBuilder {
+            weights: UploadedWeights::new(self.device.clone(), precision),
+            precision,
+        }
+    }
+}
+#[wasm_bindgen]
 pub struct ModelBuilder {
     weights: UploadedWeights,
     precision: DType,
 }
 #[wasm_bindgen]
 impl ModelBuilder {
-    pub async fn create(fp16: bool) -> Result<ModelBuilder, JsValue> {
-        let device = Device::wgpu_options().init_async().await.map_err(error)?;
-        let precision = if fp16 { DType::F16 } else { DType::F32 };
-        Ok(Self {
-            weights: UploadedWeights::new(device, precision),
-            precision,
-        })
-    }
     pub fn upload(&mut self, bytes: &[u8], conditioning: bool) -> Result<(), JsValue> {
         self.weights
             .upload(
