@@ -104,7 +104,10 @@ page.on("console", (event) => {
     return;
   }
   if (event.type() === "error") process.stderr.write(`${event.text()}\n`);
-  if (event.text().startsWith("Speech codec timing"))
+  if (
+    event.text().startsWith("Speech codec timing") ||
+    event.text().startsWith("Speech diagnostic phase")
+  )
     process.stdout.write(`${JSON.stringify({ codec: event.text() })}\n`);
 });
 try {
@@ -236,6 +239,17 @@ try {
     process.stdout.write(`${JSON.stringify(result)}\n`);
   }
 } catch (reason) {
+  await writeFile(
+    join(values.output!, "failure-state.json"),
+    JSON.stringify(
+      {
+        url: page.url(),
+        text: await page.locator("body").innerText(),
+      },
+      null,
+      2,
+    ),
+  );
   process.stderr.write(
     `${reason instanceof Error ? reason.stack : String(reason)}\n`,
   );

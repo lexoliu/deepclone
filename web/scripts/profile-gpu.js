@@ -5,6 +5,15 @@
   const pipelines = new WeakMap();
   const pending = new Set();
   const totals = new Map();
+  let phase = "preparation";
+  const postMessage = self.postMessage;
+  self.postMessage = function (event, ...rest) {
+    if (["ready", "conditioned", "done", "error"].includes(event.kind))
+      console.info("Speech diagnostic phase", performance.now(), event.kind);
+    if (event.kind === "ready") phase = "conditioning";
+    if (event.kind === "conditioned") phase = "inference";
+    return postMessage.call(this, event, ...rest);
+  };
   const createPipeline = GPUDevice.prototype.createComputePipeline;
   GPUDevice.prototype.createComputePipeline = function (descriptor) {
     const pipeline = createPipeline.call(this, descriptor);
@@ -36,22 +45,20 @@
   const begin = GPUCommandEncoder.prototype.beginComputePass;
   GPUCommandEncoder.prototype.beginComputePass = function (descriptor = {}) {
     const state = encoders.get(this);
+    // Encoders created before CDP injection belong to startup outside this capture.
+    if (!state) return begin.call(this, descriptor);
     if (descriptor.timestampWrites)
       throw new Error("GPU profiling is already active");
-    // WebGPU caps one query set at 8192 queries; every measured pass uses two.
-    if (state.passes.length >= 4096)
-      throw new Error("Too many compute passes in one encoder");
-    state.queries ??= state.device.createQuerySet({
+    const queries = state.device.createQuerySet({
       type: "timestamp",
-      count: 8192,
+      count: 2,
     });
-    const index = state.passes.length * 2;
     const pass = begin.call(this, {
       ...descriptor,
       timestampWrites: {
-        querySet: state.queries,
-        beginningOfPassWriteIndex: index,
-        endOfPassWriteIndex: index + 1,
+        querySet: queries,
+        beginningOfPassWriteIndex: 0,
+        endOfPassWriteIndex: 1,
       },
     });
     const names = [];
@@ -66,14 +73,16 @@
       names.push({ kernel, dimensions });
       dispatch(...dimensions);
     };
-    state.passes.push(names);
+    state.passes.push({ dispatches: names, queries, phase });
     return pass;
   };
   const finish = GPUCommandEncoder.prototype.finish;
   GPUCommandEncoder.prototype.finish = function (descriptor) {
     const state = encoders.get(this);
+    if (!state) return finish.call(this, descriptor);
     if (state.passes.length) {
-      const bytes = state.passes.length * 2 * BigUint64Array.BYTES_PER_ELEMENT;
+      // WebGPU requires query resolve destination offsets aligned to 256 bytes.
+      const bytes = state.passes.length * 256;
       state.resolved = state.device.createBuffer({
         size: bytes,
         usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
@@ -82,12 +91,8 @@
         size: bytes,
         usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
       });
-      this.resolveQuerySet(
-        state.queries,
-        0,
-        state.passes.length * 2,
-        state.resolved,
-        0,
+      state.passes.forEach(({ queries }, i) =>
+        this.resolveQuerySet(queries, 0, 2, state.resolved, i * 256),
       );
       this.copyBufferToBuffer(state.resolved, 0, state.readback, 0, bytes);
     }
@@ -107,21 +112,22 @@
         try {
           await state.readback.mapAsync(GPUMapMode.READ);
           const times = new BigUint64Array(state.readback.getMappedRange());
-          state.passes.forEach((dispatches, i) => {
-            const key = JSON.stringify(dispatches);
+          state.passes.forEach(({ dispatches, phase }, i) => {
+            const key = JSON.stringify({ dispatches, phase });
             const total = totals.get(key) || {
               dispatches,
+              phase,
               passes: 0,
               gpuMs: 0,
             };
             total.passes++;
-            total.gpuMs += Number(times[i * 2 + 1] - times[i * 2]) / 1e6;
+            total.gpuMs += Number(times[i * 32 + 1] - times[i * 32]) / 1e6;
             totals.set(key, total);
           });
         } finally {
           state.readback.destroy();
           state.resolved.destroy();
-          state.queries.destroy();
+          state.passes.forEach(({ queries }) => queries.destroy());
         }
       })();
       pending.add(task);

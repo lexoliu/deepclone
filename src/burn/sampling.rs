@@ -97,7 +97,7 @@ impl Logits for DeviceLogits {
     fn multinomial<R: rand::Rng>(self, sampler: &mut Multinomial<R>) -> Result<DeviceToken, Error> {
         let original = self.0.cast(DType::F32);
         let n = original.dims()[0];
-        let (mut sorted, indices) = original.clone().sort_descending_with_indices(0);
+        let (mut sorted, indices) = super::sort::descending(original.clone());
         if let Some(k) = sampler.parameters.top_k.filter(|k| k.get() < n) {
             let cutoff = sorted.clone().narrow(0, k.get() - 1, 1);
             let excluded = sorted.clone().lower(cutoff);

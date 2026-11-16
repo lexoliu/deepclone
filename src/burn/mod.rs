@@ -2,6 +2,7 @@
 mod codec_decoder;
 mod layers;
 pub mod sampling;
+mod sort;
 pub use codec_decoder::{CodecDecoder, CodecDecoderConfig};
 mod codec_encoder;
 pub use codec_encoder::{CodecEncoder, EncoderConfig};
