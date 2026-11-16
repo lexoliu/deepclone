@@ -15,11 +15,35 @@ export async function verify(
       "Model checksum mismatch. Clear this model's cache and retry.",
     );
 }
-async function download(url: string, signal: AbortSignal): Promise<Uint8Array> {
+async function download(
+  url: string,
+  signal: AbortSignal,
+  size?: number,
+  progress?: (received: number) => void,
+): Promise<Uint8Array> {
   const response = await fetch(url, { signal });
   if (!response.ok)
     throw new Error(`Model download failed (${response.status}).`);
-  return new Uint8Array(await response.arrayBuffer());
+  if (size === undefined) return new Uint8Array(await response.arrayBuffer());
+  if (!response.body) throw new Error("The download has no response body.");
+  const reader = response.body.getReader();
+  const bytes = new Uint8Array(size);
+  let received = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (received + value.length > size)
+        throw new Error("The download exceeds its declared size.");
+      bytes.set(value, received);
+      received += value.length;
+      progress?.(received);
+    }
+    if (received !== size) throw new Error("The download is incomplete.");
+    return bytes;
+  } finally {
+    reader.releaseLock();
+  }
 }
 export async function manifest(
   entry: ModelEntry,
@@ -40,13 +64,23 @@ export async function asset(
   entry: ModelEntry,
   file: Asset,
   signal: AbortSignal,
+  progress?: (received: number) => void,
 ): Promise<Uint8Array> {
   const url = new URL(file.path, entry.manifest).href;
   const cache = await caches.open("deepclone-verified-models-v1");
   const cached = await cache.match(url);
-  const bytes = cached
-    ? new Uint8Array(await cached.arrayBuffer())
-    : await download(url, signal);
+  let bytes: Uint8Array;
+  try {
+    bytes = cached
+      ? new Uint8Array(await cached.arrayBuffer())
+      : await download(url, signal, file.size, progress);
+  } catch (cause) {
+    throw new Error(
+      `Could not ${cached ? "read cached" : "download"} file: ${file.path}`,
+      { cause },
+    );
+  }
+  progress?.(bytes.length);
   if (bytes.byteLength !== file.size)
     throw new Error(`Incomplete model file: ${file.path}`);
   try {

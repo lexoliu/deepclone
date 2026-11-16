@@ -1,4 +1,9 @@
 import { test, expect } from "@playwright/test";
+
+test.beforeEach(async ({ page }) => {
+  // UI tests never download real weights; GPU contract tests initialize explicitly.
+  await page.route("**/models.json", (route) => route.fulfill({ json: [] }));
+});
 test("unsupported browsers receive an actionable message and cannot load", async ({
   page,
 }) => {
@@ -39,8 +44,20 @@ test("workspace remains usable at a narrow viewport", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
   await expect(
-    page.getByText("No models are available.", { exact: false }),
-  ).toBeVisible();
+    page.getByRole("button", { name: "Start recording" }),
+  ).toBeEnabled();
+  await expect(page.getByRole("progressbar")).toHaveCount(0);
+  for (const label of [
+    "Context tokens",
+    "Maximum audio frames",
+    "Frames per audio chunk",
+    "Random seed",
+    "Model",
+    "Generation settings",
+  ]) {
+    await expect(page.getByText(label, { exact: true })).toHaveCount(0);
+  }
+  await expect(page.locator("body")).not.toContainText(/Qwen|0\.6B|1\.7B/);
   expect(
     await page.evaluate(
       () => document.documentElement.scrollWidth <= window.innerWidth,
@@ -150,7 +167,7 @@ test("recording requires confirmation and can be replaced", async ({
   await context.close();
 });
 
-test("cancellation waits for the inference worker before allowing another request", async ({
+test("background preparation keeps the workspace usable and cancellation waits for acknowledgment", async ({
   page,
 }) => {
   await page.addInitScript(() => {
@@ -158,15 +175,48 @@ test("cancellation waits for the inference worker before allowing another reques
     class TestWorker {
       onmessage: ((event: MessageEvent) => void) | null = null;
       onerror = null;
-      postMessage(command: { kind: string }) {
+      postMessage(command: { kind: string; id?: number }) {
+        if (command.kind === "load") {
+          Object.assign(window, {
+            preparationStarted: true,
+            preparationCount:
+              ((window as unknown as { preparationCount?: number })
+                .preparationCount ?? 0) + 1,
+            completePreparation: () =>
+              this.onmessage?.(
+                new MessageEvent("message", { data: { kind: "ready" } }),
+              ),
+          });
+          this.onmessage?.(
+            new MessageEvent("message", {
+              data: {
+                kind: "progress",
+                completed: 1,
+                total: 2,
+                phase: "Technical model label",
+              },
+            }),
+          );
+        }
+        const event =
+          command.kind === "reference"
+            ? { kind: "conditioned" }
+            : command.kind === "start"
+              ? { kind: "started" }
+              : command.kind === "text"
+                ? { kind: "accepted", id: command.id }
+                : command.kind === "finish"
+                  ? { kind: "done" }
+                  : null;
+        if (event)
+          this.onmessage?.(new MessageEvent("message", { data: event }));
         if (command.kind === "cancel") {
-          (
-            window as unknown as { completeCancellation: () => void }
-          ).completeCancellation = () => {
-            this.onmessage?.(
-              new MessageEvent("message", { data: { kind: "cancelled" } }),
-            );
-          };
+          Object.assign(window, {
+            completeCancellation: () =>
+              this.onmessage?.(
+                new MessageEvent("message", { data: { kind: "cancelled" } }),
+              ),
+          });
         }
       }
       terminate() {}
@@ -185,15 +235,77 @@ test("cancellation waits for the inference worker before allowing another reques
     }),
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Load model" }).click();
+  await page.waitForFunction(
+    () =>
+      (window as unknown as { preparationStarted: boolean }).preparationStarted,
+  );
+  await expect(page.getByRole("progressbar")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Start recording" }),
+  ).toBeEnabled();
+  await expect(page.getByLabel("What should your voice say?")).toBeEnabled();
+  await expect(page.locator("body")).not.toContainText("Technical model label");
+  await page.getByRole("button", { name: "Upload audio", exact: true }).click();
+  // A real, short PCM WAV exercises the reference decoding path.
+  const wav = Buffer.alloc(44 + 4800);
+  wav.write("RIFF");
+  wav.writeUInt32LE(wav.length - 8, 4);
+  wav.write("WAVEfmt ", 8);
+  wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20);
+  wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(24000, 24);
+  wav.writeUInt32LE(48000, 28);
+  wav.writeUInt16LE(2, 32);
+  wav.writeUInt16LE(16, 34);
+  wav.write("data", 36);
+  wav.writeUInt32LE(4800, 40);
+  await page.getByLabel("Reference recording", { exact: true }).setInputFiles({
+    name: "reference.wav",
+    mimeType: "audio/wav",
+    buffer: wav,
+  });
+  await page
+    .getByLabel("Reference transcript")
+    .fill("法律让人安心。規則への信頼。규칙에 대한 신뢰.");
+  await page
+    .getByLabel("What should your voice say?")
+    .fill("Hello from my voice.");
+  await page.getByRole("button", { name: "Generate speech" }).click();
+  await expect(page.getByRole("progressbar")).toHaveAttribute(
+    "aria-valuenow",
+    "50",
+  );
   await page.getByRole("button", { name: "Cancel", exact: true }).click();
   await expect(page.getByText("Cancelling…", { exact: true })).toBeVisible();
-  await expect(page.getByLabel("Model", { exact: true })).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "Generate speech" }),
+  ).toHaveCount(0);
   await page.evaluate(() =>
     (
       window as unknown as { completeCancellation: () => void }
     ).completeCancellation(),
   );
   await expect(page.getByText("Cancelled", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Load model" })).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "Generate speech" }),
+  ).toBeEnabled();
+  await expect(page.getByRole("progressbar")).toHaveCount(0);
+  await page.getByRole("button", { name: "Generate speech" }).click();
+  await expect(page.getByRole("progressbar")).toBeVisible();
+  await page.waitForFunction(
+    () =>
+      (window as unknown as { preparationCount: number }).preparationCount ===
+      2,
+  );
+  await page.evaluate(() =>
+    (
+      window as unknown as { completePreparation: () => void }
+    ).completePreparation(),
+  );
+  await expect(page.getByRole("link", { name: "Download WAV" })).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Generate speech" }),
+  ).toBeEnabled();
+  await expect(page.getByRole("progressbar")).toHaveCount(0);
 });

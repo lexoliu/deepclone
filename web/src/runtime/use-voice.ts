@@ -7,13 +7,15 @@ export function useVoice() {
   const pending = useRef(
     new Map<string, { resolve: () => void; reject: (error: Error) => void }>(),
   );
+  const preparation = useRef<Promise<void> | null>(null);
+  const catalogAbort = useRef<AbortController | null>(null);
+  const prepared = useRef(false);
   const sequence = useRef(0);
   const cancelling = useRef(false);
   const operation = useRef(0);
   const audioUrl = useRef<string | null>(null);
-  const [status, setStatus] = useState("Choose a model to begin");
+  const [status, setStatus] = useState("Your voice, ready for something new");
   const [loaded, setLoaded] = useState(false);
-  const [loadedSize, setLoadedSize] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -31,13 +33,12 @@ export function useVoice() {
   }
   function fail(reason: unknown) {
     const value = reason instanceof Error ? reason : new Error(String(reason));
+    console.error("Voice workspace failed", value);
     if (cancelling.current) return;
-    setError(value.message);
+    setError("Speech could not be prepared. Please try again.");
     setBusy(false);
     setRunning(false);
     setStatus("Operation stopped");
-    for (const item of pending.current.values()) item.reject(value);
-    pending.current.clear();
   }
   useEffect(() => {
     const instance = new Worker(
@@ -45,8 +46,13 @@ export function useVoice() {
       { type: "module" },
     );
     worker.current = instance;
+    const workerFailed = (reason: Error) => {
+      for (const item of pending.current.values()) item.reject(reason);
+      pending.current.clear();
+      fail(reason);
+    };
     instance.onerror = (event) =>
-      fail(new Error(event.message || "Inference worker failed."));
+      workerFailed(new Error(event.message || "Inference worker failed."));
     instance.onmessage = (message: MessageEvent<Event>) => {
       const event = message.data;
       if (event.kind === "cancelled") {
@@ -59,12 +65,11 @@ export function useVoice() {
         return;
       }
       if (event.kind === "error") {
-        fail(new Error(event.message));
+        workerFailed(new Error(event.message));
         return;
       }
       if (event.kind === "progress") {
         setProgress((event.completed / event.total) * 100);
-        setStatus(event.phase);
         return;
       }
       if (event.kind === "audio") {
@@ -82,9 +87,8 @@ export function useVoice() {
         return;
       }
       if (event.kind === "ready") {
+        prepared.current = true;
         setLoaded(true);
-        setBusy(false);
-        setStatus("Model ready");
       }
       if (event.kind === "started") {
         setRunning(true);
@@ -109,28 +113,51 @@ export function useVoice() {
       pending.current.get(key)?.resolve();
       pending.current.delete(key);
     };
+    if ((navigator as Navigator & { gpu?: unknown }).gpu) {
+      void ensurePrepared().catch((reason) => {
+        if (!(reason instanceof DOMException && reason.name === "AbortError"))
+          console.error("Background preparation failed", reason);
+      });
+    }
     return () => {
+      catalogAbort.current?.abort();
+      for (const request of pending.current.values())
+        request.reject(new DOMException("Workspace closed", "AbortError"));
+      pending.current.clear();
+      preparation.current = null;
+      prepared.current = false;
       instance.terminate();
       worker.current = null;
       void player.current?.close();
       if (audioUrl.current) URL.revokeObjectURL(audioUrl.current);
     };
   }, []);
-  async function load(model: ModelEntry, context: number, seed: bigint) {
-    cancelling.current = false;
-    setError(null);
-    setBusy(true);
-    setLoaded(false);
+  function ensurePrepared(): Promise<void> {
+    if (prepared.current) return Promise.resolve();
+    if (preparation.current) return preparation.current;
+    const controller = new AbortController();
+    catalogAbort.current = controller;
     setProgress(0);
-    setStatus("Preparing local model");
-    const ready = wait("ready");
-    send({ kind: "load", model, context, seed });
-    try {
+    const task = (async () => {
+      const response = await fetch("/models.json", {
+        signal: controller.signal,
+      });
+      if (!response.ok)
+        throw new Error("The voice catalog could not be loaded.");
+      const entries: ModelEntry[] = await response.json();
+      const model = entries.find((entry) => entry.size === "0.6b");
+      if (!model) throw new Error("The browser voice package is unavailable.");
+      controller.signal.throwIfAborted();
+      const ready = wait("ready");
+      // Browser inference defaults: context capacity and reproducible sampling.
+      send({ kind: "load", model, context: 2048, seed: 42n });
       await ready;
-      setLoadedSize(model.size);
-    } catch (reason) {
-      fail(reason);
-    }
+    })();
+    preparation.current = task;
+    void task.catch(() => {
+      if (preparation.current === task) preparation.current = null;
+    });
+    return task;
   }
   async function push(text: string) {
     if (!text) return;
@@ -144,8 +171,6 @@ export function useVoice() {
     transcript: string,
     text: string,
     language: string,
-    frames: number,
-    chunkFrames: number,
     live: boolean,
   ) {
     cancelling.current = false;
@@ -156,25 +181,34 @@ export function useVoice() {
     setStatus("Preparing reference voice");
     const current = ++operation.current;
     try {
-      if (player.current) await player.current.close();
-      if (current !== operation.current) return;
-      player.current = new Player();
-      await player.current.resume();
-      const samples = await referenceAudio(file);
+      const previous = player.current;
+      const active = new Player();
+      player.current = active;
+      // Resume during the click gesture, before waiting for background preparation.
+      const [, , , samples] = await Promise.all([
+        active.resume(),
+        previous?.close(),
+        ensurePrepared(),
+        referenceAudio(file),
+      ]);
       if (current !== operation.current) return;
       const conditioned = wait("conditioned");
       send({ kind: "reference", samples, transcript }, [samples.buffer]);
       await conditioned;
       if (current !== operation.current) return;
       const started = wait("started");
-      send({ kind: "start", language, frames, chunkFrames });
+      // Bound each utterance and deliver roughly one second per audio chunk.
+      send({ kind: "start", language, frames: 512, chunkFrames: 12 });
       await started;
       if (current !== operation.current) return;
       await push(text);
       if (current !== operation.current) return;
       if (!live) send({ kind: "finish" });
     } catch (reason) {
-      fail(reason);
+      if (current === operation.current) {
+        fail(reason);
+        void player.current?.close();
+      }
     }
   }
   function finish() {
@@ -184,6 +218,7 @@ export function useVoice() {
   function cancel() {
     operation.current++;
     cancelling.current = true;
+    catalogAbort.current?.abort();
     send({ kind: "cancel" });
     void player.current?.close();
     setStatus("Cancelling…");
@@ -191,14 +226,12 @@ export function useVoice() {
   return {
     status,
     loaded,
-    loadedSize,
     busy,
     running,
     progress,
     error,
     audio,
     seconds,
-    load,
     start,
     push,
     finish,

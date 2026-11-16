@@ -44,15 +44,24 @@ async function execute(command: Command): Promise<void> {
         }
         const model = await manifest(command.model, operation.signal);
         const total = model.files.reduce((sum, f) => sum + f.size, 0);
-        let completed = 0;
+        const received = new Map<string, number>();
         const files = new Map(model.files.map((file) => [file.path, file]));
         const read = async (path: string) => {
           const file = files.get(path);
           if (!file) throw new Error(`Missing model file: ${path}`);
-          const bytes = await asset(command.model, file, operation!.signal);
-          completed += bytes.length;
-          send({ kind: "progress", completed, total, phase: "Loading model" });
-          return bytes;
+          return asset(command.model, file, operation!.signal, (bytes) => {
+            received.set(path, bytes);
+            const completed = Array.from(received.values()).reduce(
+              (sum, value) => sum + value,
+              0,
+            );
+            send({
+              kind: "progress",
+              completed,
+              total,
+              phase: "Preparing workspace",
+            });
+          });
         };
         runtime ??= await module.BrowserRuntime.create();
         const builder = runtime.builder(true);
