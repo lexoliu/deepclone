@@ -35,6 +35,53 @@ impl Linear {
     }
 }
 
+/// Independent projections sharing one input execute as one matrix multiplication.
+pub(crate) struct JoinedLinear<const N: usize> {
+    projection: Linear,
+    widths: [usize; N],
+}
+impl<const N: usize> JoinedLinear<N> {
+    pub fn load(weights: &impl WeightSource, prefixes: [String; N]) -> Result<Self, Error> {
+        let layers = prefixes
+            .iter()
+            .map(|p| Linear::load(weights, p))
+            .collect::<Result<Vec<_>, _>>()?;
+        let widths = std::array::from_fn(|i| layers[i].weight.dims()[1]);
+        let bias = if layers.iter().any(|layer| layer.bias.is_some()) {
+            Some(Tensor::cat(
+                layers
+                    .iter()
+                    .map(|layer| {
+                        layer.bias.clone().unwrap_or_else(|| {
+                            Tensor::<1>::zeros([layer.weight.dims()[1]], weights.device())
+                                .cast(weights.dtype())
+                        })
+                    })
+                    .collect(),
+                0,
+            ))
+        } else {
+            None
+        };
+        let weight = Tensor::cat(layers.into_iter().map(|layer| layer.weight).collect(), 1);
+        Ok(Self {
+            projection: Linear { weight, bias },
+            widths,
+        })
+    }
+    pub fn forward(&self, input: Tensor<3>) -> [Tensor<3>; N] {
+        let output = self.projection.forward(input);
+        let [batch, tokens, _] = output.dims();
+        let mut offset = 0;
+        std::array::from_fn(|i| {
+            let end = offset + self.widths[i];
+            let part = output.clone().slice([0..batch, 0..tokens, offset..end]);
+            offset = end;
+            part
+        })
+    }
+}
+
 pub(crate) struct RmsNorm {
     weight: Tensor<1>,
     epsilon: f32,

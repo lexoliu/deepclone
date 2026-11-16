@@ -1,6 +1,6 @@
 use super::{
     Error, WeightSource,
-    layers::{Linear, RmsNorm},
+    layers::{JoinedLinear, Linear, RmsNorm},
 };
 use burn::tensor::{Bool, Int, Tensor, activation};
 use serde::Deserialize;
@@ -22,12 +22,9 @@ struct Layer {
     post: RmsNorm,
     query_norm: RmsNorm,
     key_norm: RmsNorm,
-    query: Linear,
-    key: Linear,
-    value: Linear,
+    qkv: JoinedLinear<3>,
     output: Linear,
-    gate: Linear,
-    up: Linear,
+    gate_up: JoinedLinear<2>,
     down: Linear,
     keys: Tensor<4>,
     values: Tensor<4>,
@@ -49,12 +46,15 @@ impl Layer {
             )?,
             query_norm: RmsNorm::load(w, &format!("{prefix}.self_attn.q_norm"), c.rms_norm_eps)?,
             key_norm: RmsNorm::load(w, &format!("{prefix}.self_attn.k_norm"), c.rms_norm_eps)?,
-            query: Linear::load(w, &format!("{prefix}.self_attn.q_proj"))?,
-            key: Linear::load(w, &format!("{prefix}.self_attn.k_proj"))?,
-            value: Linear::load(w, &format!("{prefix}.self_attn.v_proj"))?,
+            qkv: JoinedLinear::load(
+                w,
+                ["q", "k", "v"].map(|name| format!("{prefix}.self_attn.{name}_proj")),
+            )?,
             output: Linear::load(w, &format!("{prefix}.self_attn.o_proj"))?,
-            gate: Linear::load(w, &format!("{prefix}.mlp.gate_proj"))?,
-            up: Linear::load(w, &format!("{prefix}.mlp.up_proj"))?,
+            gate_up: JoinedLinear::load(
+                w,
+                ["gate", "up"].map(|name| format!("{prefix}.mlp.{name}_proj")),
+            )?,
             down: Linear::load(w, &format!("{prefix}.mlp.down_proj"))?
                 .cast(burn::tensor::DType::F32),
             keys: Tensor::<4>::zeros(shape, w.device()).cast(w.dtype()),
@@ -72,21 +72,16 @@ impl Layer {
     ) -> Tensor<3> {
         let tokens = x.dims()[1];
         let normalized = self.input.forward(x.clone());
+        let [q, k, v] = self.qkv.forward(normalized);
         let q = self.query_norm.forward(
-            self.query
-                .forward(normalized.clone())
-                .reshape([1, tokens, c.num_attention_heads, c.head_dim])
+            q.reshape([1, tokens, c.num_attention_heads, c.head_dim])
                 .swap_dims(1, 2),
         );
         let k = self.key_norm.forward(
-            self.key
-                .forward(normalized.clone())
-                .reshape([1, tokens, c.num_key_value_heads, c.head_dim])
+            k.reshape([1, tokens, c.num_key_value_heads, c.head_dim])
                 .swap_dims(1, 2),
         );
-        let v = self
-            .value
-            .forward(normalized)
+        let v = v
             .reshape([1, tokens, c.num_key_value_heads, c.head_dim])
             .swap_dims(1, 2);
         let q = rotary(q, cosine, sine);
@@ -141,10 +136,8 @@ impl Layer {
             .reshape([1, tokens, c.num_attention_heads * c.head_dim]);
         let x = x + self.output.forward(mixed);
         let normalized = self.post.forward(x.clone());
-        x + self.down.gated(
-            self.gate.forward(normalized.clone()),
-            self.up.forward(normalized),
-        )
+        let [gate, up] = self.gate_up.forward(normalized);
+        x + self.down.gated(gate, up)
     }
 }
 pub(crate) fn rotary(x: Tensor<4>, cosine: &Tensor<4>, sine: &Tensor<4>) -> Tensor<4> {
