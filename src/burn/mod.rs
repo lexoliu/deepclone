@@ -1,5 +1,6 @@
 //! Qwen tensor execution on Burn's WGPU runtime.
 mod codec_decoder;
+mod gemv;
 mod layers;
 pub mod sampling;
 mod sort;

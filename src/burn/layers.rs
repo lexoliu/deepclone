@@ -27,7 +27,12 @@ impl Linear {
     }
     pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let dtype = x.dtype();
-        let y = x.matmul(self.weight.clone().cast(dtype).unsqueeze());
+        let weight = self.weight.clone().cast(dtype);
+        let y = if x.dims()[0] == 1 && x.dims()[1] == 1 {
+            super::gemv::project(x, weight)
+        } else {
+            x.matmul(weight.unsqueeze())
+        };
         match &self.bias {
             Some(bias) => y + bias.clone().cast(dtype).unsqueeze(),
             None => y,
@@ -63,7 +68,16 @@ impl<const N: usize> JoinedLinear<N> {
         } else {
             None
         };
-        let weight = Tensor::cat(layers.into_iter().map(|layer| layer.weight).collect(), 1);
+        // Preserve contiguous input features within each output row so decode
+        // lanes can cooperate on the reduction without repacking every token.
+        let weight = Tensor::cat(
+            layers
+                .into_iter()
+                .map(|layer| layer.weight.transpose())
+                .collect(),
+            0,
+        )
+        .transpose();
         Ok(Self {
             projection: Linear { weight, bias },
             widths,
