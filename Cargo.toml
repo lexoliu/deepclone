@@ -29,7 +29,7 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [dependencies]
-burn = { version = "0.22.1", default-features = false, features = ["std", "wgpu", "webgpu", "fusion"], optional = true }
+burn = { version = "0.22.1", default-features = false, features = ["std", "wgpu", "webgpu", "fusion", "autotune"], optional = true }
 safetensors = { git = "https://github.com/lexoliu/safetensors", branch = "fix/wasm32-tensor-sizes", default-features = false, features = ["alloc"], optional = true }
 rustix = { version = "1.1.6", default-features = false, features = ["std"], optional = true }
 async-io = { version = "2.6.0", default-features = false, optional = true }
