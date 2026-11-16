@@ -4,7 +4,9 @@
   const buffers = new WeakMap();
   const pipelines = new WeakMap();
   const pending = new Set();
+  const failures = [];
   const totals = new Map();
+  let testDevice;
   let phase = "preparation";
   const postMessage = self.postMessage;
   self.postMessage = function (event, ...rest) {
@@ -34,11 +36,13 @@
   };
   const createEncoder = GPUDevice.prototype.createCommandEncoder;
   GPUDevice.prototype.createCommandEncoder = function (descriptor) {
+    const encoder = createEncoder.call(this, descriptor);
+    // Capture steady-state generation, excluding model upload and conditioning.
+    if (phase !== "inference" && this !== testDevice) return encoder;
     if (!this.features.has("timestamp-query"))
       throw new Error(
         "GPU profiling requires timestamp-query on the inference device",
       );
-    const encoder = createEncoder.call(this, descriptor);
     encoders.set(encoder, { device: this, passes: [] });
     return encoder;
   };
@@ -131,15 +135,74 @@
         }
       })();
       pending.add(task);
-      task.finally(() => pending.delete(task));
+      task.then(
+        () => pending.delete(task),
+        (reason) => {
+          pending.delete(task);
+          failures.push(reason);
+        },
+      );
     }
   };
   self.speechGpuProfileTake = async () => {
-    await Promise.all(Array.from(pending));
+    await Promise.allSettled(Array.from(pending));
+    if (failures.length)
+      throw new AggregateError(failures.splice(0), "GPU profiling failed");
     const result = Array.from(totals.values()).sort(
       (a, b) => b.gpuMs - a.gpuMs,
     );
     totals.clear();
     return result;
+  };
+  self.speechGpuProfileSelfTest = async () => {
+    const adapter = await navigator.gpu.requestAdapter();
+    const device = await adapter.requestDevice({
+      requiredFeatures: ["timestamp-query"],
+    });
+    testDevice = device;
+    device.pushErrorScope("validation");
+    const storage = device.createBuffer({
+      size: 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+    const readback = device.createBuffer({
+      size: 4,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    try {
+      const module = device.createShaderModule({
+        code: "@group(0) @binding(0) var<storage, read_write> value: array<u32>; @compute @workgroup_size(1) fn main() { value[0] = 7u; }",
+      });
+      const pipeline = device.createComputePipeline({
+        label: "profiler-self-test",
+        layout: "auto",
+        compute: { module, entryPoint: "main" },
+      });
+      const group = device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [{ binding: 0, resource: { buffer: storage } }],
+      });
+      const encoder = device.createCommandEncoder();
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, group);
+      pass.dispatchWorkgroups(1);
+      pass.end();
+      encoder.copyBufferToBuffer(storage, 0, readback, 0, 4);
+      device.queue.submit([encoder.finish()]);
+      await readback.mapAsync(GPUMapMode.READ);
+      const value = new Uint32Array(readback.getMappedRange())[0];
+      const result = await self.speechGpuProfileTake();
+      const error = await device.popErrorScope();
+      if (error) throw new Error(error.message);
+      if (value !== 7 || result.length !== 1 || result[0].passes !== 1)
+        throw new Error("GPU profiler self-test failed");
+      return result;
+    } finally {
+      readback.destroy();
+      storage.destroy();
+      testDevice = undefined;
+      device.destroy();
+    }
   };
 })();

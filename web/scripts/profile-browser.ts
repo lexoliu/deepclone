@@ -46,6 +46,10 @@ if (values.shaders) await mkdir(values.shaders, { recursive: true });
 const browser = await chromium.connectOverCDP(values.cdp!);
 const page = await browser.contexts()[0].newPage();
 page.setDefaultTimeout(timeout);
+// Artifacts share module URLs; an older mtime must not reuse a newer cached Wasm.
+const network = await page.context().newCDPSession(page);
+await network.send("Network.clearBrowserCache");
+await network.detach();
 const measurements: unknown[] = [];
 const profiler =
   values.profile || values.shaders || values["gpu-profile"]
@@ -166,6 +170,17 @@ try {
       })) as { exceptionDetails?: unknown };
       if (result.exceptionDetails)
         throw new Error(JSON.stringify(result.exceptionDetails));
+      const checked = (await profileCommand("Runtime.evaluate", {
+        expression: "speechGpuProfileSelfTest()",
+        awaitPromise: true,
+        returnByValue: true,
+      })) as { result: { value: unknown }; exceptionDetails?: unknown };
+      if (checked.exceptionDetails)
+        throw new Error(JSON.stringify(checked.exceptionDetails));
+      await writeFile(
+        join(values.output!, "gpu-profiler-self-test.json"),
+        JSON.stringify(checked.result.value, null, 2),
+      );
     }
     if (values.profile) {
       await profileCommand("Profiler.enable");
