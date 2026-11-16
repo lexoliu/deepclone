@@ -14,6 +14,12 @@ export function useVoice() {
   const cancelling = useRef(false);
   const operation = useRef(0);
   const audioUrl = useRef<string | null>(null);
+  const timing = useRef<{
+    requested: number;
+    ready?: number;
+    conditioned?: number;
+    firstAudio?: number;
+  } | null>(null);
   const [status, setStatus] = useState("Your voice, ready for something new");
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -22,6 +28,15 @@ export function useVoice() {
   const [error, setError] = useState<string | null>(null);
   const [audio, setAudio] = useState<string | null>(null);
   const [seconds, setSeconds] = useState(0);
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (!busy) return;
+    const timer = setInterval(() => {
+      if (timing.current)
+        setElapsed((performance.now() - timing.current.requested) / 1000);
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [busy]);
   function send(command: Command, transfer: Transferable[] = []) {
     if (!worker.current) throw new Error("Inference worker is unavailable.");
     worker.current.postMessage(command, transfer);
@@ -40,13 +55,29 @@ export function useVoice() {
     setRunning(false);
     setStatus("Operation stopped");
   }
-  useEffect(() => {
+  function stopWorker() {
+    catalogAbort.current?.abort();
+    if (worker.current) {
+      worker.current.onmessage = null;
+      worker.current.onerror = null;
+      worker.current.terminate();
+      worker.current = null;
+    }
+    for (const request of pending.current.values())
+      request.reject(new DOMException("Cancelled", "AbortError"));
+    pending.current.clear();
+    preparation.current = null;
+    prepared.current = false;
+    setLoaded(false);
+  }
+  function initializeWorker() {
     const instance = new Worker(
       new URL("./inference.worker.ts", import.meta.url),
       { type: "module" },
     );
     worker.current = instance;
     const workerFailed = (reason: Error) => {
+      if (instance !== worker.current) return;
       for (const item of pending.current.values()) item.reject(reason);
       pending.current.clear();
       fail(reason);
@@ -54,16 +85,8 @@ export function useVoice() {
     instance.onerror = (event) =>
       workerFailed(new Error(event.message || "Inference worker failed."));
     instance.onmessage = (message: MessageEvent<Event>) => {
+      if (instance !== worker.current) return;
       const event = message.data;
-      if (event.kind === "cancelled") {
-        for (const request of pending.current.values())
-          request.reject(new DOMException("Cancelled", "AbortError"));
-        pending.current.clear();
-        setRunning(false);
-        setBusy(false);
-        setStatus("Cancelled");
-        return;
-      }
       if (event.kind === "error") {
         workerFailed(new Error(event.message));
         return;
@@ -73,6 +96,12 @@ export function useVoice() {
         return;
       }
       if (event.kind === "audio") {
+        if (timing.current && timing.current.firstAudio === undefined) {
+          timing.current.firstAudio = performance.now();
+          console.info("Speech first audio", {
+            elapsedMs: timing.current.firstAudio - timing.current.requested,
+          });
+        }
         setStatus("Generating and playing");
         setSeconds((value) => value + event.samples.length / event.sampleRate);
         void player
@@ -83,7 +112,9 @@ export function useVoice() {
               id: event.id,
             } satisfies Command),
           )
-          .catch(fail);
+          .catch((reason) => {
+            if (instance === worker.current) fail(reason);
+          });
         return;
       }
       if (event.kind === "ready") {
@@ -95,11 +126,24 @@ export function useVoice() {
         setStatus("Generating speech");
       }
       if (event.kind === "done") {
+        const completed = performance.now();
+        const times = timing.current;
+        if (times)
+          console.info("Speech generation timing", {
+            totalMs: completed - times.requested,
+            preparationMs: times.ready! - times.requested,
+            conditioningMs: times.conditioned! - times.ready!,
+            inferenceMs: completed - times.conditioned!,
+            firstAudioMs:
+              times.firstAudio === undefined
+                ? null
+                : times.firstAudio - times.requested,
+          });
         const active = player.current;
         void active
           ?.finish()
           .then(() => {
-            if (cancelling.current) return;
+            if (instance !== worker.current || cancelling.current) return;
             if (audioUrl.current) URL.revokeObjectURL(audioUrl.current);
             audioUrl.current = URL.createObjectURL(active.wav());
             setAudio(audioUrl.current);
@@ -107,7 +151,9 @@ export function useVoice() {
             setBusy(false);
             setStatus("Ready to listen");
           })
-          .catch(fail);
+          .catch((reason) => {
+            if (instance === worker.current) fail(reason);
+          });
       }
       const key = event.kind === "accepted" ? `text:${event.id}` : event.kind;
       pending.current.get(key)?.resolve();
@@ -119,15 +165,12 @@ export function useVoice() {
           console.error("Background preparation failed", reason);
       });
     }
+  }
+  useEffect(() => {
+    initializeWorker();
     return () => {
-      catalogAbort.current?.abort();
-      for (const request of pending.current.values())
-        request.reject(new DOMException("Workspace closed", "AbortError"));
-      pending.current.clear();
-      preparation.current = null;
-      prepared.current = false;
-      instance.terminate();
-      worker.current = null;
+      operation.current++;
+      stopWorker();
       void player.current?.close();
       if (audioUrl.current) URL.revokeObjectURL(audioUrl.current);
     };
@@ -177,9 +220,14 @@ export function useVoice() {
     setError(null);
     setBusy(true);
     setSeconds(0);
+    setElapsed(0);
     setAudio(null);
     setStatus("Preparing reference voice");
     const current = ++operation.current;
+    const times = { requested: performance.now() } as NonNullable<
+      typeof timing.current
+    >;
+    timing.current = times;
     try {
       const previous = player.current;
       const active = new Player();
@@ -192,9 +240,11 @@ export function useVoice() {
         referenceAudio(file),
       ]);
       if (current !== operation.current) return;
+      times.ready = performance.now();
       const conditioned = wait("conditioned");
       send({ kind: "reference", samples, transcript }, [samples.buffer]);
       await conditioned;
+      times.conditioned = performance.now();
       if (current !== operation.current) return;
       const started = wait("started");
       // Bound each utterance and deliver roughly one second per audio chunk.
@@ -218,10 +268,14 @@ export function useVoice() {
   function cancel() {
     operation.current++;
     cancelling.current = true;
-    catalogAbort.current?.abort();
-    send({ kind: "cancel" });
+    stopWorker();
     void player.current?.close();
-    setStatus("Cancelling…");
+    player.current = null;
+    setRunning(false);
+    setBusy(false);
+    setError(null);
+    setStatus("Cancelled");
+    initializeWorker();
   }
   return {
     status,
@@ -232,6 +286,7 @@ export function useVoice() {
     error,
     audio,
     seconds,
+    elapsed,
     start,
     push,
     finish,

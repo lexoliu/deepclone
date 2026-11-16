@@ -134,10 +134,11 @@ test("a GPU runtime remains reusable after a rejected model shard", async ({
   expect(rejected).toBe(true);
 });
 
-test("recording requires confirmation and can be replaced", async ({
+test("confirmed recordings survive refresh, replacement and deletion", async ({
   browser,
 }) => {
   const context = await browser.newContext();
+  await context.route("**/models.json", (route) => route.fulfill({ json: [] }));
   const page = await context.newPage();
   await page.goto("/");
   await page.getByRole("button", { name: "Start recording" }).click();
@@ -149,25 +150,63 @@ test("recording requires confirmation and can be replaced", async ({
   await expect(page.getByLabel("Review your recording")).toBeVisible();
   await page.getByRole("button", { name: "Use this recording" }).click();
   await expect(
-    page.getByRole("button", { name: "Voice selected" }),
-  ).toBeDisabled();
-  await page
-    .getByRole("button", { name: "Record my voice", exact: true })
-    .click();
-  await expect(
-    page.getByRole("button", { name: "Voice selected" }),
+    page.getByText("Saved on this device", { exact: true }),
   ).toBeVisible();
+  await page.reload();
+  await expect(page.getByLabel("Saved voice recording")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Start recording" }),
+  ).toHaveCount(0);
   await page.getByRole("button", { name: "Record again" }).click();
+  await page.getByRole("button", { name: "Start recording" }).click();
   await page.getByRole("button", { name: "Stop recording" }).click();
   await expect(
     page.getByRole("button", { name: "Use this recording" }),
   ).toBeEnabled();
   await page.getByLabel("Language you will read").selectOption("Japanese");
   await expect(page.getByLabel("Review your recording")).toHaveCount(0);
+  await page.getByRole("button", { name: "Start recording" }).click();
+  await page.getByRole("button", { name: "Stop recording" }).click();
+  await page.getByRole("button", { name: "Use this recording" }).click();
+  await expect(
+    page.getByText("Saved on this device", { exact: true }),
+  ).toBeVisible();
+  await page.reload();
+  await expect(
+    page.getByText("静かな朝に窓を開けると", { exact: false }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Delete voice" }).click();
+  await expect(page.getByLabel("Saved voice recording")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Start recording" }),
+  ).toBeEnabled();
+  // Wait for the deletion transaction to commit, then verify a new page load.
+  await page.waitForFunction(async () => {
+    const request = indexedDB.open("deepclone-voices");
+    const db = await new Promise<IDBDatabase>((resolve) => {
+      request.onsuccess = () => resolve(request.result);
+    });
+    try {
+      const read = db
+        .transaction("reference")
+        .objectStore("reference")
+        .get("selected");
+      return await new Promise<boolean>((resolve) => {
+        read.onsuccess = () => resolve(read.result === undefined);
+      });
+    } finally {
+      db.close();
+    }
+  });
+  await page.reload();
+  await expect(
+    page.getByRole("button", { name: "Start recording" }),
+  ).toBeEnabled();
+  await expect(page.getByLabel("Saved voice recording")).toHaveCount(0);
   await context.close();
 });
 
-test("background preparation keeps the workspace usable and cancellation waits for acknowledgment", async ({
+test("background preparation stays usable and cancellation terminates an unresponsive worker", async ({
   page,
 }) => {
   await page.addInitScript(() => {
@@ -210,16 +249,10 @@ test("background preparation keeps the workspace usable and cancellation waits f
                   : null;
         if (event)
           this.onmessage?.(new MessageEvent("message", { data: event }));
-        if (command.kind === "cancel") {
-          Object.assign(window, {
-            completeCancellation: () =>
-              this.onmessage?.(
-                new MessageEvent("message", { data: { kind: "cancelled" } }),
-              ),
-          });
-        }
       }
-      terminate() {}
+      terminate() {
+        Object.assign(window, { terminated: true });
+      }
     }
     Object.defineProperty(window, "Worker", { value: TestWorker });
   });
@@ -277,15 +310,11 @@ test("background preparation keeps the workspace usable and cancellation waits f
     "50",
   );
   await page.getByRole("button", { name: "Cancel", exact: true }).click();
-  await expect(page.getByText("Cancelling…", { exact: true })).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: "Generate speech" }),
-  ).toHaveCount(0);
-  await page.evaluate(() =>
-    (
-      window as unknown as { completeCancellation: () => void }
-    ).completeCancellation(),
-  );
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { terminated: boolean }).terminated,
+    ),
+  ).toBe(true);
   await expect(page.getByText("Cancelled", { exact: true })).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Generate speech" }),
@@ -308,4 +337,58 @@ test("background preparation keeps the workspace usable and cancellation waits f
     page.getByRole("button", { name: "Generate speech" }),
   ).toBeEnabled();
   await expect(page.getByRole("progressbar")).toHaveCount(0);
+});
+
+test("cancel terminates a real worker that cannot process messages", async ({
+  page,
+}) => {
+  await page.addInitScript(() =>
+    Object.defineProperty(navigator, "gpu", { value: {}, configurable: true }),
+  );
+  await page.route("**/models.json", (route) =>
+    route.fulfill({
+      json: [
+        {
+          size: "0.6b",
+          manifest: "https://example.test/model.json",
+          sha256: "0".repeat(64),
+        },
+      ],
+    }),
+  );
+  await page.context().route("**/inference.worker-*.js", (route) => {
+    return route.fulfill({
+      path: new URL("./fixtures/unresponsive-worker.js", import.meta.url)
+        .pathname,
+      contentType: "text/javascript",
+      headers: {
+        "Cross-Origin-Embedder-Policy": "require-corp",
+        "Cross-Origin-Resource-Policy": "same-origin",
+      },
+    });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Start recording" }).click();
+  await page.getByRole("button", { name: "Stop recording" }).click();
+  await page.getByRole("button", { name: "Use this recording" }).click();
+  await expect(
+    page.getByText("Saved on this device", { exact: true }),
+  ).toBeVisible();
+  await page
+    .getByLabel("What should your voice say?")
+    .fill("法律让人安心。規則への信頼。규칙에 대한 신뢰.");
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await page.getByRole("button", { name: "Generate speech" }).click();
+    await expect(
+      page.getByRole("status").filter({ hasText: "Generating speech" }),
+    ).toBeVisible();
+    await page.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(page.getByText("Cancelled", { exact: true })).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Generate speech" }),
+    ).toBeEnabled();
+    await expect(
+      page.getByRole("button", { name: "Record again" }),
+    ).toBeEnabled();
+  }
 });

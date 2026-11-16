@@ -15,7 +15,6 @@ let voice: WasmVoice | undefined;
 let input: WasmInput | undefined;
 let operation: AbortController | undefined;
 let running = false;
-let cancelled = false;
 let audioId = 0;
 const pending = new Map<
   number,
@@ -29,7 +28,6 @@ async function execute(command: Command): Promise<void> {
     case "load": {
       if (running || operation)
         throw new Error("An operation is already running.");
-      cancelled = false;
       operation = new AbortController();
       try {
         if (voice) {
@@ -100,7 +98,6 @@ async function execute(command: Command): Promise<void> {
     case "reference": {
       if (!voice || running || operation)
         throw new Error("Load a model before preparing a voice.");
-      cancelled = false;
       operation = new AbortController();
       try {
         await voice.reference(command.samples, 24000, command.transcript);
@@ -114,7 +111,6 @@ async function execute(command: Command): Promise<void> {
     case "start": {
       if (!voice || !module || running || operation)
         throw new Error("The voice is not ready.");
-      cancelled = false;
       running = true;
       input = new module.TextInput(2);
       send({ kind: "started" });
@@ -136,7 +132,7 @@ async function execute(command: Command): Promise<void> {
             await acknowledged;
           },
         );
-        send({ kind: cancelled ? "cancelled" : "done" });
+        send({ kind: "done" });
       } finally {
         input.free();
         input = undefined;
@@ -153,13 +149,6 @@ async function execute(command: Command): Promise<void> {
       if (!input) throw new Error("No active text stream.");
       input.finish();
       return;
-    case "cancel":
-      cancelled = true;
-      operation?.abort();
-      input?.cancel();
-      for (const p of pending.values()) p.reject(new Error("Cancelled"));
-      if (!operation && !running) send({ kind: "cancelled" });
-      return;
     case "ack": {
       const request = pending.get(command.id);
       if (!request) throw new Error("Unknown audio acknowledgement.");
@@ -171,13 +160,9 @@ async function execute(command: Command): Promise<void> {
 }
 scope.onmessage = (event: MessageEvent<Command>) => {
   void execute(event.data).catch((error) => {
-    if (cancelled) {
-      if (!operation && !running) send({ kind: "cancelled" });
-    } else {
-      send({
-        kind: "error",
-        message: error instanceof Error ? error.message : String(error),
-      });
-    }
+    send({
+      kind: "error",
+      message: error instanceof Error ? error.message : String(error),
+    });
   });
 };

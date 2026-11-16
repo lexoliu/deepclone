@@ -61,11 +61,13 @@ const passages = [
 export function ReferenceRecorder({
   disabled,
   onUse,
+  initialLanguage = "English",
 }: {
   disabled: boolean;
-  onUse: (file: File | null, text: string) => void;
+  initialLanguage?: string;
+  onUse: (file: File | null, text: string, language: string) => void;
 }) {
-  const [language, setLanguage] = useState("English");
+  const [language, setLanguage] = useState(initialLanguage);
   const [phase, setPhase] = useState<
     "idle" | "requesting" | "recording" | "review" | "used"
   >("idle");
@@ -84,7 +86,7 @@ export function ReferenceRecorder({
     url.current = null;
     setPreview(null);
     setSeconds(0);
-    onUse(null, "");
+    onUse(null, "", language);
   }
   useEffect(() => {
     alive.current = true;
@@ -265,7 +267,7 @@ export function ReferenceRecorder({
             <Button
               disabled={disabled || phase === "used"}
               onClick={() => {
-                onUse(recorded.current, passage.text);
+                onUse(recorded.current, passage.text, language);
                 setPhase("used");
               }}
             >

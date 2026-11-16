@@ -12,14 +12,29 @@ import { Progress } from "@/components/ui/progress";
 import { useVoice } from "@/runtime/use-voice";
 
 import { ReferenceRecorder } from "./ReferenceRecorder";
+import { SavedVoice } from "./SavedVoice";
+import { useReference } from "@/runtime/use-reference";
 
 export default function App() {
   const [referenceMode, setReferenceMode] = useState<"record" | "upload">(
     "record",
   );
   const voice = useVoice();
-  const [file, setFile] = useState<File | null>(null);
-  const [transcript, setTranscript] = useState("");
+  const reference = useReference();
+  const [replacing, setReplacing] = useState(false);
+  const file = reference.value?.file ?? null;
+  const transcript = reference.value?.transcript ?? "";
+  const [draftTranscript, setDraftTranscript] = useState("");
+  function chooseFile(file: File | null) {
+    if (file)
+      reference.save({
+        file,
+        transcript: draftTranscript,
+        source: "upload",
+        language: "auto",
+      });
+  }
+  const referenceDisabled = voice.busy || !reference.ready;
   const [text, setText] = useState("");
   const [language, setLanguage] = useState("auto");
   const [live, setLive] = useState(false);
@@ -59,7 +74,7 @@ export default function App() {
     setInputEnded(false);
     await voice.start(file, transcript, text, language, live);
   }
-  const error = formError || voice.error;
+  const error = formError || voice.error || reference.error;
   return (
     <div className="min-h-[100dvh]">
       <header className="flex h-16 items-center justify-between border-b px-5 md:px-9">
@@ -112,12 +127,11 @@ export default function App() {
                   className="flex-1"
                   size="sm"
                   variant={referenceMode === "record" ? "outline" : "ghost"}
-                  disabled={voice.busy}
+                  disabled={referenceDisabled}
                   onClick={() => {
                     if (referenceMode === "record") return;
                     setReferenceMode("record");
-                    setFile(null);
-                    setTranscript("");
+                    setReplacing(false);
                   }}
                 >
                   Record my voice
@@ -126,25 +140,50 @@ export default function App() {
                   className="flex-1"
                   size="sm"
                   variant={referenceMode === "upload" ? "outline" : "ghost"}
-                  disabled={voice.busy}
+                  disabled={referenceDisabled}
                   onClick={() => {
                     if (referenceMode === "upload") return;
                     setReferenceMode("upload");
-                    setFile(null);
-                    setTranscript("");
+                    setReplacing(false);
                   }}
                 >
                   Upload audio
                 </Button>
               </div>
               {referenceMode === "record" ? (
-                <ReferenceRecorder
-                  disabled={voice.busy}
-                  onUse={(recording, words) => {
-                    setFile(recording);
-                    setTranscript(words);
-                  }}
-                />
+                reference.value && !replacing ? (
+                  <SavedVoice
+                    reference={reference.value}
+                    disabled={referenceDisabled}
+                    saving={reference.saving}
+                    error={reference.error}
+                    onReplace={() => setReplacing(true)}
+                    onDelete={() => {
+                      reference.save(null);
+                      setReplacing(false);
+                    }}
+                  />
+                ) : (
+                  <ReferenceRecorder
+                    initialLanguage={
+                      reference.value?.source === "record"
+                        ? reference.value.language
+                        : undefined
+                    }
+                    disabled={referenceDisabled}
+                    onUse={(recording, words, language) => {
+                      if (recording) {
+                        reference.save({
+                          file: recording,
+                          transcript: words,
+                          source: "record",
+                          language,
+                        });
+                        setReplacing(false);
+                      }
+                    }}
+                  />
+                )
               ) : (
                 <>
                   <input
@@ -153,20 +192,20 @@ export default function App() {
                     accept="audio/*"
                     className="sr-only"
                     aria-label="Reference recording"
-                    disabled={voice.busy}
+                    disabled={referenceDisabled}
                     onChange={(event) =>
-                      setFile(event.target.files?.[0] ?? null)
+                      chooseFile(event.target.files?.[0] ?? null)
                     }
                   />
                   <button
                     type="button"
-                    disabled={voice.busy}
+                    disabled={referenceDisabled}
                     onClick={() => picker.current?.click()}
                     onDragOver={(event) => event.preventDefault()}
                     onDrop={(event) => {
                       event.preventDefault();
                       if (!voice.busy)
-                        setFile(event.dataTransfer.files[0] ?? null);
+                        chooseFile(event.dataTransfer.files[0] ?? null);
                     }}
                     className="flex min-h-36 w-full flex-col items-center justify-center rounded-lg border border-dashed bg-white px-5 text-center hover:bg-secondary/30 disabled:opacity-50"
                   >
@@ -188,9 +227,14 @@ export default function App() {
                   </label>
                   <Textarea
                     id="transcript"
-                    value={transcript}
-                    onChange={(event) => setTranscript(event.target.value)}
-                    disabled={voice.busy}
+                    value={file ? transcript : draftTranscript}
+                    onChange={(event) => {
+                      const transcript = event.target.value;
+                      setDraftTranscript(transcript);
+                      if (reference.value)
+                        reference.save({ ...reference.value, transcript });
+                    }}
+                    disabled={referenceDisabled}
                     placeholder="The exact words spoken in your recording"
                     className="min-h-36 bg-white text-sm shadow-none"
                   />
@@ -227,7 +271,7 @@ export default function App() {
                   <select
                     id="language"
                     value={language}
-                    disabled={voice.busy}
+                    disabled={referenceDisabled}
                     onChange={(event) => setLanguage(event.target.value)}
                     className="h-9 rounded-md border bg-white px-3 text-sm"
                   >
@@ -254,7 +298,7 @@ export default function App() {
                   <input
                     type="checkbox"
                     checked={live}
-                    disabled={voice.busy}
+                    disabled={referenceDisabled}
                     onChange={(event) => setLive(event.target.checked)}
                   />
                   Stream as I type
@@ -316,6 +360,7 @@ export default function App() {
                 <h2 className="text-sm font-medium">Output</h2>
                 <p role="status" className="mt-1 text-xs text-muted-foreground">
                   {voice.status}
+                  {voice.busy ? ` · ${Math.floor(voice.elapsed)}s elapsed` : ""}
                   {voice.seconds > 0
                     ? ` · ${voice.seconds.toFixed(1)}s generated`
                     : ""}
