@@ -150,28 +150,57 @@ impl LayerNorm {
 }
 
 pub(crate) struct TransposeConv {
-    weight: Tensor<3>,
+    phases: Conv<Causal>,
     bias: Option<Tensor<1>>,
-    stride: usize,
+    stride: std::num::NonZeroUsize,
+    channels: usize,
 }
 impl TransposeConv {
     pub fn load(weights: &impl WeightSource, prefix: &str, stride: usize) -> Result<Self, Error> {
+        let stride = std::num::NonZeroUsize::new(stride).ok_or_else(|| Error::Tensor {
+            name: prefix.into(),
+            reason: "transposed convolution stride must be nonzero".into(),
+        })?;
+        let weight = weights.tensor::<3>(&format!("{prefix}.weight"))?;
+        let [input, channels, kernel] = weight.dims();
+        let phases = stride.get();
+        let taps = kernel.div_ceil(phases);
+        // Each output phase is an ordinary causal convolution over input time.
+        // Pad incomplete phases with zero taps, then reverse taps for cross-correlation.
+        let weight = weight
+            .pad(
+                [(0, 0), (0, 0), (0, taps * phases - kernel)],
+                burn::tensor::ops::PadMode::Constant(0.0),
+            )
+            .reshape([input, channels, taps, phases])
+            .permute([1, 3, 0, 2])
+            .flip([3])
+            .reshape([channels * phases, input, taps]);
         Ok(Self {
-            weight: weights.tensor(&format!("{prefix}.weight"))?,
+            phases: Conv {
+                weight,
+                bias: None,
+                options: burn::tensor::ops::ConvOptions::new([1], [0], [1], 1),
+                padding: Causal,
+            },
             bias: weights.optional(&format!("{prefix}.bias"))?,
             stride,
+            channels,
         })
     }
     pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
-        let frames = x.dims()[2] * self.stride;
-        let y = burn::tensor::module::conv_transpose1d(
-            x,
-            self.weight.clone(),
-            self.bias.clone(),
-            burn::tensor::ops::ConvTransposeOptions::new([self.stride], [0], [0], [1], 1),
-        );
-        let [b, c, _] = y.dims();
-        y.slice([0..b, 0..c, 0..frames])
+        let [batch, _, frames] = x.dims();
+        let phases = self.stride.get();
+        let y = self
+            .phases
+            .forward(x)
+            .reshape([batch, self.channels, phases, frames])
+            .swap_dims(2, 3)
+            .reshape([batch, self.channels, frames * phases]);
+        match &self.bias {
+            Some(bias) => y + bias.clone().reshape([1, self.channels, 1]),
+            None => y,
+        }
     }
 }
 
