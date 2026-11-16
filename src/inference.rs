@@ -396,6 +396,15 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Engine<B, T, S> {
     }
 }
 
+// Qwen's official chunked decoder resets every 300 codec frames and
+// includes 25 frames from the preceding block as causal left context.
+const CODEC_BLOCK_FRAMES: usize = 300;
+const CODEC_LEFT_CONTEXT: usize = 25;
+pub(crate) const CODEC_CAPACITY: usize = CODEC_BLOCK_FRAMES + CODEC_LEFT_CONTEXT;
+pub(crate) fn codec_context_start(frame: usize) -> usize {
+    (frame / CODEC_BLOCK_FRAMES * CODEC_BLOCK_FRAMES).saturating_sub(CODEC_LEFT_CONTEXT)
+}
+
 async fn decode_range<B: Model>(
     waveform: &mut B,
     decoder_contract: &AudioContract,
@@ -410,9 +419,8 @@ async fn decode_range<B: Model>(
     }
     // Qwen's chunked_decode resets at 300 frames with 25 frames of left
     // context. Incremental output preserves these absolute boundaries.
-    let (block_frames, left_context) = (300, 25);
     let capacity = decoder_contract.capacity;
-    if capacity < block_frames + left_context {
+    if capacity < CODEC_CAPACITY {
         return Err(Error::Contract(
             "waveform decoder capacity must cover 300 frames and 25 context frames",
         ));
@@ -421,9 +429,9 @@ async fn decode_range<B: Model>(
     let samples_per_frame = decoder_contract.samples_per_frame;
     let mut result = Vec::with_capacity((end - start) * samples_per_frame);
     while start < end {
-        let block = start / block_frames * block_frames;
-        let context_start = block.saturating_sub(left_context);
-        let stop = end.min(block + block_frames);
+        let block = start / CODEC_BLOCK_FRAMES * CODEC_BLOCK_FRAMES;
+        let context_start = codec_context_start(start);
+        let stop = end.min(block + CODEC_BLOCK_FRAMES);
         let frames = waveform.waveform_frames(stop - context_start, capacity);
         let mut packed = vec![0i32; groups * frames];
         for (frame, values) in codes.values[context_start * groups..stop * groups]

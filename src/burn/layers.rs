@@ -135,7 +135,7 @@ impl<P: Padding> Conv<P> {
 }
 
 /// Only the causal receptive field survives between codec spans.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ConvHistory {
     input: Option<Tensor<3>>,
 }

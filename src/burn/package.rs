@@ -40,7 +40,7 @@ impl<T: crate::sampling::TokenSampler, S: crate::sampling::TokenSampler>
             code_groups: audio.encoder_valid_num_quantizers,
         };
         let decoder_contract = AudioContract {
-            capacity: 325,
+            capacity: crate::inference::CODEC_CAPACITY,
             sample_rate: audio.output_sample_rate,
             samples_per_frame: audio.decode_upsample_rate,
             code_groups: audio.encoder_valid_num_quantizers,

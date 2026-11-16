@@ -99,7 +99,7 @@ impl Residual {
         x + self.conv2.stream(self.act2.forward(y), &mut history.last)
     }
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ResidualHistory {
     first: ConvHistory,
     last: ConvHistory,
@@ -142,6 +142,7 @@ impl Upsample {
         x
     }
 }
+#[derive(Clone)]
 struct UpsampleHistory {
     conv: ConvHistory,
     residuals: Vec<ResidualHistory>,
@@ -177,11 +178,12 @@ struct PreUpsample {
     conv: TransposeConv,
     block: ConvNext,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PreUpsampleHistory {
     conv: ConvHistory,
     block: ConvHistory,
 }
+#[derive(Clone)]
 struct CodecHistory {
     preconv: ConvHistory,
     transformer: AudioHistory,
@@ -191,6 +193,7 @@ struct CodecHistory {
     last: ConvHistory,
 }
 /// The supplied prefix identifies the block, including its official left context.
+#[derive(Clone)]
 pub(crate) struct CodecCache {
     packed: Vec<i32>,
     frames: usize,
@@ -385,6 +388,20 @@ mod tests {
     use burn::tensor::{DType, Device};
     use std::path::PathBuf;
 
+    fn assert_close(actual: &[f32], expected: &[f32], label: &str) {
+        assert_eq!(actual.len(), expected.len(), "{label}: shape");
+        assert!(
+            actual.iter().chain(expected).all(|v| v.is_finite()),
+            "{label}: nonfinite samples"
+        );
+        let error = actual
+            .iter()
+            .zip(expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(error < 1e-3, "{label}: maximum error {error}");
+    }
+
     #[test]
     #[ignore = "requires real codec fixtures, pinned official weights and a GPU adapter"]
     fn cached_codec_prefixes_match_full_decoding_and_official_waveforms() {
@@ -428,23 +445,12 @@ mod tests {
                     .prefix(prefix, groups, stop, &mut cache, &device)
                     .await
                     .unwrap();
-                assert_eq!(actual.len(), full.len());
-                let error = actual
-                    .iter()
-                    .zip(&full)
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0f32, f32::max);
-                assert!(error < 1e-3, "{stop}-frame cached/full error: {error}");
+                assert_close(&actual, &full, &format!("{stop}-frame cached/full"));
                 if stop == 80 {
                     let expected = read(data.tensor::<3>("waveform.80").unwrap())
                         .await
                         .unwrap();
-                    let error = actual
-                        .iter()
-                        .zip(&expected)
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0f32, f32::max);
-                    assert!(error < 1e-3, "cached/official error: {error}");
+                    assert_close(&actual, &expected, "cached/official");
                 }
             }
             // A different real-code span with the same shape cannot reuse state.
@@ -467,12 +473,42 @@ mod tests {
                     .prefix(prefix, groups, 8, &mut cache, &device)
                     .await
                     .unwrap();
-                let error = actual
-                    .iter()
-                    .zip(&full)
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0f32, f32::max);
-                assert!(error < 1e-3, "changed-prefix error: {error}");
+                assert_close(&actual, &full, "changed-prefix");
+            }
+            let prefix: Vec<_> = (0..groups)
+                .flat_map(|g| packed[g * frames..g * frames + 8].iter().copied())
+                .collect();
+            let mut checkpoint = decoder.cache();
+            decoder
+                .prefix(prefix, groups, 8, &mut checkpoint, &device)
+                .await
+                .unwrap();
+            // Independent utterances share the reference tensors but never mutate
+            // their checkpoint, even when the generated suffix differs.
+            for offset in [0, 1] {
+                let prefix: Vec<_> = (0..groups)
+                    .flat_map(|g| {
+                        (0..frames).map({
+                            let packed = &packed;
+                            move |f| {
+                                packed[g * frames + if f < 8 { f } else { (f + offset) % frames }]
+                            }
+                        })
+                    })
+                    .collect();
+                let full = read(decoder.forward(Tensor::<3, Int>::from_data(
+                    burn::tensor::TensorData::new(prefix.clone(), [1, groups, frames]),
+                    &device,
+                )))
+                .await
+                .unwrap();
+                let mut branch = checkpoint.clone();
+                let actual = decoder
+                    .prefix(prefix, groups, frames, &mut branch, &device)
+                    .await
+                    .unwrap();
+                assert_close(&actual, &full, "reference-checkpoint branch");
+                assert_eq!(checkpoint.frames, 8);
             }
         });
     }

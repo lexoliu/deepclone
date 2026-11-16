@@ -53,6 +53,7 @@ pub struct Burn {
     encoder: CodecEncoder,
     decoder: CodecDecoder,
     decoder_cache: super::codec_decoder::CodecCache,
+    reference_decoder_cache: Option<super::codec_decoder::CodecCache>,
     device: Device,
     dtype: DType,
 }
@@ -112,6 +113,7 @@ impl Burn {
             )?,
             decoder,
             decoder_cache,
+            reference_decoder_cache: None,
             device: speech.device().clone(),
             dtype: speech.dtype(),
         })
@@ -140,7 +142,10 @@ impl Model for Burn {
     fn reset(&mut self) {
         self.talker.reset();
         self.predictor.reset();
-        self.decoder_cache = self.decoder.cache();
+        self.decoder_cache = self
+            .reference_decoder_cache
+            .clone()
+            .unwrap_or_else(|| self.decoder.cache());
     }
     fn reset_predictor(&mut self) {
         self.predictor.reset();
@@ -237,6 +242,28 @@ impl Model for Burn {
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // Prepare the official block containing the first generated frame once
+        // per voice. Each utterance clones its history; changed code prefixes
+        // invalidate it through the same decoder cache contract.
+        let context = crate::inference::codec_context_start(frames);
+        let packed = (0..groups)
+            .flat_map(|g| {
+                values[g * frames + context..(g + 1) * frames]
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        let mut checkpoint = self.decoder.cache();
+        self.decoder
+            .prefix(
+                packed,
+                groups,
+                frames - context,
+                &mut checkpoint,
+                &self.device,
+            )
+            .await?;
+        self.reference_decoder_cache = Some(checkpoint);
         Ok((speaker, codes))
     }
     async fn waveform(

@@ -157,6 +157,7 @@ pub(crate) struct AudioTransformer<N, F> {
     config: AttentionConfig,
     window: Option<usize>,
 }
+#[derive(Clone)]
 pub(crate) struct AudioHistory {
     layers: Vec<Option<(Tensor<4>, Tensor<4>)>>,
     frames: usize,
