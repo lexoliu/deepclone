@@ -172,6 +172,87 @@ mod tests {
     use super::*;
     use burn::tensor::{DType, Device, TensorData, activation};
 
+    fn unfused(
+        query: BurnTensor<4>,
+        keys: BurnTensor<4>,
+        values: BurnTensor<4>,
+        length: usize,
+    ) -> BurnTensor<4> {
+        let [_, heads, _, width] = query.dims();
+        let kv_heads = keys.dims()[1];
+        let selection = [0..1, 0..kv_heads, 0..length, 0..width];
+        let q = query.reshape([1, kv_heads, heads / kv_heads, 1, width]);
+        let k = keys
+            .slice(selection.clone())
+            .reshape([1, kv_heads, 1, length, width]);
+        let v = values
+            .slice(selection)
+            .reshape([1, kv_heads, 1, length, width]);
+        let dtype = q.dtype();
+        activation::softmax(q.matmul(k.swap_dims(3, 4)).cast(DType::F32), 4)
+            .cast(dtype)
+            .matmul(v)
+            .reshape([1, heads, 1, width])
+    }
+
+    #[test]
+    #[ignore = "requires a WebGPU adapter"]
+    fn decode_attention_retains_cache_order_across_growth_and_reset() {
+        futures_lite::future::block_on(async {
+            let device = Device::wgpu_options().init_async().await.unwrap();
+            for dtype in [DType::F16, DType::F32] {
+                let mut keys = BurnTensor::<4>::zeros([1, 8, 256, 128], (&device, dtype));
+                let mut values = keys.clone();
+                let mut actual = Vec::new();
+                let mut expected = Vec::new();
+                for (step, length) in [1, 2, 15, 16, 17, 163, 179, 1, 5, 13, 163]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let data = BurnTensor::<4>::from_data(
+                        TensorData::new(
+                            (0..8 * length * 128)
+                                .map(|i| ((i * 31 + step * 19) as f32).sin())
+                                .collect::<Vec<_>>(),
+                            [1, 8, length, 128],
+                        ),
+                        (&device, dtype),
+                    );
+                    let selection = [0..1, 0..8, 0..length, 0..128];
+                    keys.inplace(|cache| cache.slice_assign(selection.clone(), data.clone()));
+                    values.inplace(|cache| cache.slice_assign(selection, data * 0.5));
+                    let query = BurnTensor::<4>::from_data(
+                        TensorData::new(
+                            (0..16 * 128)
+                                .map(|i| ((i * 47 + step * 7) as f32).cos() / 128f32.sqrt())
+                                .collect::<Vec<_>>(),
+                            [1, 16, 1, 128],
+                        ),
+                        (&device, dtype),
+                    );
+                    actual.push(decode(query.clone(), keys.clone(), values.clone(), length));
+                    expected.push(unfused(query, keys.clone(), values.clone(), length));
+                    device.flush().unwrap();
+                }
+                let (actual, expected) = futures_lite::future::zip(
+                    super::super::read(BurnTensor::cat(actual, 2)),
+                    super::super::read(BurnTensor::cat(expected, 2)),
+                )
+                .await;
+                let maximum = actual
+                    .unwrap()
+                    .into_iter()
+                    .zip(expected.unwrap())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    maximum < if dtype == DType::F16 { 0.002 } else { 1e-5 },
+                    "{dtype:?}: {maximum}"
+                );
+            }
+        });
+    }
+
     #[test]
     #[ignore = "requires a WebGPU adapter"]
     fn decode_attention_matches_unfused_grouped_attention() {
@@ -200,22 +281,7 @@ mod tests {
                     let query = tensor([1, heads, 1, width], 19) * (width as f32).sqrt().recip();
                     let keys = tensor([1, kv_heads, capacity, width], 31);
                     let values = tensor([1, kv_heads, capacity, width], 47);
-                    let selection = [0..1, 0..kv_heads, 0..length, 0..width];
-                    let groups = heads / kv_heads;
-                    let q = query.clone().reshape([1, kv_heads, groups, 1, width]);
-                    let k = keys
-                        .clone()
-                        .slice(selection.clone())
-                        .reshape([1, kv_heads, 1, length, width]);
-                    let v = values
-                        .clone()
-                        .slice(selection)
-                        .reshape([1, kv_heads, 1, length, width]);
-                    let expected =
-                        activation::softmax(q.matmul(k.swap_dims(3, 4)).cast(DType::F32), 4)
-                            .cast(dtype)
-                            .matmul(v)
-                            .reshape([1, heads, 1, width]);
+                    let expected = unfused(query.clone(), keys.clone(), values.clone(), length);
                     let (actual, expected) = futures_lite::future::zip(
                         super::super::read(decode(query, keys, values, length)),
                         super::super::read(expected),
