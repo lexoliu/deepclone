@@ -1701,7 +1701,7 @@ dependencies = [
 [[package]]
 name = "cubecl"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "cubecl-core",
  "cubecl-cpu",
@@ -1719,7 +1719,7 @@ dependencies = [
 [[package]]
 name = "cubecl-common"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "bytemuck",
  "cfg_aliases",
@@ -1743,7 +1743,7 @@ dependencies = [
 [[package]]
 name = "cubecl-core"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "bitflags",
  "bytemuck",
@@ -1772,7 +1772,7 @@ dependencies = [
 [[package]]
 name = "cubecl-cpp"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "bytemuck",
  "cubecl-common",
@@ -1795,7 +1795,7 @@ dependencies = [
 [[package]]
 name = "cubecl-cpu"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "bytemuck",
  "crossbeam-utils",
@@ -1817,7 +1817,7 @@ dependencies = [
 [[package]]
 name = "cubecl-cuda"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "bytemuck",
  "cubecl-common",
@@ -1837,7 +1837,7 @@ dependencies = [
 [[package]]
 name = "cubecl-environment"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "async-channel",
  "backtrace",
@@ -1875,7 +1875,7 @@ dependencies = [
 [[package]]
 name = "cubecl-hip"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "bytemuck",
  "cubecl-common",
@@ -1907,7 +1907,7 @@ dependencies = [
 [[package]]
 name = "cubecl-ir"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "bumpalo",
  "cubecl-common",
@@ -1938,7 +1938,7 @@ dependencies = [
 [[package]]
 name = "cubecl-llvm"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "cc",
  "cubecl-core",
@@ -1957,7 +1957,7 @@ dependencies = [
 [[package]]
 name = "cubecl-macros"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "darling 0.24.1",
  "derive-new",
@@ -1974,7 +1974,7 @@ dependencies = [
 [[package]]
 name = "cubecl-macros-internal"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "darling 0.24.1",
  "inflections",
@@ -1986,7 +1986,7 @@ dependencies = [
 [[package]]
 name = "cubecl-metal"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "block2",
  "bytemuck",
@@ -2010,7 +2010,7 @@ dependencies = [
 [[package]]
 name = "cubecl-monitoring"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "cfg_aliases",
  "cubecl-ir",
@@ -2023,7 +2023,7 @@ dependencies = [
 [[package]]
 name = "cubecl-opt"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "cubecl-common",
  "cubecl-core",
@@ -2045,7 +2045,7 @@ dependencies = [
 [[package]]
 name = "cubecl-runtime"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "buildid",
  "bytemuck",
@@ -2075,7 +2075,7 @@ dependencies = [
 [[package]]
 name = "cubecl-server"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "buildid",
  "bytemuck",
@@ -2103,7 +2103,7 @@ dependencies = [
 [[package]]
 name = "cubecl-spirv"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "bitflags",
  "cubecl-common",
@@ -2126,7 +2126,7 @@ dependencies = [
 [[package]]
 name = "cubecl-std"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "cubecl-common",
  "cubecl-core",
@@ -2143,7 +2143,7 @@ dependencies = [
 [[package]]
 name = "cubecl-wgpu"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "bytemuck",
  "cfg-if",
@@ -2174,7 +2174,7 @@ dependencies = [
 [[package]]
 name = "cubecl-zspace"
 version = "0.11.4"
-source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#772b9dadc39786845a8b1db4c8acaff9aaa1fba8"
 dependencies = [
  "derive-new",
  "serde",
@@ -2184,7 +2184,7 @@ dependencies = [
 [[package]]
 name = "cubek"
 version = "0.3.1"
-source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#e6fa4982c9eecf6030b7fd629d975547ce4fcd35"
 dependencies = [
  "cubecl",
  "cubek-attention",
@@ -2202,7 +2202,7 @@ dependencies = [
 [[package]]
 name = "cubek-attention"
 version = "0.3.1"
-source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#e6fa4982c9eecf6030b7fd629d975547ce4fcd35"
 dependencies = [
  "bytemuck",
  "cubecl",
@@ -2216,7 +2216,7 @@ dependencies = [
 [[package]]
 name = "cubek-convolution"
 version = "0.3.1"
-source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#e6fa4982c9eecf6030b7fd629d975547ce4fcd35"
 dependencies = [
  "bytemuck",
  "cubecl",
@@ -2232,7 +2232,7 @@ dependencies = [
 [[package]]
 name = "cubek-fft"
 version = "0.3.1"
-source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#e6fa4982c9eecf6030b7fd629d975547ce4fcd35"
 dependencies = [
  "cubecl",
 ]
@@ -2240,7 +2240,7 @@ dependencies = [
 [[package]]
 name = "cubek-interpolate"
 version = "0.3.1"
-source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#e6fa4982c9eecf6030b7fd629d975547ce4fcd35"
 dependencies = [
  "cubecl",
  "cubecl-common",
@@ -2253,7 +2253,7 @@ dependencies = [
 [[package]]
 name = "cubek-matmul"
 version = "0.3.1"
-source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#e6fa4982c9eecf6030b7fd629d975547ce4fcd35"
 dependencies = [
  "bytemuck",
  "cubecl",
@@ -2267,7 +2267,7 @@ dependencies = [
 [[package]]
 name = "cubek-pool"
 version = "0.3.1"
-source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#e6fa4982c9eecf6030b7fd629d975547ce4fcd35"
 dependencies = [
  "cubecl",
  "cubecl-common",
@@ -2277,7 +2277,7 @@ dependencies = [
 [[package]]
 name = "cubek-quant"
 version = "0.3.1"
-source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#e6fa4982c9eecf6030b7fd629d975547ce4fcd35"
 dependencies = [
  "cubecl",
  "cubecl-common",
@@ -2289,7 +2289,7 @@ dependencies = [
 [[package]]
 name = "cubek-random"
 version = "0.3.1"
-source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#e6fa4982c9eecf6030b7fd629d975547ce4fcd35"
 dependencies = [
  "cubecl",
  "cubecl-common",
@@ -2304,7 +2304,7 @@ dependencies = [
 [[package]]
 name = "cubek-reduce"
 version = "0.3.1"
-source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#e6fa4982c9eecf6030b7fd629d975547ce4fcd35"
 dependencies = [
  "cubecl",
  "cubek-std",
@@ -2317,7 +2317,7 @@ dependencies = [
 [[package]]
 name = "cubek-std"
 version = "0.3.1"
-source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#e6fa4982c9eecf6030b7fd629d975547ce4fcd35"
 dependencies = [
  "cubecl",
  "cubecl-common",
@@ -2327,7 +2327,7 @@ dependencies = [
 [[package]]
 name = "cubek-tile"
 version = "0.3.1"
-source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#e6fa4982c9eecf6030b7fd629d975547ce4fcd35"
 dependencies = [
  "bytemuck",
  "cubecl",
