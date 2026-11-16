@@ -396,6 +396,7 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::{
         convert::Infallible,
+        future,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
