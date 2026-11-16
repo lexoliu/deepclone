@@ -705,6 +705,7 @@ dependencies = [
  "burn-std",
  "burn-store",
  "burn-vision",
+ "cubecl",
 ]
 
 [[package]]
@@ -1700,8 +1701,7 @@ dependencies = [
 [[package]]
 name = "cubecl"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d44bb3fb8559ef4e7e107df09df37b7f5a5a7d45ab063148a0d25c1cdd13990"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "cubecl-core",
  "cubecl-cpu",
@@ -1719,8 +1719,7 @@ dependencies = [
 [[package]]
 name = "cubecl-common"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ec818209d97ad8f62e4ac9bb22c15f8ed8301698d46d61a92721d28f2a3f5c9"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "bytemuck",
  "cfg_aliases",
@@ -1744,8 +1743,7 @@ dependencies = [
 [[package]]
 name = "cubecl-core"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ae7fef8923f1362f3d211b93144097744f2e46232d9a63f99858480c492a2ed"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "bitflags",
  "bytemuck",
@@ -1774,8 +1772,7 @@ dependencies = [
 [[package]]
 name = "cubecl-cpp"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d89bf5c2b694af7e5316e37bc5fd9056a7c855b64772763aae0924bfcc3319e6"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "bytemuck",
  "cubecl-common",
@@ -1798,8 +1795,7 @@ dependencies = [
 [[package]]
 name = "cubecl-cpu"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5622ec8466f1b1373c5b0e2e420f30a9b49ad06b1919232daaefb748d77941a"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "bytemuck",
  "crossbeam-utils",
@@ -1821,8 +1817,7 @@ dependencies = [
 [[package]]
 name = "cubecl-cuda"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d55b98f35f8e9fe6ec8a9b870100fb841a995b866ea3ca1a750d05c96fafc06"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "bytemuck",
  "cubecl-common",
@@ -1842,8 +1837,7 @@ dependencies = [
 [[package]]
 name = "cubecl-environment"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d47cca02047e7b3ceae0b53dc544887f48408cc6f670b0a911b42db83caabea3"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "async-channel",
  "backtrace",
@@ -1881,8 +1875,7 @@ dependencies = [
 [[package]]
 name = "cubecl-hip"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "607ca44da0530e6634527a81abd7d2cc389be54e35e13ca3d5465ce747716362"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "bytemuck",
  "cubecl-common",
@@ -1914,8 +1907,7 @@ dependencies = [
 [[package]]
 name = "cubecl-ir"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9714b8124a7736c9c694e23944048e77d6c1b33f3de8d13379a3a02d497eb0f5"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "bumpalo",
  "cubecl-common",
@@ -1946,8 +1938,7 @@ dependencies = [
 [[package]]
 name = "cubecl-llvm"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b90d4056b3b4829f4c4830b35a4deb045728535ab5c757a2d7c77fa195f322b9"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "cc",
  "cubecl-core",
@@ -1966,8 +1957,7 @@ dependencies = [
 [[package]]
 name = "cubecl-macros"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c67962ecb52dc6fd493df1ef6c01990bc8c98a29039765a5e58bef00d9ab304"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "darling 0.24.1",
  "derive-new",
@@ -1984,8 +1974,7 @@ dependencies = [
 [[package]]
 name = "cubecl-macros-internal"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "450576459be780afa4158ed3b2481935342834df79cd2293928b223044056f37"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "darling 0.24.1",
  "inflections",
@@ -1997,8 +1986,7 @@ dependencies = [
 [[package]]
 name = "cubecl-metal"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "888e4a690a66a484e8fec9e61598b0af1c44a6af20fed64d7c8fd4e628843d64"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "block2",
  "bytemuck",
@@ -2022,8 +2010,7 @@ dependencies = [
 [[package]]
 name = "cubecl-monitoring"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41a159090b55e83641a823b6ea1dc1f205db0931e59210cc19e329a7d256b481"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "cfg_aliases",
  "cubecl-ir",
@@ -2036,8 +2023,7 @@ dependencies = [
 [[package]]
 name = "cubecl-opt"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "156c1d3b476cf1465680361d8b0eebe6ab76b4a944dc10ecccf53abaf8af6c75"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "cubecl-common",
  "cubecl-core",
@@ -2048,7 +2034,7 @@ dependencies = [
  "downcast-rs",
  "foldhash 0.2.0",
  "hashbrown 0.17.1",
- "hi_sparse_bitset 0.9.0",
+ "hi_sparse_bitset",
  "itertools 0.15.0",
  "log",
  "pliron",
@@ -2059,8 +2045,7 @@ dependencies = [
 [[package]]
 name = "cubecl-runtime"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc18c95e3b851f50f807c40056e02b70d46773ca478b97ae4e93516d97cf9933"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "buildid",
  "bytemuck",
@@ -2090,8 +2075,7 @@ dependencies = [
 [[package]]
 name = "cubecl-server"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8494d0b834cd9319ea0b0a6c756f7b163ad94a096d964cb91b9d1e0757b3295"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "buildid",
  "bytemuck",
@@ -2119,8 +2103,7 @@ dependencies = [
 [[package]]
 name = "cubecl-spirv"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eabaf3f18aa0649f023796e9207dfb9679cdf6aee9c14fde148af4d0d2b44733"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "bitflags",
  "cubecl-common",
@@ -2143,8 +2126,7 @@ dependencies = [
 [[package]]
 name = "cubecl-std"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f38816234f4a864ae06587dc3430a4d75eeaac3aa53a9a14cfa5d25295a8da9"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "cubecl-common",
  "cubecl-core",
@@ -2161,8 +2143,7 @@ dependencies = [
 [[package]]
 name = "cubecl-wgpu"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413caaf7eaf52cb5922f1e9e766fea404fd1dd549d10f3500e22b61c70b63a10"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "bytemuck",
  "cfg-if",
@@ -2193,8 +2174,7 @@ dependencies = [
 [[package]]
 name = "cubecl-zspace"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30b3a4ad34a20287783a2c9859322e86980bcf166bac5bce0e0febe7c267f470"
+source = "git+https://github.com/lexoliu/cubecl?branch=fix%2Fwebgpu-tuning#cfe86357c6ae31e9de93a2a61e68495113d687fb"
 dependencies = [
  "derive-new",
  "serde",
@@ -2204,8 +2184,7 @@ dependencies = [
 [[package]]
 name = "cubek"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8209a4c033ed0cd01341e6f0d4ec9a396331c687b9f07e89655bc6dd71f719b7"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
 dependencies = [
  "cubecl",
  "cubek-attention",
@@ -2223,8 +2202,7 @@ dependencies = [
 [[package]]
 name = "cubek-attention"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f402aaf971df49876d1844293200e42da65ff8e098056790dd1d002f1abb0e69"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
 dependencies = [
  "bytemuck",
  "cubecl",
@@ -2238,8 +2216,7 @@ dependencies = [
 [[package]]
 name = "cubek-convolution"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e1b1dc2ec66b4016976f55ad762adac48d07987427b377cc3045bf34ebca225"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
 dependencies = [
  "bytemuck",
  "cubecl",
@@ -2255,8 +2232,7 @@ dependencies = [
 [[package]]
 name = "cubek-fft"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48451902f1d21d3eb88cadc17a8a7aeb3b582f17484a68e650f44efe74688b73"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
 dependencies = [
  "cubecl",
 ]
@@ -2264,8 +2240,7 @@ dependencies = [
 [[package]]
 name = "cubek-interpolate"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "070bf1738d73be1c01354623cd6bdd7261c13e31851727e117bfe47794c28f95"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
 dependencies = [
  "cubecl",
  "cubecl-common",
@@ -2278,8 +2253,7 @@ dependencies = [
 [[package]]
 name = "cubek-matmul"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11362e390ac15e89a9dad87645a0869e0fa73998c26fc62dfffbca62893b0f28"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
 dependencies = [
  "bytemuck",
  "cubecl",
@@ -2293,8 +2267,7 @@ dependencies = [
 [[package]]
 name = "cubek-pool"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a1e07d045ebcbe5961d1214e2a53d4a07684e3c3cac7c8223100a36a2daec95"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
 dependencies = [
  "cubecl",
  "cubecl-common",
@@ -2304,8 +2277,7 @@ dependencies = [
 [[package]]
 name = "cubek-quant"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c4bfcd807a759a68c636f347b2fe86daeec7882e86a96485850a0c87636067d"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
 dependencies = [
  "cubecl",
  "cubecl-common",
@@ -2317,8 +2289,7 @@ dependencies = [
 [[package]]
 name = "cubek-random"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "535bd228257e6fea6f326711fcbf128ac7e438346e85883b011623e0d99f8889"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
 dependencies = [
  "cubecl",
  "cubecl-common",
@@ -2333,8 +2304,7 @@ dependencies = [
 [[package]]
 name = "cubek-reduce"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c422c126ad6b0662941278cc294a077a3089c715893ae223cc84a4756120acfd"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
 dependencies = [
  "cubecl",
  "cubek-std",
@@ -2347,8 +2317,7 @@ dependencies = [
 [[package]]
 name = "cubek-std"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d19b0a7e8fda354c87d5e9ec8a5bca336f2538945108a27889457fd2cc925c8"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
 dependencies = [
  "cubecl",
  "cubecl-common",
@@ -2358,8 +2327,7 @@ dependencies = [
 [[package]]
 name = "cubek-tile"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "362b7476a916cd7ee09f46eb1e9cd6258530c8b9a77fec480302ba3be10ceff5"
+source = "git+https://github.com/lexoliu/cubek?branch=fix%2Fwebgpu-capabilities#0ea80b37f6e6803a7e611de5da048ea4a16cf7f4"
 dependencies = [
  "bytemuck",
  "cubecl",
@@ -3555,15 +3523,6 @@ name = "hi_sparse_bitset"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "244cabe6369d69e97280fccda8e43c82387aa4af83a2c491791ec421cfe94e45"
-dependencies = [
- "wide",
-]
-
-[[package]]
-name = "hi_sparse_bitset"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "682097abdf22a902b7b2b5f2824e773691507289873c3ea0abbc5d4c85f05ec0"
 dependencies = [
  "wide",
 ]
@@ -5297,8 +5256,8 @@ dependencies = [
  "combine",
  "downcast-rs",
  "dyn-clone",
- "hashbrown 0.17.1",
- "hi_sparse_bitset 0.10.0",
+ "hashbrown 0.13.2",
+ "hi_sparse_bitset",
  "indexmap",
  "inventory",
  "linkme",
@@ -5542,7 +5501,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad9c5423459fa2f729b8d9235fab810aa29628b171467744fc86d21460ad70d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",

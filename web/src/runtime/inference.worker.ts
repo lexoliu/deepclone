@@ -61,7 +61,14 @@ async function execute(command: Command): Promise<void> {
             });
           });
         };
-        runtime ??= await module.BrowserRuntime.create();
+        if (!runtime) {
+          const response = await fetch("/runtime.json", {
+            signal: operation.signal,
+          });
+          if (!response.ok)
+            throw new Error("GPU runtime configuration could not be loaded.");
+          runtime = await module.BrowserRuntime.create(await response.text());
+        }
         const builder = runtime.builder(true);
         let consumed = false;
         try {

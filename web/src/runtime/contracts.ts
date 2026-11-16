@@ -60,7 +60,7 @@ export interface WasmBuilder {
 }
 export interface WasmModule {
   default(): Promise<unknown>;
-  BrowserRuntime: { create(): Promise<WasmRuntime> };
+  BrowserRuntime: { create(configuration: string): Promise<WasmRuntime> };
   TextInput: new (capacity: number) => WasmInput;
 }
 export interface WasmRuntime {

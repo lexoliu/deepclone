@@ -133,7 +133,7 @@ test("a GPU runtime remains reusable after a rejected model shard", async ({
     const url = "/wasm/deepclone.js";
     const module = await import(url);
     await module.default();
-    const runtime = await module.BrowserRuntime.create();
+    const runtime = await module.BrowserRuntime.create("{}");
     const first = runtime.builder(true);
     let rejected = false;
     try {

@@ -44,7 +44,14 @@ pub struct BrowserRuntime {
 }
 #[wasm_bindgen]
 impl BrowserRuntime {
-    pub async fn create() -> Result<BrowserRuntime, JsValue> {
+    pub async fn create(configuration: &str) -> Result<BrowserRuntime, JsValue> {
+        use burn::cubecl::config::{CubeClRuntimeConfig, RuntimeConfig};
+        let configuration = serde_json::from_str(configuration).map_err(error)?;
+        if !CubeClRuntimeConfig::try_set(configuration) {
+            return Err(error(
+                "GPU configuration must be set before runtime initialization",
+            ));
+        }
         let device = Device::wgpu_options().init_async().await.map_err(error)?;
         Ok(Self { device })
     }
