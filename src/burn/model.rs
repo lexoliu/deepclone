@@ -8,6 +8,13 @@ use burn::tensor::{DType, Device, Int, Tensor, TensorData, activation};
 use serde::Deserialize;
 use std::num::NonZeroUsize;
 
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console, js_name = debug)]
+    fn codec_timing(marker: &str, frames: usize, elapsed_ms: f64);
+}
+
 #[derive(Deserialize)]
 pub struct SpeechConfig {
     pub talker_config: TalkerConfig,
@@ -233,8 +240,13 @@ impl Model for Burn {
         groups: usize,
         frames: usize,
     ) -> Result<Vec<f32>, Error> {
+        #[cfg(all(feature = "browser", target_arch = "wasm32"))]
+        let started = js_sys::Date::now();
         let codes =
             Tensor::<3, Int>::from_data(TensorData::new(packed, [1, groups, frames]), &self.device);
-        Ok(read(self.decoder.forward(codes)).await?)
+        let samples = read(self.decoder.forward(codes)).await?;
+        #[cfg(all(feature = "browser", target_arch = "wasm32"))]
+        codec_timing("Speech codec timing", frames, js_sys::Date::now() - started);
+        Ok(samples)
     }
 }

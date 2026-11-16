@@ -82,6 +82,8 @@ async function profileCommand(method: string) {
 }
 page.on("console", (event) => {
   if (event.type() === "error") process.stderr.write(`${event.text()}\n`);
+  if (event.text().startsWith("Speech codec timing"))
+    process.stdout.write(`${JSON.stringify({ codec: event.text() })}\n`);
 });
 try {
   await page.goto(values.url!);
