@@ -1,0 +1,22 @@
+import { defineConfig } from "@playwright/test";
+export default defineConfig({
+  testDir: "tests",
+  timeout: 30000,
+  use: {
+    baseURL: "http://127.0.0.1:4173",
+    headless: true,
+    launchOptions: {
+      args: [
+        "--enable-unsafe-webgpu",
+        "--use-fake-device-for-media-stream",
+        "--use-fake-ui-for-media-stream",
+      ],
+    },
+  },
+  webServer: {
+    command: "bun run vite preview --host 127.0.0.1 --port 4173",
+    url: "http://127.0.0.1:4173",
+    reuseExistingServer: !process.env.CI,
+    timeout: 30000,
+  },
+});

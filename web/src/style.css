@@ -1,0 +1,64 @@
+@import "tailwindcss";
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--foreground);
+  --color-muted: var(--secondary);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--secondary);
+  --color-accent-foreground: var(--foreground);
+  --color-destructive: #b64040;
+  --color-border: var(--border);
+  --color-input: var(--border);
+  --color-ring: #8b8b93;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+}
+:root {
+  font-family:
+    ui-sans-serif,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+  color-scheme: light;
+  --background: #fafafa;
+  --foreground: #242429;
+  --primary: #303036;
+  --primary-foreground: #fafafa;
+  --secondary: #ededf0;
+  --muted-foreground: #72727d;
+  --border: #e2e2e7;
+  background: var(--background);
+  color: var(--foreground);
+}
+* {
+  box-sizing: border-box;
+  border-color: var(--border);
+}
+body {
+  margin: 0;
+  min-width: 320px;
+}
+button:not(:disabled),
+a {
+  cursor: pointer;
+}
+button:active:not(:disabled) {
+  transform: scale(0.98);
+}
+button {
+  transition:
+    background-color 0.15s,
+    transform 0.1s;
+}
+textarea {
+  resize: vertical;
+}
+::selection {
+  background: #dcdce4;
+}

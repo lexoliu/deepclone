@@ -11,3 +11,9 @@ outputs/
 .worktrees/
 .DS_Store
 /target/
+
+node_modules/
+web/public/wasm/
+web/test-results/
+web/playwright-report/
+*.tsbuildinfo

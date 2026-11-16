@@ -1,0 +1,9 @@
+{
+  "autotune": {
+    "bench": {
+      "repetitions": 32,
+      "min_samples": 3,
+      "max_samples": 3
+    }
+  }
+}

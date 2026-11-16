@@ -1,61 +1,65 @@
-//! Worker-owned autoregressive generation with native tensor handoff.
-use crate::{
-    decoder::Decoder,
-    sampling::{RepetitionPenalty, TokenSampler},
-};
-use ondevice_coreml::{Function, Inputs, Tensor, f16};
+//! Shared autoregressive generation with backend-owned tensors and KV state.
+use crate::inference::Error;
+use crate::sampling::{Logits, RepetitionPenalty, TokenSampler};
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error(transparent)]
-    CoreMl(#[from] ondevice_coreml::Error),
-    #[error("Talker: {0}")]
-    Talker(crate::decoder::Error),
-    #[error("code predictor: {0}")]
-    Predictor(crate::decoder::Error),
-    #[error(transparent)]
-    Sampling(#[from] crate::sampling::Error),
-    #[error("generation contract: {0}")]
-    Contract(&'static str),
-    #[error("token embedding {token}: {source}")]
-    Embedding {
-        token: u32,
-        source: ondevice_coreml::Error,
-    },
-    #[error("codec frame embedding: {0}")]
-    Frame(ondevice_coreml::Error),
-    #[error("output head: {0}")]
-    Head(ondevice_coreml::Error),
-}
-
-/// The predictor input mapping is identity for 0.6B and learned for 1.7B.
-pub trait PredictorProjection {
-    fn project(&mut self, hidden: Tensor<f16>) -> Result<Tensor<f16>, Error>;
-}
-pub struct IdentityProjection;
-impl PredictorProjection for IdentityProjection {
-    fn project(&mut self, hidden: Tensor<f16>) -> Result<Tensor<f16>, Error> {
-        Ok(hidden)
+/// Execution operations needed by the shared Qwen generation loop.
+/// Readbacks are asynchronous so the same session can execute inside a Web Worker.
+#[allow(async_fn_in_trait)]
+pub trait Model {
+    type Hidden: Clone;
+    type Token: Clone;
+    type Logits: Logits<Token = Self::Token>;
+    fn code_token(&mut self, group: usize, token: &Self::Token) -> Result<Self::Hidden, Error>;
+    async fn read_tokens(&self, tokens: &[Self::Token]) -> Result<Vec<u32>, Error>;
+    fn groups(&self) -> usize;
+    /// Fixed-shape backends can retain their model capacity; dynamic backends use the valid span.
+    fn waveform_frames(&self, valid: usize, capacity: usize) -> usize {
+        let _ = valid;
+        capacity
     }
-}
-impl PredictorProjection for Function {
-    fn project(&mut self, hidden: Tensor<f16>) -> Result<Tensor<f16>, Error> {
-        let mut inputs = Inputs::new();
-        inputs.insert("hidden", &hidden)?;
-        Ok(self.predict(&inputs)?.tensor("hidden_out")?)
+    fn reset(&mut self);
+    fn reset_predictor(&mut self);
+    fn text(&mut self, token: u32) -> Result<Self::Hidden, Error>;
+    fn code(&mut self, group: usize, token: u32) -> Result<Self::Hidden, Error>;
+    fn frame(&mut self, codes: &[u32], text: &Self::Hidden) -> Result<Self::Hidden, Error>;
+    fn add(a: &Self::Hidden, b: &Self::Hidden) -> Result<Self::Hidden, Error>;
+    fn talker(&mut self, hidden: Self::Hidden) -> Result<Self::Hidden, Error>;
+    /// Consume an ordered conditioning prefix, retaining only its last output.
+    fn prefill(
+        &mut self,
+        first: Self::Hidden,
+        remaining: impl IntoIterator<Item = Self::Hidden>,
+    ) -> Result<Self::Hidden, Error> {
+        let mut last = self.talker(first)?;
+        for hidden in remaining {
+            last = self.talker(hidden)?;
+        }
+        Ok(last)
     }
+    async fn talker_head(
+        &mut self,
+        hidden: Self::Hidden,
+    ) -> Result<(Self::Hidden, Self::Logits), Error>;
+    fn project(&mut self, hidden: Self::Hidden) -> Result<Self::Hidden, Error>;
+    fn predictor(&mut self, hidden: Self::Hidden) -> Result<Self::Hidden, Error>;
+    async fn predictor_head(
+        &mut self,
+        group: usize,
+        hidden: Self::Hidden,
+    ) -> Result<Self::Logits, Error>;
+    async fn condition(
+        &mut self,
+        samples: &[f32],
+        mel: &[f32],
+        channels: usize,
+    ) -> Result<(Self::Hidden, Vec<Vec<u32>>), Error>;
+    async fn waveform(
+        &mut self,
+        packed: Vec<i32>,
+        groups: usize,
+        frames: usize,
+    ) -> Result<Vec<f32>, Error>;
 }
-
-pub struct Networks<P> {
-    pub talker: Decoder,
-    pub talker_head: Function,
-    pub predictor: Decoder,
-    pub predictor_heads: Vec<Function>,
-    pub predictor_projection: P,
-    pub codec_embeddings: Vec<Function>,
-    pub codec_frame: Function,
-}
-
 pub struct Selection<T, S> {
     pub talker: T,
     pub predictor: S,
@@ -67,37 +71,28 @@ pub struct Selection<T, S> {
     pub minimum_frames: usize,
 }
 
-pub struct Generator<P, T, S> {
-    networks: Networks<P>,
+pub struct Generator<B: Model, T, S> {
+    pub(crate) networks: B,
     selection: Selection<T, S>,
 }
 
-pub struct Sequence<'a, P, T, S> {
-    generator: &'a mut Generator<P, T, S>,
-    pending: Option<Tensor<f16>>,
+pub struct Sequence<'a, B: Model, T, S> {
+    pub(crate) generator: &'a mut Generator<B, T, S>,
+    pending: Option<B::Hidden>,
     history: Vec<u32>,
     finished: bool,
 }
 
-impl<P: PredictorProjection, T: TokenSampler, S: TokenSampler> Generator<P, T, S> {
-    pub fn embed_code(&mut self, group: usize, token: u32) -> Result<Tensor<f16>, Error> {
-        let function = self
-            .networks
-            .codec_embeddings
-            .get_mut(group)
-            .ok_or(Error::Contract("code group is outside the model"))?;
-        embed(function, token)
+impl<B: Model, T: TokenSampler, S: TokenSampler> Generator<B, T, S> {
+    pub fn embed_code(&mut self, group: usize, token: u32) -> Result<B::Hidden, Error> {
+        self.networks.code(group, token)
     }
-    pub fn embed_frame(&mut self, codes: &[u32], text: &Tensor<f16>) -> Result<Tensor<f16>, Error> {
-        frame(&mut self.networks.codec_frame, codes, text)
+    pub fn embed_frame(&mut self, codes: &[u32], text: &B::Hidden) -> Result<B::Hidden, Error> {
+        self.networks.frame(codes, text)
     }
-    pub fn new(networks: Networks<P>, selection: Selection<T, S>) -> Result<Self, Error> {
-        if networks.predictor_heads.is_empty()
-            || networks.codec_embeddings.len() != networks.predictor_heads.len() + 1
-        {
-            return Err(Error::Contract(
-                "one codec embedding per group and one predictor head per residual group are required",
-            ));
+    pub fn new(networks: B, selection: Selection<T, S>) -> Result<Self, Error> {
+        if networks.groups() < 2 {
+            return Err(Error::Contract("at least two code groups are required"));
         }
         Ok(Self {
             networks,
@@ -105,19 +100,16 @@ impl<P: PredictorProjection, T: TokenSampler, S: TokenSampler> Generator<P, T, S
         })
     }
 
-    /// Starts an independent request; borrowing prevents two requests from
-    /// sharing these native states concurrently. Failure requires a new request.
     pub fn start(
         &mut self,
-        prefill: impl IntoIterator<Item = Tensor<f16>>,
-    ) -> Result<Sequence<'_, P, T, S>, Error> {
-        self.networks.talker.reset();
-        self.networks.predictor.reset();
-        let mut last = None;
-        for hidden in prefill {
-            last = Some(self.networks.talker.step(hidden).map_err(Error::Talker)?);
-        }
-        let last = last.ok_or(Error::Contract("prefill must not be empty"))?;
+        prefill: impl IntoIterator<Item = B::Hidden>,
+    ) -> Result<Sequence<'_, B, T, S>, Error> {
+        self.networks.reset();
+        let mut prefill = prefill.into_iter();
+        let first = prefill
+            .next()
+            .ok_or(Error::Contract("prefill must not be empty"))?;
+        let last = self.networks.prefill(first, prefill)?;
         let pending = Some(last);
         Ok(Sequence {
             generator: self,
@@ -128,25 +120,24 @@ impl<P: PredictorProjection, T: TokenSampler, S: TokenSampler> Generator<P, T, S
     }
 }
 
-impl<P: PredictorProjection, T: TokenSampler, S: TokenSampler> Sequence<'_, P, T, S> {
-    pub fn embed_frame(&mut self, codes: &[u32], text: &Tensor<f16>) -> Result<Tensor<f16>, Error> {
+impl<B: Model, T: TokenSampler, S: TokenSampler> Sequence<'_, B, T, S> {
+    pub fn embed_frame(&mut self, codes: &[u32], text: &B::Hidden) -> Result<B::Hidden, Error> {
         self.generator.embed_frame(codes, text)
     }
 
     /// Extend the conditioning prefix without resetting the KV state.
-    pub fn prefill(&mut self, hidden: Tensor<f16>) -> Result<(), Error> {
+    pub fn prefill(
+        &mut self,
+        first: B::Hidden,
+        remaining: impl IntoIterator<Item = B::Hidden>,
+    ) -> Result<(), Error> {
         self.pending = None;
-        let hidden = self
-            .generator
-            .networks
-            .talker
-            .step(hidden)
-            .map_err(Error::Talker)?;
+        let hidden = self.generator.networks.prefill(first, remaining)?;
         self.pending = Some(hidden);
         Ok(())
     }
 
-    pub fn next_frame(&mut self, text: &Tensor<f16>) -> Result<Option<Vec<u32>>, Error> {
+    pub async fn next_frame(&mut self, text: &B::Hidden) -> Result<Option<Vec<u32>>, Error> {
         let Some(hidden) = self.pending.take() else {
             return if self.finished {
                 Ok(None)
@@ -154,96 +145,42 @@ impl<P: PredictorProjection, T: TokenSampler, S: TokenSampler> Sequence<'_, P, T
                 Err(Error::Contract("sequence failed; start a new request"))
             };
         };
-        let (past, mut logits) = head(&mut self.generator.networks.talker_head, &hidden)?;
+        let (past, logits) = self.generator.networks.talker_head(hidden).await?;
         let selection = &mut self.generator.selection;
-        if selection.eos as usize >= logits.len()
-            || selection.reserved_start as usize > logits.len()
-        {
-            return Err(Error::Contract(
-                "reserved token range is outside the vocabulary",
-            ));
-        }
-        selection.repetition.apply(&mut logits, &self.history)?;
-        for (index, value) in logits
-            .iter_mut()
-            .enumerate()
-            .skip(selection.reserved_start as usize)
-        {
-            if index != selection.eos as usize {
-                *value = f32::NEG_INFINITY;
-            }
-        }
-        if self.history.len() < selection.minimum_frames {
-            logits[selection.eos as usize] = f32::NEG_INFINITY;
-        }
-        let first = selection.talker.sample(&mut logits)?;
+        let logits = logits.constrain(
+            selection.repetition,
+            &self.history,
+            selection.eos,
+            selection.reserved_start,
+            self.history.len() < selection.minimum_frames,
+        )?;
+        let first_token = selection.talker.sample(logits).await?;
+        let first = self
+            .generator
+            .networks
+            .read_tokens(std::slice::from_ref(&first_token))
+            .await?[0];
         if first == selection.eos {
             self.finished = true;
             return Ok(None);
         }
         let networks = &mut self.generator.networks;
-        networks.predictor.reset();
-        let past = networks.predictor_projection.project(past)?;
-        networks.predictor.step(past).map_err(Error::Predictor)?;
-        let mut codes = vec![first];
-        for index in 0..networks.predictor_heads.len() {
-            let embedded = embed(&mut networks.codec_embeddings[index], codes[index])?;
-            let projected = networks.predictor_projection.project(embedded)?;
-            let hidden = networks
-                .predictor
-                .step(projected)
-                .map_err(Error::Predictor)?;
-            let (_, mut logits) = head(&mut networks.predictor_heads[index], &hidden)?;
-            codes.push(selection.predictor.sample(&mut logits)?);
+        networks.reset_predictor();
+        let past = networks.project(past)?;
+        networks.predictor(past)?;
+        let mut tokens = vec![first_token];
+        for index in 0..networks.groups() - 1 {
+            let embedded = networks.code_token(index, &tokens[index])?;
+            let projected = networks.project(embedded)?;
+            let hidden = networks.predictor(projected)?;
+            let logits = networks.predictor_head(index, hidden).await?;
+            tokens.push(selection.predictor.sample(logits).await?);
         }
-        let embedded = frame(&mut networks.codec_frame, &codes, text)?;
-        let hidden = networks.talker.step(embedded).map_err(Error::Talker)?;
+        let codes = networks.read_tokens(&tokens).await?;
+        let embedded = networks.frame(&codes, text)?;
+        let hidden = networks.talker(embedded)?;
         self.pending = Some(hidden);
         self.history.push(first);
         Ok(Some(codes))
     }
-}
-
-fn frame(function: &mut Function, codes: &[u32], text: &Tensor<f16>) -> Result<Tensor<f16>, Error> {
-    let ids = codes
-        .iter()
-        .map(|&id| i32::try_from(id).map_err(|_| Error::Contract("codec token exceeds int32")))
-        .collect::<Result<Vec<_>, _>>()?;
-    let ids = Tensor::from_slice(&[1, ids.len()], &ids)?;
-    let mut inputs = Inputs::new();
-    inputs.insert("codes", &ids)?;
-    inputs.insert("text", text)?;
-    Ok(function
-        .predict(&inputs)
-        .map_err(Error::Frame)?
-        .tensor("hidden")?)
-}
-
-pub fn embed(function: &mut Function, token: u32) -> Result<Tensor<f16>, Error> {
-    let identifier = token;
-    let token = i32::try_from(token).map_err(|_| Error::Contract("token exceeds int32"))?;
-    let tensor = Tensor::from_slice(&[1, 1], &[token])?;
-    let mut inputs = Inputs::new();
-    inputs.insert("token", &tensor)?;
-    Ok(function
-        .predict(&inputs)
-        .map_err(|source| Error::Embedding {
-            token: identifier,
-            source,
-        })?
-        .tensor("hidden")?)
-}
-
-fn head(function: &mut Function, hidden: &Tensor<f16>) -> Result<(Tensor<f16>, Vec<f32>), Error> {
-    let mut inputs = Inputs::new();
-    inputs.insert("hidden", hidden)?;
-    let prediction = function.predict(&inputs).map_err(Error::Head)?;
-    let logits = prediction
-        .tensor::<f16>("logits")?
-        .read()
-        .into_data()
-        .into_iter()
-        .map(f16::to_f32)
-        .collect();
-    Ok((prediction.tensor("normalized")?, logits))
 }

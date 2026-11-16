@@ -2,21 +2,26 @@
 name = "deepclone"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lexoliu/deepclone"
 description = "Qwen3-TTS voice cloning on Apple hardware through Core ML"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [features]
 default = []
+browser = ["dep:getrandom","tokenizers/unstable_wasm", "burn", "streaming", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:gloo-timers", "dep:web-time", "rand/std_rng"]
+burn = ["dep:burn", "dep:safetensors", "inference"]
 sampling = ["dep:rand", "dep:thiserror"]
 coreml = ["dep:ondevice-coreml", "dep:thiserror"]
-generation = ["coreml", "sampling"]
+generation = ["sampling"]
 inference = ["generation", "dep:serde", "dep:serde_json", "dep:tokenizers", "dep:realfft"]
 streaming = ["inference", "dep:tracing", "dep:async-channel", "dep:futures-lite", "dep:tokio"]
 download = ["dep:ondevice"]
 http = ["download", "ondevice/zenwave"]
-cli = ["streaming", "dep:async-io", "dep:rustix", "tokio/fs", "tokio/io-util", "http", "dep:futures-lite", "dep:clap", "dep:hound", "dep:tracing", "dep:tracing-subscriber", "rand/std_rng"]
+cli = ["coreml", "streaming", "dep:async-io", "dep:rustix", "tokio/fs", "tokio/io-util", "http", "dep:futures-lite", "dep:clap", "dep:hound", "dep:tracing", "dep:tracing-subscriber", "rand/std_rng"]
 
 [[bin]]
 name = "deepclone"
@@ -24,12 +29,14 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [dependencies]
+burn = { version = "0.22.1", default-features = false, features = ["std", "wgpu", "webgpu", "fusion", "cubecl", "extension"], optional = true }
+safetensors = { git = "https://github.com/lexoliu/safetensors", branch = "fix/wasm32-tensor-sizes", default-features = false, features = ["alloc"], optional = true }
 rustix = { version = "1.1.6", default-features = false, features = ["std"], optional = true }
 async-io = { version = "2.6.0", default-features = false, optional = true }
 async-channel = { version = "2.5.0", default-features = false, features = ["std"], optional = true }
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "time"], optional = true }
 ondevice = { git = "https://github.com/May-Agent/ondevice", branch = "dev", default-features = false, features = ["archive"], optional = true }
-futures-lite = { version = "2.6.1", default-features = false, features = ["std"], optional = true }
+futures-lite = { version = "2.6.1", default-features = false, features = ["std", "race"], optional = true }
 rand = { version = "0.10.3", default-features = false, features = ["std"], optional = true }
 thiserror = { version = "2.0.21", default-features = false, optional = true }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"], optional = true }
@@ -42,6 +49,7 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"], op
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "ansi"], optional = true }
 
 [dev-dependencies]
+futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
 rand = { version = "0.10.3", default-features = false, features = ["std", "std_rng"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
@@ -51,3 +59,50 @@ ondevice-coreml = { git = "https://github.com/May-Agent/ondevice", branch = "dev
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { version = "0.2.130", default-features = false, features = ["std"], optional = true }
+wasm-bindgen-futures = { version = "0.4.80", default-features = false, features = ["std"], optional = true }
+js-sys = { version = "0.3.107", default-features = false, features = ["std"], optional = true }
+gloo-timers = { version = "0.4.0", default-features = false, features = ["futures"], optional = true }
+web-time = { version = "1.1.0", default-features = false, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.getrandom]
+version = "0.4.3"
+default-features = false
+features = ["wasm_js"]
+optional = true
+
+[patch.crates-io]
+cubek = { git = "https://github.com/lexoliu/cubek", branch = "fix/webgpu-capabilities" }
+cubek-attention = { git = "https://github.com/lexoliu/cubek", branch = "fix/webgpu-capabilities" }
+cubek-convolution = { git = "https://github.com/lexoliu/cubek", branch = "fix/webgpu-capabilities" }
+cubek-interpolate = { git = "https://github.com/lexoliu/cubek", branch = "fix/webgpu-capabilities" }
+cubek-matmul = { git = "https://github.com/lexoliu/cubek", branch = "fix/webgpu-capabilities" }
+cubek-pool = { git = "https://github.com/lexoliu/cubek", branch = "fix/webgpu-capabilities" }
+cubek-quant = { git = "https://github.com/lexoliu/cubek", branch = "fix/webgpu-capabilities" }
+cubek-random = { git = "https://github.com/lexoliu/cubek", branch = "fix/webgpu-capabilities" }
+cubek-reduce = { git = "https://github.com/lexoliu/cubek", branch = "fix/webgpu-capabilities" }
+cubek-std = { git = "https://github.com/lexoliu/cubek", branch = "fix/webgpu-capabilities" }
+cubek-tile = { git = "https://github.com/lexoliu/cubek", branch = "fix/webgpu-capabilities" }
+cubecl = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl-common = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl-core = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl-cpp = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl-cpu = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl-cuda = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl-environment = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl-hip = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl-ir = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl-llvm = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl-macros = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl-macros-internal = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl-metal = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl-monitoring = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl-opt = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl-runtime = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl-server = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl-spirv = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl-std = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl-wgpu = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl-zspace = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
