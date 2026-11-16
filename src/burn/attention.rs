@@ -6,17 +6,22 @@ use burn::{
         ops::FloatTensorOps, tensor::FloatTensor, wgpu::CubeBackend,
     },
     cubecl::{ir::ElemType, prelude::*},
-    tensor::{FloatDType, Shape, Tensor as BurnTensor},
+    tensor::{DType, Shape, Tensor as BurnTensor, activation},
 };
 
 #[backend_extension(Cube, Fusion)]
 trait DecodeAttention: Backend {
-    #[fusion(dtype = query, shape = query.clone())]
-    fn decode_attention(
+    #[fusion(dtype = query, shape = Shape::from([1, query[1], 1, *length]))]
+    fn query_scores(
         query: FloatTensor<Self>,
         keys: FloatTensor<Self>,
-        values: FloatTensor<Self>,
         length: usize,
+    ) -> FloatTensor<Self>;
+
+    #[fusion(dtype = probabilities, shape = Shape::from([1, probabilities[1], 1, values[3]]))]
+    fn weighted_values(
+        probabilities: FloatTensor<Self>,
+        values: FloatTensor<Self>,
     ) -> FloatTensor<Self>;
 }
 
@@ -26,64 +31,87 @@ pub(super) fn decode(
     values: BurnTensor<4>,
     length: usize,
 ) -> BurnTensor<4> {
-    BurnTensor::from_dispatch(Dispatch::decode_attention(
+    let dtype = query.dtype();
+    let heads = query.dims()[1];
+    let kv_heads = keys.dims()[1];
+    let scores = BurnTensor::<4>::from_dispatch(Dispatch::query_scores(
         query.into_dispatch(),
         keys.into_dispatch(),
-        values.into_dispatch(),
         length,
+    ));
+    // Keep the established softmax reduction and rounding boundaries. Small
+    // probability differences can change an entire autoregressive trajectory.
+    let scores = scores.reshape([1, kv_heads, heads / kv_heads, 1, length]);
+    let probabilities = activation::softmax(scores.cast(DType::F32), 4)
+        .cast(dtype)
+        .reshape([1, heads, 1, length]);
+    BurnTensor::from_dispatch(Dispatch::weighted_values(
+        probabilities.into_dispatch(),
+        values.into_dispatch(),
     ))
 }
 
 impl DecodeAttention for CubeBackend {
-    fn decode_attention(
+    fn query_scores(
         query: FloatTensor<Self>,
         keys: FloatTensor<Self>,
-        values: FloatTensor<Self>,
         length: usize,
     ) -> FloatTensor<Self> {
         let shape = query.shape();
-        let output = Self::float_empty(shape.clone(), &query.device, query.dtype.into());
-        let scores = Self::float_empty(
-            Shape::from([shape[1], length]),
+        let output = Self::float_empty(
+            Shape::from([1, shape[1], 1, length]),
             &query.device,
-            FloatDType::F32,
+            query.dtype.into(),
         );
-        let dim = CubeDim::new(&query.client, length.max(shape[3]));
-        decode_kernel::launch(
+        let dim = CubeDim::new(&query.client, length);
+        query_scores_kernel::launch(
             &query.client,
             CubeCount::Static(shape[1] as u32, 1, 1),
             dim,
             query.clone().into_tensor_arg(),
             keys.into_tensor_arg(),
-            values.into_tensor_arg(),
-            scores.into_tensor_arg(),
             output.clone().into_tensor_arg(),
-            length as u32,
-            dim.num_elems() as usize,
             dtype_to_storage_type(query.dtype),
+        );
+        output
+    }
+
+    fn weighted_values(
+        probabilities: FloatTensor<Self>,
+        values: FloatTensor<Self>,
+    ) -> FloatTensor<Self> {
+        let shape = probabilities.shape();
+        let width = values.shape()[3];
+        let output = Self::float_empty(
+            Shape::from([1, shape[1], 1, width]),
+            &probabilities.device,
+            probabilities.dtype.into(),
+        );
+        let dim = CubeDim::new(&probabilities.client, width);
+        weighted_values_kernel::launch(
+            &probabilities.client,
+            CubeCount::Static(shape[1] as u32, 1, 1),
+            dim,
+            probabilities.clone().into_tensor_arg(),
+            values.into_tensor_arg(),
+            output.clone().into_tensor_arg(),
+            dtype_to_storage_type(probabilities.dtype),
         );
         output
     }
 }
 
 #[cube(launch)]
-fn decode_kernel<F: Float>(
+fn query_scores_kernel<F: Float>(
     query: &Tensor<F>,
     keys: &Tensor<F>,
-    values: &Tensor<F>,
-    scores: &mut Tensor<f32>,
     output: &mut Tensor<F>,
-    length: u32,
-    #[comptime] lanes: usize,
     #[define(F)] _dtype: ElemType,
 ) {
     let head = CUBE_POS;
     let kv_head = head / (query.shape(1) / keys.shape(1));
     let width = query.shape(3);
-    let length = length as usize;
-    let score_offset = head * length;
-    let mut partial = Shared::<[f32]>::new_slice(lanes);
-    let maximum = RuntimeCell::<f32>::new(-f32::MAX);
+    let length = output.shape(3);
     let mut token = UNIT_POS as usize;
     while token < length {
         let dot = RuntimeCell::<f32>::new(0f32);
@@ -98,62 +126,30 @@ fn decode_kernel<F: Float>(
                         ),
             );
         }
-        // The unfused path stores QK in the activation dtype before FP32 softmax.
-        let score = f32::cast_from(F::cast_from(dot.consume()));
-        scores[score_offset + token] = score;
-        maximum.store(f32::max(maximum.read(), score));
+        let offset = head * output.stride(1) + token;
+        output[offset] = F::cast_from(dot.consume());
         token += CUBE_DIM as usize;
     }
-    partial[UNIT_POS as usize] = maximum.consume();
-    sync_cube();
-    #[unroll]
-    for stage in 0..lanes.ilog2() as usize {
-        let distance = comptime!(lanes >> (stage + 1));
-        if (UNIT_POS as usize) < distance {
-            partial[UNIT_POS as usize] = f32::max(
-                partial[UNIT_POS as usize],
-                partial[UNIT_POS as usize + distance],
-            );
-        }
-        sync_cube();
-    }
-    let maximum = partial[0];
-    // All lanes must read the maximum before reusing the reduction storage.
-    sync_cube();
-    let sum = RuntimeCell::<f32>::new(0f32);
-    let mut token = UNIT_POS as usize;
-    while token < length {
-        let weight = f32::exp(scores[score_offset + token] - maximum);
-        scores[score_offset + token] = weight;
-        sum.store(sum.read() + weight);
-        token += CUBE_DIM as usize;
-    }
-    partial[UNIT_POS as usize] = sum.consume();
-    sync_cube();
-    #[unroll]
-    for stage in 0..lanes.ilog2() as usize {
-        let distance = comptime!(lanes >> (stage + 1));
-        if (UNIT_POS as usize) < distance {
-            partial[UNIT_POS as usize] += partial[UNIT_POS as usize + distance];
-        }
-        sync_cube();
-    }
-    let denominator = partial[0];
-    let mut token = UNIT_POS as usize;
-    while token < length {
-        // Qwen casts softmax probabilities back before multiplying V.
-        scores[score_offset + token] =
-            f32::cast_from(F::cast_from(scores[score_offset + token] / denominator));
-        token += CUBE_DIM as usize;
-    }
-    sync_storage();
+}
+
+#[cube(launch)]
+fn weighted_values_kernel<F: Float>(
+    probabilities: &Tensor<F>,
+    values: &Tensor<F>,
+    output: &mut Tensor<F>,
+    #[define(F)] _dtype: ElemType,
+) {
+    let head = CUBE_POS;
+    let kv_head = head / (probabilities.shape(1) / values.shape(1));
+    let width = output.shape(3);
+    let length = probabilities.shape(3);
     let mut column = UNIT_POS as usize;
     while column < width {
         let mixed = RuntimeCell::<f32>::new(0f32);
         for token in 0..length {
             mixed.store(
                 mixed.read()
-                    + scores[score_offset + token]
+                    + f32::cast_from(probabilities[head * probabilities.stride(1) + token])
                         * f32::cast_from(
                             values[kv_head * values.stride(1)
                                 + token * values.stride(2)
