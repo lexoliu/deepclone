@@ -1,6 +1,7 @@
 //! Qwen tensor execution on Burn's WGPU runtime.
 mod codec_decoder;
 mod layers;
+pub mod sampling;
 pub use codec_decoder::{CodecDecoder, CodecDecoderConfig};
 mod codec_encoder;
 pub use codec_encoder::{CodecEncoder, EncoderConfig};

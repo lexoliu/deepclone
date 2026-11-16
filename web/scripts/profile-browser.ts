@@ -15,6 +15,7 @@ const { values } = parseArgs({
     runs: { type: "string" },
     timeout: { type: "string" },
     profile: { type: "boolean", default: false },
+    "gpu-profile": { type: "boolean", default: false },
     shaders: { type: "string" },
   },
 });
@@ -47,7 +48,7 @@ const page = await browser.contexts()[0].newPage();
 page.setDefaultTimeout(timeout);
 const measurements: unknown[] = [];
 const profiler =
-  values.profile || values.shaders
+  values.profile || values.shaders || values["gpu-profile"]
     ? await browser.newBrowserCDPSession()
     : null;
 const shaderCaptures: Promise<void>[] = [];
@@ -153,6 +154,16 @@ try {
       if (result.exceptionDetails)
         throw new Error(JSON.stringify(result.exceptionDetails));
     }
+    if (values["gpu-profile"]) {
+      const result = (await profileCommand("Runtime.evaluate", {
+        expression: await readFile(
+          new URL("./profile-gpu.js", import.meta.url),
+          "utf8",
+        ),
+      })) as { exceptionDetails?: unknown };
+      if (result.exceptionDetails)
+        throw new Error(JSON.stringify(result.exceptionDetails));
+    }
     if (values.profile) {
       await profileCommand("Profiler.enable");
       await profileCommand("Profiler.start");
@@ -172,6 +183,19 @@ try {
       });
     const event = await Promise.race([measured, failed]);
     const timing = await event.args()[1].jsonValue();
+    if (values["gpu-profile"]) {
+      const result = (await profileCommand("Runtime.evaluate", {
+        expression: "speechGpuProfileTake()",
+        awaitPromise: true,
+        returnByValue: true,
+      })) as { result: { value: unknown }; exceptionDetails?: unknown };
+      if (result.exceptionDetails)
+        throw new Error(JSON.stringify(result.exceptionDetails));
+      await writeFile(
+        join(values.output!, `run-${run}-gpu.json`),
+        JSON.stringify(result.result.value, null, 2),
+      );
+    }
     // Persist timing before transferring audio, including when the remote browser closes.
     await writeFile(
       join(values.output!, `run-${run}-timing.json`),

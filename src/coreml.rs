@@ -121,6 +121,14 @@ impl<T: TokenSampler, S: TokenSampler> Engine<CoreMl, T, S> {
 }
 impl Backend for CoreMl {
     type Hidden = Tensor<f16>;
+    type Token = u32;
+    type Logits = Vec<f32>;
+    fn code_token(&mut self, group: usize, token: &u32) -> Result<Self::Hidden, Error> {
+        self.code(group, *token)
+    }
+    async fn read_tokens(&self, tokens: &[u32]) -> Result<Vec<u32>, Error> {
+        Ok(tokens.to_vec())
+    }
     fn groups(&self) -> usize {
         self.codec_embeddings.len()
     }

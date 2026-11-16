@@ -1,12 +1,16 @@
 //! Shared autoregressive generation with backend-owned tensors and KV state.
 use crate::inference::Error;
-use crate::sampling::{RepetitionPenalty, TokenSampler};
+use crate::sampling::{Logits, RepetitionPenalty, TokenSampler};
 
 /// Execution operations needed by the shared Qwen generation loop.
 /// Readbacks are asynchronous so the same session can execute inside a Web Worker.
 #[allow(async_fn_in_trait)]
 pub trait Model {
     type Hidden: Clone;
+    type Token: Clone;
+    type Logits: Logits<Token = Self::Token>;
+    fn code_token(&mut self, group: usize, token: &Self::Token) -> Result<Self::Hidden, Error>;
+    async fn read_tokens(&self, tokens: &[Self::Token]) -> Result<Vec<u32>, Error>;
     fn groups(&self) -> usize;
     /// Fixed-shape backends can retain their model capacity; dynamic backends use the valid span.
     fn waveform_frames(&self, valid: usize, capacity: usize) -> usize {
@@ -35,14 +39,14 @@ pub trait Model {
     async fn talker_head(
         &mut self,
         hidden: Self::Hidden,
-    ) -> Result<(Self::Hidden, Vec<f32>), Error>;
+    ) -> Result<(Self::Hidden, Self::Logits), Error>;
     fn project(&mut self, hidden: Self::Hidden) -> Result<Self::Hidden, Error>;
     fn predictor(&mut self, hidden: Self::Hidden) -> Result<Self::Hidden, Error>;
     async fn predictor_head(
         &mut self,
         group: usize,
         hidden: Self::Hidden,
-    ) -> Result<Vec<f32>, Error>;
+    ) -> Result<Self::Logits, Error>;
     async fn condition(
         &mut self,
         samples: &[f32],
@@ -141,29 +145,21 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Sequence<'_, B, T, S> {
                 Err(Error::Contract("sequence failed; start a new request"))
             };
         };
-        let (past, mut logits) = self.generator.networks.talker_head(hidden).await?;
+        let (past, logits) = self.generator.networks.talker_head(hidden).await?;
         let selection = &mut self.generator.selection;
-        if selection.eos as usize >= logits.len()
-            || selection.reserved_start as usize > logits.len()
-        {
-            return Err(Error::Contract(
-                "reserved token range is outside the vocabulary",
-            ));
-        }
-        selection.repetition.apply(&mut logits, &self.history)?;
-        for (index, value) in logits
-            .iter_mut()
-            .enumerate()
-            .skip(selection.reserved_start as usize)
-        {
-            if index != selection.eos as usize {
-                *value = f32::NEG_INFINITY;
-            }
-        }
-        if self.history.len() < selection.minimum_frames {
-            logits[selection.eos as usize] = f32::NEG_INFINITY;
-        }
-        let first = selection.talker.sample(&mut logits)?;
+        let logits = logits.constrain(
+            selection.repetition,
+            &self.history,
+            selection.eos,
+            selection.reserved_start,
+            self.history.len() < selection.minimum_frames,
+        )?;
+        let first_token = selection.talker.sample(logits).await?;
+        let first = self
+            .generator
+            .networks
+            .read_tokens(std::slice::from_ref(&first_token))
+            .await?[0];
         if first == selection.eos {
             self.finished = true;
             return Ok(None);
@@ -172,14 +168,15 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Sequence<'_, B, T, S> {
         networks.reset_predictor();
         let past = networks.project(past)?;
         networks.predictor(past)?;
-        let mut codes = vec![first];
+        let mut tokens = vec![first_token];
         for index in 0..networks.groups() - 1 {
-            let embedded = networks.code(index, codes[index])?;
+            let embedded = networks.code_token(index, &tokens[index])?;
             let projected = networks.project(embedded)?;
             let hidden = networks.predictor(projected)?;
-            let mut logits = networks.predictor_head(index, hidden).await?;
-            codes.push(selection.predictor.sample(&mut logits)?);
+            let logits = networks.predictor_head(index, hidden).await?;
+            tokens.push(selection.predictor.sample(logits).await?);
         }
+        let codes = networks.read_tokens(&tokens).await?;
         let embedded = networks.frame(&codes, text)?;
         let hidden = networks.talker(embedded)?;
         self.pending = Some(hidden);

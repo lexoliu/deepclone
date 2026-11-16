@@ -1,7 +1,7 @@
 //! Complete Qwen model operations for the shared cloning session.
 use super::{
     CodecDecoder, CodecDecoderConfig, CodecEncoder, Decoder, DecoderConfig, EncoderConfig, Speaker,
-    SpeakerConfig, WeightSource, layers::Linear, read,
+    SpeakerConfig, WeightSource, layers::Linear,
 };
 use crate::{generation::Model, inference::Error};
 use burn::tensor::{DType, Device, Tensor, TensorData, activation};
@@ -133,6 +133,19 @@ impl Burn {
 }
 impl Model for Burn {
     type Hidden = Tensor<3>;
+    type Token = super::sampling::DeviceToken;
+    type Logits = super::sampling::DeviceLogits;
+    fn code_token(&mut self, group: usize, token: &Self::Token) -> Result<Self::Hidden, Error> {
+        let table = &self.codes[group];
+        let width = table.dims()[1];
+        Ok(table
+            .clone()
+            .select(0, token.index())
+            .reshape([1, 1, width]))
+    }
+    async fn read_tokens(&self, tokens: &[Self::Token]) -> Result<Vec<u32>, Error> {
+        Ok(super::sampling::read_tokens(tokens).await?)
+    }
     fn waveform_frames(&self, valid: usize, _capacity: usize) -> usize {
         valid
     }
@@ -188,9 +201,10 @@ impl Model for Burn {
     async fn talker_head(
         &mut self,
         hidden: Self::Hidden,
-    ) -> Result<(Self::Hidden, Vec<f32>), Error> {
+    ) -> Result<(Self::Hidden, Self::Logits), Error> {
         let hidden = self.talker.normalize(hidden);
-        let logits = read(self.talker_head.forward(hidden.clone())).await?;
+        let logits =
+            super::sampling::DeviceLogits(self.talker_head.forward(hidden.clone()).flatten(0, 2));
         Ok((hidden, logits))
     }
     fn project(&mut self, hidden: Self::Hidden) -> Result<Self::Hidden, Error> {
@@ -206,8 +220,12 @@ impl Model for Burn {
         &mut self,
         group: usize,
         hidden: Self::Hidden,
-    ) -> Result<Vec<f32>, Error> {
-        Ok(read(self.predictor_heads[group].forward(self.predictor.normalize(hidden))).await?)
+    ) -> Result<Self::Logits, Error> {
+        Ok(super::sampling::DeviceLogits(
+            self.predictor_heads[group]
+                .forward(self.predictor.normalize(hidden))
+                .flatten(0, 2),
+        ))
     }
     async fn condition(
         &mut self,
