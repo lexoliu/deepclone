@@ -26,7 +26,7 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(about = "Local Qwen3-TTS voice cloning through Core ML")]
+#[command(about = "Local streaming voice cloning")]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -246,7 +246,8 @@ struct Sample<'a> {
     prompt: &'a Prompt,
     file: String,
     backend: &'static str,
-    requested_compute_units: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_compute_units: Option<&'a str>,
     seed: u64,
     greedy: bool,
     sample_rate: u32,
@@ -416,8 +417,15 @@ async fn run<T: TokenSampler + Send + 'static, S: TokenSampler + Send + 'static>
             transformer_weight_bits: generation.transformer_weight_bits,
             prompt,
             file,
-            backend: "Rust/Core ML",
-            requested_compute_units: &args.compute_units,
+            backend: if args.burn_model.is_some() {
+                "Rust/Burn WebGPU"
+            } else {
+                "Rust/Core ML"
+            },
+            requested_compute_units: args
+                .burn_model
+                .is_none()
+                .then_some(args.compute_units.as_str()),
             seed: args.seed,
             greedy: args.greedy,
             temperature: args.temperature,
