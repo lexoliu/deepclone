@@ -14,6 +14,7 @@ const { values } = parseArgs({
     output: { type: "string" },
     runs: { type: "string" },
     timeout: { type: "string" },
+    profile: { type: "boolean", default: false },
   },
 });
 for (const key of [
@@ -43,6 +44,42 @@ const browser = await chromium.connectOverCDP(values.cdp!);
 const page = await browser.contexts()[0].newPage();
 page.setDefaultTimeout(timeout);
 const measurements: unknown[] = [];
+const profiler = values.profile ? await browser.newBrowserCDPSession() : null;
+let profileSession: string | undefined;
+let commandId = 0;
+const replies = new Map<
+  number,
+  { resolve(value: unknown): void; reject(reason: Error): void }
+>();
+profiler?.on("Target.receivedMessageFromTarget", ({ sessionId, message }) => {
+  if (sessionId !== profileSession) return;
+  const response = JSON.parse(message);
+  const pending = replies.get(response.id);
+  if (!pending) return;
+  replies.delete(response.id);
+  if (response.error) pending.reject(new Error(response.error.message));
+  else pending.resolve(response.result);
+});
+async function profileCommand(method: string) {
+  const id = ++commandId;
+  const response = new Promise<unknown>((resolve, reject) => {
+    replies.set(id, { resolve, reject });
+  });
+  const deadline = setTimeout(() => {
+    replies.get(id)?.reject(new Error(`Worker profiler timed out: ${method}`));
+    replies.delete(id);
+  }, 10000);
+  try {
+    await profiler!.send("Target.sendMessageToTarget", {
+      sessionId: profileSession,
+      message: JSON.stringify({ id, method }),
+    });
+    return await response;
+  } finally {
+    clearTimeout(deadline);
+    replies.delete(id);
+  }
+}
 page.on("console", (event) => {
   if (event.type() === "error") process.stderr.write(`${event.text()}\n`);
 });
@@ -70,6 +107,22 @@ try {
   await page
     .getByLabel("Language", { exact: true })
     .selectOption(values.language!);
+  if (profiler) {
+    const { targetInfos } = await profiler.send("Target.getTargets");
+    const target = targetInfos.find(
+      (target) =>
+        target.type === "worker" && target.url.includes("inference.worker"),
+    );
+    if (!target)
+      throw new Error("The inference worker is unavailable for profiling");
+    const attached = await profiler.send("Target.attachToTarget", {
+      targetId: target.targetId,
+      flatten: false,
+    });
+    profileSession = attached.sessionId;
+    await profileCommand("Profiler.enable");
+    await profileCommand("Profiler.start");
+  }
   for (let run = 1; run <= runs; run++) {
     const measured = page.waitForEvent("console", {
       predicate: (event) => event.text().startsWith("Speech generation timing"),
@@ -123,7 +176,25 @@ try {
     );
     process.stdout.write(`${JSON.stringify(result)}\n`);
   }
+} catch (reason) {
+  process.stderr.write(
+    `${reason instanceof Error ? reason.stack : String(reason)}\n`,
+  );
+  throw reason;
 } finally {
-  await page.close();
-  await browser.close();
+  try {
+    if (profileSession) {
+      const result = await profileCommand("Profiler.stop");
+      await writeFile(
+        join(values.output!, "worker-profile.json"),
+        JSON.stringify(result),
+      );
+      await profiler!.send("Target.detachFromTarget", {
+        sessionId: profileSession,
+      });
+    }
+  } finally {
+    await page.close();
+    await browser.close();
+  }
 }

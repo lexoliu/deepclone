@@ -12,6 +12,19 @@ use std::{cell::Cell, num::NonZeroUsize, rc::Rc, time::Duration};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
+// This module is called repeatedly through wasm-bindgen, including externref helpers.
+// Explicit initialization prevents wasm-ld's command-style constructor wrappers from
+// rerunning inventory/Pliron registration on every exported call.
+#[wasm_bindgen(start)]
+pub fn initialize() {
+    unsafe extern "C" {
+        fn __wasm_call_ctors();
+    }
+    // SAFETY: wasm-bindgen invokes its start entry once after instantiation, before
+    // exposing any model operations. The function is supplied by the Wasm linker.
+    unsafe { __wasm_call_ctors() };
+}
+
 type Sampler = Multinomial<StdRng>;
 type Cloner = Engine<Burn, Sampler, Sampler>;
 fn error(value: impl std::fmt::Display) -> JsValue {
