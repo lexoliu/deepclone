@@ -109,18 +109,34 @@ impl Layer {
             0..position + tokens,
             0..c.head_dim,
         ];
-        let keys = expand_kv(self.keys.clone().slice(selection.clone()), c);
-        let values = expand_kv(self.values.clone().slice(selection), c);
+        let groups = c.num_attention_heads / c.num_key_value_heads;
+        // Broadcast shared K/V over query groups instead of materializing repeated heads.
+        let q = q.reshape([1, c.num_key_value_heads, groups, tokens, c.head_dim]);
+        let keys = self.keys.clone().slice(selection.clone()).reshape([
+            1,
+            c.num_key_value_heads,
+            1,
+            position + tokens,
+            c.head_dim,
+        ]);
+        let values = self.values.clone().slice(selection).reshape([
+            1,
+            c.num_key_value_heads,
+            1,
+            position + tokens,
+            c.head_dim,
+        ]);
         let scores = (q * (c.head_dim as f32).sqrt().recip())
-            .matmul(keys.swap_dims(2, 3))
+            .matmul(keys.swap_dims(3, 4))
             .cast(burn::tensor::DType::F32);
         let scores = match mask {
-            Some(mask) => scores.mask_fill(mask.clone(), f32::NEG_INFINITY),
+            Some(mask) => scores.mask_fill(mask.clone().unsqueeze(), f32::NEG_INFINITY),
             None => scores,
         };
-        let mixed = activation::softmax(scores, 3)
+        let mixed = activation::softmax(scores, 4)
             .cast(x.dtype())
             .matmul(values)
+            .reshape([1, c.num_attention_heads, tokens, c.head_dim])
             .swap_dims(1, 2)
             .reshape([1, tokens, c.num_attention_heads * c.head_dim]);
         let x = x + self.output.forward(mixed);
@@ -137,13 +153,6 @@ pub(crate) fn rotary(x: Tensor<4>, cosine: &Tensor<4>, sine: &Tensor<4>) -> Tens
     let second = x.clone().slice([0..b, 0..h, 0..t, d / 2..d]);
     x * cosine.clone() + Tensor::cat(vec![-second, first], 3) * sine.clone()
 }
-fn expand_kv(x: Tensor<4>, c: &DecoderConfig) -> Tensor<4> {
-    let [b, h, t, d] = x.dims();
-    x.reshape([b, h, 1, t, d])
-        .repeat_dim(2, c.num_attention_heads / c.num_key_value_heads)
-        .reshape([b, c.num_attention_heads, t, d])
-}
-
 /// One decoder's weights and independently owned KV cache. Resetting invalidates
 /// the old prefix without reading or clearing unused device storage.
 pub struct Decoder {
