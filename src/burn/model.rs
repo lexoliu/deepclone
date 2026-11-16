@@ -4,7 +4,7 @@ use super::{
     SpeakerConfig, WeightSource, layers::Linear, read,
 };
 use crate::{generation::Model, inference::Error};
-use burn::tensor::{DType, Device, Int, Tensor, TensorData, activation, module};
+use burn::tensor::{DType, Device, Int, Tensor, TensorData, activation};
 use serde::Deserialize;
 use std::num::NonZeroUsize;
 
@@ -106,12 +106,16 @@ impl Burn {
         })
     }
     fn embed(&self, table: &Tensor<2>, token: u32) -> Result<Tensor<3>, Error> {
-        let id = i32::try_from(token).map_err(|_| Error::Contract("token exceeds int32"))?;
-        if token as usize >= table.dims()[0] {
+        let [vocabulary, width] = table.dims();
+        let row = token as usize;
+        if row >= vocabulary {
             return Err(Error::Contract("token outside embedding vocabulary"));
         }
-        let indices = Tensor::<2, Int>::from_data(TensorData::new(vec![id], [1, 1]), &self.device);
-        Ok(module::embedding(table.clone(), indices))
+        // A known row needs no uploaded integer index or embedding gather kernel.
+        Ok(table
+            .clone()
+            .slice([row..row + 1, 0..width])
+            .reshape([1, 1, width]))
     }
 }
 impl Model for Burn {
@@ -152,6 +156,17 @@ impl Model for Burn {
     }
     fn talker(&mut self, hidden: Self::Hidden) -> Result<Self::Hidden, Error> {
         Ok(self.talker.step(hidden)?)
+    }
+    fn prefill(
+        &mut self,
+        first: Self::Hidden,
+        remaining: impl IntoIterator<Item = Self::Hidden>,
+    ) -> Result<Self::Hidden, Error> {
+        let mut prefix = vec![first];
+        prefix.extend(remaining);
+        let hidden = self.talker.step(Tensor::cat(prefix, 1))?;
+        let [b, t, h] = hidden.dims();
+        Ok(hidden.slice([0..b, t - 1..t, 0..h]))
     }
     async fn talker_head(
         &mut self,

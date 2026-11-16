@@ -2,7 +2,7 @@ use super::{
     Error, WeightSource,
     layers::{Linear, RmsNorm},
 };
-use burn::tensor::{Tensor, activation};
+use burn::tensor::{Bool, Int, Tensor, activation};
 use serde::Deserialize;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -68,34 +68,33 @@ impl Layer {
         c: &DecoderConfig,
         cosine: &Tensor<4>,
         sine: &Tensor<4>,
+        mask: Option<&Tensor<4, Bool>>,
     ) -> Tensor<3> {
+        let tokens = x.dims()[1];
         let normalized = self.input.forward(x.clone());
-        let q = self
-            .query_norm
-            .forward(self.query.forward(normalized.clone()).reshape([
-                1,
-                c.num_attention_heads,
-                1,
-                c.head_dim,
-            ]));
-        let k = self
-            .key_norm
-            .forward(self.key.forward(normalized.clone()).reshape([
-                1,
-                c.num_key_value_heads,
-                1,
-                c.head_dim,
-            ]));
+        let q = self.query_norm.forward(
+            self.query
+                .forward(normalized.clone())
+                .reshape([1, tokens, c.num_attention_heads, c.head_dim])
+                .swap_dims(1, 2),
+        );
+        let k = self.key_norm.forward(
+            self.key
+                .forward(normalized.clone())
+                .reshape([1, tokens, c.num_key_value_heads, c.head_dim])
+                .swap_dims(1, 2),
+        );
         let v = self
             .value
             .forward(normalized)
-            .reshape([1, c.num_key_value_heads, 1, c.head_dim]);
+            .reshape([1, tokens, c.num_key_value_heads, c.head_dim])
+            .swap_dims(1, 2);
         let q = rotary(q, cosine, sine);
         let k = rotary(k, cosine, sine);
         let selection = [
             0..1,
             0..c.num_key_value_heads,
-            position..position + 1,
+            position..position + tokens,
             0..c.head_dim,
         ];
         // Moving the cache into slice_assign permits device-side in-place
@@ -107,16 +106,23 @@ impl Layer {
         let selection = [
             0..1,
             0..c.num_key_value_heads,
-            0..position + 1,
+            0..position + tokens,
             0..c.head_dim,
         ];
         let keys = expand_kv(self.keys.clone().slice(selection.clone()), c);
         let values = expand_kv(self.values.clone().slice(selection), c);
-        let scores = (q * (c.head_dim as f32).sqrt().recip()).matmul(keys.swap_dims(2, 3));
-        let mixed = activation::softmax(scores.cast(burn::tensor::DType::F32), 3)
+        let scores = (q * (c.head_dim as f32).sqrt().recip())
+            .matmul(keys.swap_dims(2, 3))
+            .cast(burn::tensor::DType::F32);
+        let scores = match mask {
+            Some(mask) => scores.mask_fill(mask.clone(), f32::NEG_INFINITY),
+            None => scores,
+        };
+        let mixed = activation::softmax(scores, 3)
             .cast(x.dtype())
             .matmul(values)
-            .reshape([1, 1, c.num_attention_heads * c.head_dim]);
+            .swap_dims(1, 2)
+            .reshape([1, tokens, c.num_attention_heads * c.head_dim]);
         let x = x + self.output.forward(mixed);
         let normalized = self.post.forward(x.clone());
         x + self.down.gated(
@@ -193,25 +199,51 @@ impl Decoder {
         self.position = 0;
     }
     pub fn step(&mut self, mut hidden: Tensor<3>) -> Result<Tensor<3>, Error> {
-        if self.position == self.capacity {
+        let [batch, tokens, width] = hidden.dims();
+        if tokens > self.capacity - self.position {
             return Err(Error::Context(self.capacity));
         }
-        if hidden.dims() != [1, 1, self.config.hidden_size] {
+        if batch != 1 || tokens == 0 || width != self.config.hidden_size {
             return Err(Error::Tensor {
                 name: "hidden".into(),
-                reason: "expected one token with the configured hidden width".into(),
+                reason: "expected a nonempty token sequence with the configured hidden width"
+                    .into(),
             });
         }
         let slice = [
             0..1,
             0..1,
-            self.position..self.position + 1,
+            self.position..self.position + tokens,
             0..self.config.head_dim,
         ];
         let cosine = self.cosine.clone().slice(slice.clone());
         let sine = self.sine.clone().slice(slice);
+        let mask = if tokens > 1 {
+            let device = hidden.device();
+            let queries = Tensor::<1, Int>::arange(
+                self.position as i64..(self.position + tokens) as i64,
+                &device,
+            )
+            .reshape([tokens, 1]);
+            let keys = Tensor::<1, Int>::arange(0..(self.position + tokens) as i64, &device)
+                .reshape([1, self.position + tokens]);
+            Some(
+                (queries - keys)
+                    .lower_elem(0)
+                    .reshape([1, 1, tokens, self.position + tokens]),
+            )
+        } else {
+            None
+        };
         for layer in &mut self.layers {
-            hidden = layer.forward(hidden, self.position, &self.config, &cosine, &sine);
+            hidden = layer.forward(
+                hidden,
+                self.position,
+                &self.config,
+                &cosine,
+                &sine,
+                mask.as_ref(),
+            );
         }
         // Submit each autoregressive step without waiting for GPU completion.
         // This keeps a long reference prefix from accumulating one fusion queue.
@@ -219,7 +251,7 @@ impl Decoder {
             .device()
             .flush()
             .map_err(|error| Error::Execution(error.to_string()))?;
-        self.position += 1;
+        self.position += tokens;
         Ok(hidden)
     }
     pub fn normalize(&self, hidden: Tensor<3>) -> Tensor<3> {

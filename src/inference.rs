@@ -516,18 +516,26 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> CloningSession<'_, B, T, S> {
         if cancelled() {
             return Err(Error::Cancelled);
         }
+        let mut prefix = Vec::new();
         while self.prefix < self.reference.codes.len() {
             if cancelled() {
                 return Err(Error::Cancelled);
             }
             let Some(text) = self.text_embedding()? else {
-                return Ok(false);
+                break;
             };
             let embedded = self
                 .sequence
                 .embed_frame(&self.reference.codes[self.prefix], &text)?;
-            self.sequence.prefill(embedded)?;
+            prefix.push(embedded);
             self.prefix += 1;
+        }
+        let mut prefix = prefix.into_iter();
+        if let Some(first) = prefix.next() {
+            self.sequence.prefill(first, prefix)?;
+        }
+        if self.prefix < self.reference.codes.len() {
+            return Ok(false);
         }
         if self.codes.generated_frames() == self.maximum_frames {
             return Err(Error::FrameBudget {

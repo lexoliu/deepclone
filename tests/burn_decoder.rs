@@ -77,6 +77,42 @@ fn check_decoder(dtype: DType, prefix: &str, config_file: &str, fixture_prefix: 
                     .unwrap();
                 actual.extend(read(decoder.normalize(hidden)).await.unwrap());
             }
+            decoder.reset();
+            // Split the prefix to exercise causal masking with nonzero KV offsets.
+            let split = t / 2;
+            let mut batched = Vec::new();
+            for span in [0..split, split..t] {
+                if span.is_empty() {
+                    continue;
+                }
+                let hidden = decoder
+                    .step(input.clone().slice([0..b, span, 0..h]).cast(dtype))
+                    .unwrap();
+                batched.extend(read(decoder.normalize(hidden)).await.unwrap());
+            }
+            assert!(batched.iter().all(|v| v.is_finite()));
+            let squared_error = batched
+                .iter()
+                .zip(&actual)
+                .map(|(a, b)| (a - b).powi(2))
+                .sum::<f32>();
+            let squared_reference = actual.iter().map(|v| v.powi(2)).sum::<f32>();
+            // FP16 matrix and vector kernels round differently; require <1% relative RMS.
+            assert!(
+                (squared_error / squared_reference).sqrt() < 0.01,
+                "batched prefix differs for prompt {index}"
+            );
+            if dtype == DType::F32 {
+                let maximum = batched
+                    .iter()
+                    .zip(&expected)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    maximum < 0.005,
+                    "batched prompt {index}: maximum error {maximum}"
+                );
+            }
             assert!(
                 actual.iter().all(|v| v.is_finite()),
                 "nonfinite output for prompt {index}"

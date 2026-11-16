@@ -20,6 +20,18 @@ pub trait Model {
     fn frame(&mut self, codes: &[u32], text: &Self::Hidden) -> Result<Self::Hidden, Error>;
     fn add(a: &Self::Hidden, b: &Self::Hidden) -> Result<Self::Hidden, Error>;
     fn talker(&mut self, hidden: Self::Hidden) -> Result<Self::Hidden, Error>;
+    /// Consume an ordered conditioning prefix, retaining only its last output.
+    fn prefill(
+        &mut self,
+        first: Self::Hidden,
+        remaining: impl IntoIterator<Item = Self::Hidden>,
+    ) -> Result<Self::Hidden, Error> {
+        let mut last = self.talker(first)?;
+        for hidden in remaining {
+            last = self.talker(hidden)?;
+        }
+        Ok(last)
+    }
     async fn talker_head(
         &mut self,
         hidden: Self::Hidden,
@@ -89,11 +101,11 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Generator<B, T, S> {
         prefill: impl IntoIterator<Item = B::Hidden>,
     ) -> Result<Sequence<'_, B, T, S>, Error> {
         self.networks.reset();
-        let mut last = None;
-        for hidden in prefill {
-            last = Some(self.networks.talker(hidden)?);
-        }
-        let last = last.ok_or(Error::Contract("prefill must not be empty"))?;
+        let mut prefill = prefill.into_iter();
+        let first = prefill
+            .next()
+            .ok_or(Error::Contract("prefill must not be empty"))?;
+        let last = self.networks.prefill(first, prefill)?;
         let pending = Some(last);
         Ok(Sequence {
             generator: self,
@@ -110,9 +122,13 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Sequence<'_, B, T, S> {
     }
 
     /// Extend the conditioning prefix without resetting the KV state.
-    pub fn prefill(&mut self, hidden: B::Hidden) -> Result<(), Error> {
+    pub fn prefill(
+        &mut self,
+        first: B::Hidden,
+        remaining: impl IntoIterator<Item = B::Hidden>,
+    ) -> Result<(), Error> {
         self.pending = None;
-        let hidden = self.generator.networks.talker(hidden)?;
+        let hidden = self.generator.networks.prefill(first, remaining)?;
         self.pending = Some(hidden);
         Ok(())
     }
