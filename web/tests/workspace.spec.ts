@@ -362,6 +362,68 @@ test("background preparation stays usable and cancellation terminates an unrespo
   }
 });
 
+test("a crashed worker is discarded and the next request creates a fresh worker", async ({
+  page,
+}) => {
+  await page.addInitScript(() =>
+    Object.defineProperty(navigator, "gpu", { value: {}, configurable: true }),
+  );
+  await page.route("**/models.json", (route) =>
+    route.fulfill({
+      json: [
+        {
+          size: "0.6b",
+          manifest: "https://example.test/model.json",
+          sha256: "0".repeat(64),
+        },
+      ],
+    }),
+  );
+  let created = 0;
+  await page.context().route("**/inference.worker-*.js", (route) =>
+    route.fulfill({
+      path: new URL(
+        ++created === 1
+          ? "./fixtures/crashing-worker.js"
+          : "./fixtures/unresponsive-worker.js",
+        import.meta.url,
+      ).pathname,
+      contentType: "text/javascript",
+      headers: {
+        "Cross-Origin-Embedder-Policy": "require-corp",
+        "Cross-Origin-Resource-Policy": "same-origin",
+      },
+    }),
+  );
+  await page.goto("/");
+  await page.getByRole("button", { name: "Upload audio", exact: true }).click();
+  await page
+    .getByLabel("Reference recording", { exact: true })
+    .setInputFiles(referenceWav());
+  await page
+    .getByLabel("Reference transcript")
+    .fill("法律让人安心。規則への信頼。규칙에 대한 신뢰.");
+  await page
+    .getByLabel("What should your voice say?")
+    .fill("Hello from my voice.");
+  await page.getByRole("button", { name: "Generate speech" }).click();
+  await expect(page.getByRole("alert")).toHaveText(
+    "Speech could not be prepared. Please try again.",
+  );
+  await expect(
+    page.getByRole("button", { name: "Generate speech" }),
+  ).toBeEnabled();
+  expect(created).toBe(1);
+  await page.getByRole("button", { name: "Generate speech" }).click();
+  await expect(
+    page.getByRole("status").filter({ hasText: "Generating speech" }),
+  ).toBeVisible();
+  expect(created).toBe(2);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(page.getByText("Cancelled", { exact: true })).toBeVisible();
+});
+
 test("cancel terminates a real worker that cannot process messages", async ({
   page,
 }) => {

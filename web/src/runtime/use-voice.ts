@@ -51,12 +51,18 @@ export function useVoice() {
     const value = reason instanceof Error ? reason : new Error(String(reason));
     console.error("Voice workspace failed", value);
     if (cancelling.current) return;
+    operation.current++;
+    stopWorker(value);
+    void player.current?.close();
+    player.current = null;
     setError("Speech could not be prepared. Please try again.");
     setBusy(false);
     setRunning(false);
     setStatus("Operation stopped");
   }
-  function stopWorker() {
+  function stopWorker(
+    reason: Error = new DOMException("Cancelled", "AbortError"),
+  ) {
     catalogAbort.current?.abort();
     if (worker.current) {
       worker.current.onmessage = null;
@@ -64,8 +70,7 @@ export function useVoice() {
       worker.current.terminate();
       worker.current = null;
     }
-    for (const request of pending.current.values())
-      request.reject(new DOMException("Cancelled", "AbortError"));
+    for (const request of pending.current.values()) request.reject(reason);
     pending.current.clear();
     preparation.current = null;
     prepared.current = false;
@@ -80,8 +85,6 @@ export function useVoice() {
     worker.current = instance;
     const workerFailed = (reason: Error) => {
       if (instance !== worker.current) return;
-      for (const item of pending.current.values()) item.reject(reason);
-      pending.current.clear();
       fail(reason);
     };
     instance.onerror = (event) =>
@@ -231,6 +234,7 @@ export function useVoice() {
     >;
     timing.current = times;
     try {
+      if (!worker.current) initializeWorker();
       const previous = player.current;
       const active = new Player();
       player.current = active;
@@ -267,7 +271,6 @@ export function useVoice() {
     } catch (reason) {
       if (current === operation.current) {
         fail(reason);
-        void player.current?.close();
       }
     }
   }

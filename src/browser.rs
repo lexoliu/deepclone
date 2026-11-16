@@ -15,8 +15,15 @@ use wasm_bindgen_futures::JsFuture;
 // This module is called repeatedly through wasm-bindgen, including externref helpers.
 // Explicit initialization prevents wasm-ld's command-style constructor wrappers from
 // rerunning inventory/Pliron registration on every exported call.
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console, js_name = error)]
+    fn report_panic(message: &str);
+}
+
 #[wasm_bindgen(start)]
 pub fn initialize() {
+    std::panic::set_hook(Box::new(|info| report_panic(&info.to_string())));
     unsafe extern "C" {
         fn __wasm_call_ctors();
     }
