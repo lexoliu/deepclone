@@ -48,7 +48,7 @@ impl FeedForward for Gated {
         Ok(Self {
             gate: Linear::load(w, &format!("{p}.gate_proj"))?,
             up: Linear::load(w, &format!("{p}.up_proj"))?,
-            down: Linear::load(w, &format!("{p}.down_proj"))?,
+            down: Linear::load(w, &format!("{p}.down_proj"))?.cast(DType::F32),
         })
     }
     fn apply(&self, x: Tensor<3>) -> Tensor<3> {

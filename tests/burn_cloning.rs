@@ -52,29 +52,37 @@ fn cloned_speech_completes_in_four_languages() {
             ),
             ("Korean", "오늘은 조용한 길을 걸으며 내일을 생각해 봅시다."),
         ] {
-            let result = engine
-                .synthesize(&voice, text, language, 512)
-                .await
-                .unwrap();
-            assert!(!result.waveform.samples.is_empty());
-            assert!(result.waveform.samples.iter().all(|x| x.is_finite()));
-            assert!(result.waveform.samples.iter().any(|x| x.abs() > 0.01));
+            let sample_rate = engine.sample_rate();
+            let mut session = engine.session(&voice, language, 512, usize::MAX).unwrap();
+            session.push_text(text).unwrap();
+            session.finish_input().unwrap();
             let spec = hound::WavSpec {
                 channels: 2,
-                sample_rate: result.waveform.sample_rate,
+                sample_rate,
                 bits_per_sample: 32,
                 sample_format: hound::SampleFormat::Float,
             };
             let mut writer =
                 hound::WavWriter::create(output.join(format!("{language}.wav")), spec).unwrap();
-            for sample in result.waveform.samples {
-                writer.write_sample(sample).unwrap();
-                writer.write_sample(sample).unwrap();
+            let mut count = 0;
+            let mut audible = false;
+            while let Some(chunk) = session.next_chunk(12, || false).await.unwrap() {
+                assert!(!chunk.samples.is_empty());
+                assert!(chunk.samples.iter().all(|x| x.is_finite()));
+                audible |= chunk.samples.iter().any(|x| x.abs() > 0.01);
+                count += chunk.samples.len();
+                for sample in chunk.samples {
+                    writer.write_sample(sample).unwrap();
+                    writer.write_sample(sample).unwrap();
+                }
+                writer.flush().unwrap();
             }
+            assert!(count > 0 && audible);
+            let generation = session.into_generation().unwrap();
             writer.finalize().unwrap();
             std::fs::write(
                 output.join(format!("{language}.json")),
-                serde_json::to_vec(&result.generation).unwrap(),
+                serde_json::to_vec(&generation).unwrap(),
             )
             .unwrap();
         }

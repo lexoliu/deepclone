@@ -14,6 +14,11 @@ impl Linear {
             bias: weights.optional(&format!("{prefix}.bias"))?,
         })
     }
+    pub fn cast(mut self, dtype: DType) -> Self {
+        self.weight = self.weight.cast(dtype);
+        self.bias = self.bias.map(|bias| bias.cast(dtype));
+        self
+    }
     pub fn gated(&self, gate: Tensor<3>, up: Tensor<3>) -> Tensor<3> {
         // Qwen's gated intermediate can exceed FP16 while its projection fits.
         let dtype = gate.dtype();

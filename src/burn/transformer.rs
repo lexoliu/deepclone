@@ -55,7 +55,8 @@ impl Layer {
             output: Linear::load(w, &format!("{prefix}.self_attn.o_proj"))?,
             gate: Linear::load(w, &format!("{prefix}.mlp.gate_proj"))?,
             up: Linear::load(w, &format!("{prefix}.mlp.up_proj"))?,
-            down: Linear::load(w, &format!("{prefix}.mlp.down_proj"))?,
+            down: Linear::load(w, &format!("{prefix}.mlp.down_proj"))?
+                .cast(burn::tensor::DType::F32),
             keys: Tensor::<4>::zeros(shape, w.device()).cast(w.dtype()),
             values: Tensor::<4>::zeros(shape, w.device()).cast(w.dtype()),
         })
