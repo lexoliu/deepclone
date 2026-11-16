@@ -15,6 +15,7 @@ const { values } = parseArgs({
     runs: { type: "string" },
     timeout: { type: "string" },
     profile: { type: "boolean", default: false },
+    shaders: { type: "string" },
   },
 });
 for (const key of [
@@ -40,11 +41,17 @@ if (
 )
   throw new Error("Invalid timeout or run count");
 await mkdir(values.output!, { recursive: true });
+if (values.shaders) await mkdir(values.shaders, { recursive: true });
 const browser = await chromium.connectOverCDP(values.cdp!);
 const page = await browser.contexts()[0].newPage();
 page.setDefaultTimeout(timeout);
 const measurements: unknown[] = [];
-const profiler = values.profile ? await browser.newBrowserCDPSession() : null;
+const profiler =
+  values.profile || values.shaders
+    ? await browser.newBrowserCDPSession()
+    : null;
+const shaderCaptures: Promise<void>[] = [];
+let shaderIndex = 0;
 let profileSession: string | undefined;
 let commandId = 0;
 const replies = new Map<
@@ -60,7 +67,10 @@ profiler?.on("Target.receivedMessageFromTarget", ({ sessionId, message }) => {
   if (response.error) pending.reject(new Error(response.error.message));
   else pending.resolve(response.result);
 });
-async function profileCommand(method: string) {
+async function profileCommand(
+  method: string,
+  params: Record<string, unknown> = {},
+) {
   const id = ++commandId;
   const response = new Promise<unknown>((resolve, reject) => {
     replies.set(id, { resolve, reject });
@@ -72,7 +82,7 @@ async function profileCommand(method: string) {
   try {
     await profiler!.send("Target.sendMessageToTarget", {
       sessionId: profileSession,
-      message: JSON.stringify({ id, method }),
+      message: JSON.stringify({ id, method, params }),
     });
     return await response;
   } finally {
@@ -81,6 +91,16 @@ async function profileCommand(method: string) {
   }
 }
 page.on("console", (event) => {
+  if (values.shaders && event.text().startsWith("Speech shader failure")) {
+    const path = join(values.shaders, `shader-${shaderIndex++}.json`);
+    shaderCaptures.push(
+      event
+        .args()[1]
+        .jsonValue()
+        .then((value) => writeFile(path, JSON.stringify(value, null, 2))),
+    );
+    return;
+  }
   if (event.type() === "error") process.stderr.write(`${event.text()}\n`);
   if (event.text().startsWith("Speech codec timing"))
     process.stdout.write(`${JSON.stringify({ codec: event.text() })}\n`);
@@ -122,8 +142,20 @@ try {
       flatten: false,
     });
     profileSession = attached.sessionId;
-    await profileCommand("Profiler.enable");
-    await profileCommand("Profiler.start");
+    if (values.shaders) {
+      const result = (await profileCommand("Runtime.evaluate", {
+        expression: await readFile(
+          new URL("./profile-shaders.js", import.meta.url),
+          "utf8",
+        ),
+      })) as { exceptionDetails?: unknown };
+      if (result.exceptionDetails)
+        throw new Error(JSON.stringify(result.exceptionDetails));
+    }
+    if (values.profile) {
+      await profileCommand("Profiler.enable");
+      await profileCommand("Profiler.start");
+    }
   }
   for (let run = 1; run <= runs; run++) {
     const measured = page.waitForEvent("console", {
@@ -186,16 +218,19 @@ try {
 } finally {
   try {
     if (profileSession) {
-      const result = await profileCommand("Profiler.stop");
-      await writeFile(
-        join(values.output!, "worker-profile.json"),
-        JSON.stringify(result),
-      );
+      if (values.profile) {
+        const result = await profileCommand("Profiler.stop");
+        await writeFile(
+          join(values.output!, "worker-profile.json"),
+          JSON.stringify(result),
+        );
+      }
       await profiler!.send("Target.detachFromTarget", {
         sessionId: profileSession,
       });
     }
   } finally {
+    await Promise.all(shaderCaptures);
     await page.close();
     await browser.close();
   }
