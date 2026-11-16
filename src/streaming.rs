@@ -121,6 +121,23 @@ pub(crate) async fn feed<I, E, C: Clock>(
 where
     I: Stream<Item = Result<String, E>>,
 {
+    let lifetime = output.clone();
+    future::race(feed_open(input, output, options, clock), async {
+        lifetime.closed().await;
+        Ok(())
+    })
+    .await
+}
+
+async fn feed_open<I, E, C: Clock>(
+    input: I,
+    output: Sender<Option<String>>,
+    options: Options,
+    clock: C,
+) -> Result<(), E>
+where
+    I: Stream<Item = Result<String, E>>,
+{
     futures_lite::pin!(input);
     let mut buffer = String::new();
     let mut count = 0;

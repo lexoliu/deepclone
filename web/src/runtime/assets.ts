@@ -55,7 +55,15 @@ export async function asset(
     await cache.delete(url);
     throw error;
   }
-  if (!cached)
-    await cache.put(url, new Response(bytes as Uint8Array<ArrayBuffer>));
+  if (!cached) {
+    try {
+      await cache.put(url, new Response(bytes as Uint8Array<ArrayBuffer>));
+    } catch (cause) {
+      throw new Error(
+        `Could not cache ${file.path}. Check available browser storage and use a regular browser profile rather than private browsing.`,
+        { cause },
+      );
+    }
+  }
   return bytes;
 }

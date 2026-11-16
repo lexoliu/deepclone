@@ -25,7 +25,7 @@ use crate::{
     sampling::TokenSampler,
 };
 use async_channel::{Receiver, Sender};
-use futures_lite::{Stream, StreamExt, future};
+use futures_lite::{Stream, StreamExt};
 #[cfg(all(feature = "coreml", target_vendor = "apple"))]
 use ondevice_coreml::ComputeUnits;
 use std::{
@@ -162,16 +162,13 @@ impl Voice {
             // Keep a sender alive until the error is published and cancellation
             // is signalled. A worker cannot mistake this gap for normal EOF.
             let input_lifetime = input.clone();
-            let result = future::race(feed(text, input, policy), async {
-                input_lifetime.closed().await;
-                Ok(())
-            })
-            .await;
+            let result = feed(text, input, policy).await;
             tracing::debug!("text forwarding ended");
             if let Err(error) = result {
                 let _ = input_error.send(error).await;
                 cancellation.close();
             }
+            drop(input_lifetime);
         });
         let stream = AudioStream {
             output: Box::pin(output),
@@ -498,6 +495,23 @@ mod tests {
             assert!(dropped.load(Ordering::SeqCst));
             assert!(request.audio.is_closed());
             assert!(request.text.recv().await.is_err());
+        });
+    }
+
+    #[test]
+    fn shared_feeder_cancels_an_idle_source_when_consumer_closes() {
+        runtime().block_on(async {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let (sender, receiver) = async_channel::bounded(1);
+            let task = tokio::spawn(feed(pending_input(dropped.clone()), sender, options()));
+            tokio::task::yield_now().await;
+            receiver.close();
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(dropped.load(Ordering::SeqCst));
         });
     }
 
