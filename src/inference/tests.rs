@@ -502,7 +502,10 @@ fn real_coreml_waveform_replays_prediction_inputs() {
 #[test]
 #[ignore = "requires Core ML models, a private recording and a long-form prompt"]
 fn real_coreml_long_stream_preserves_codes_and_contiguous_pcm() {
-    use crate::sampling::{Multinomial, Parameters};
+    use crate::{
+        profiling::{Counter, TimedSampler},
+        sampling::{Multinomial, Parameters},
+    };
     use ondevice_coreml::ComputeUnits;
     use rand::{SeedableRng, rngs::StdRng};
     use std::path::PathBuf;
@@ -531,23 +534,35 @@ fn real_coreml_long_stream_preserves_codes_and_contiguous_pcm() {
                 .unwrap();
         let parameters = Parameters::new(0.9, NonZeroUsize::new(50), 1.).unwrap();
         progress("load", 0, 0);
+        let mut talker_sampling = Counter::default();
+        let mut predictor_sampling = Counter::default();
         let mut engine = Engine::open(
             &directory("DEEPCLONE_TRANSFORMERS"),
             &directory("DEEPCLONE_AUDIO_MODELS"),
             ComputeUnits::CpuAndNeuralEngine,
             Sampling {
-                talker: Multinomial::new(StdRng::seed_from_u64(42), parameters),
-                predictor: Multinomial::new(StdRng::seed_from_u64(42), parameters),
+                talker: TimedSampler {
+                    inner: Multinomial::new(StdRng::seed_from_u64(42), parameters),
+                    counter: &mut talker_sampling,
+                },
+                predictor: TimedSampler {
+                    inner: Multinomial::new(StdRng::seed_from_u64(42), parameters),
+                    counter: &mut predictor_sampling,
+                },
                 repetition: RepetitionPenalty::new(1.05).unwrap(),
                 minimum_frames: 2,
             },
         )
         .unwrap();
+        let load_seconds = started.elapsed().as_secs_f64();
+        let condition_started = std::time::Instant::now();
         progress("reference", 0, 0);
         let reference = engine
             .reference(&samples, sample_rate, &text)
             .await
             .unwrap();
+        let conditioning_seconds = condition_started.elapsed().as_secs_f64();
+        let synthesis_started = std::time::Instant::now();
         let maximum = NonZeroUsize::new(512).unwrap(); // Former total stream frame limit.
         let mut session = engine
             .session(
@@ -562,9 +577,32 @@ fn real_coreml_long_stream_preserves_codes_and_contiguous_pcm() {
         session.finish_input().unwrap();
         let mut samples = Vec::new();
         progress("synthesis", session.codes.frames(), 0);
+        let mut chunks = Vec::new();
+        let mut playback_end = 0.0f64;
+        let mut gaps = 0.0;
+        let mut first_audio_seconds = None;
         while !session.finished {
+            let before = session.generator.networks.profile.clone();
+            let chunk_started = std::time::Instant::now();
             match session.next_chunk(12, || false).await {
                 Ok(Some(chunk)) => {
+                    let production_seconds = chunk_started.elapsed().as_secs_f64();
+                    let delivered = synthesis_started.elapsed().as_secs_f64();
+                    let duration =
+                        chunk.samples.len() as f64 / session.decoder_contract.sample_rate as f64;
+                    if first_audio_seconds.is_none() {
+                        first_audio_seconds = Some(delivered);
+                        playback_end = delivered;
+                    } else {
+                        gaps += (delivered - playback_end).max(0.0);
+                    }
+                    playback_end = playback_end.max(delivered) + duration;
+                    chunks.push(serde_json::json!({
+                        "start_sample":chunk.start_sample, "samples":chunk.samples.len(),
+                        "production_seconds":production_seconds, "delivered_seconds":delivered,
+                        "audio_seconds":duration,
+                        "stages":session.generator.networks.profile.since(&before),
+                    }));
                     assert_eq!(chunk.start_sample, samples.len());
                     samples.extend(chunk.samples);
                     progress("pcm", session.codes.frames(), samples.len());
@@ -585,6 +623,29 @@ fn real_coreml_long_stream_preserves_codes_and_contiguous_pcm() {
             }
         }
         let generation = session.into_generation().unwrap();
+        let synthesis_seconds = synthesis_started.elapsed().as_secs_f64();
+        let stages = engine.generator.networks.profile.clone();
+        let rate = engine.sample_rate();
+        let samples_per_frame = engine.decoder_contract.samples_per_frame;
+        drop(engine);
+        let steady_production: f64 = chunks
+            .iter()
+            .skip(1)
+            .map(|c| c["production_seconds"].as_f64().unwrap())
+            .sum();
+        let steady_audio: f64 = chunks
+            .iter()
+            .skip(1)
+            .map(|c| c["audio_seconds"].as_f64().unwrap())
+            .sum();
+        std::fs::write(output.join("profile.json"),serde_json::to_vec_pretty(&serde_json::json!({
+            "load_seconds":load_seconds, "conditioning_seconds":conditioning_seconds,
+            "synthesis_seconds":synthesis_seconds, "first_audio_seconds":first_audio_seconds,
+            "steady_production_seconds":steady_production, "steady_audio_seconds":steady_audio,
+            "steady_rtf":steady_production/steady_audio, "playback_gap_seconds":gaps,
+            "stages":stages, "talker_sampling":talker_sampling, "predictor_sampling":predictor_sampling,
+            "chunks":chunks,
+        })).unwrap()).unwrap();
         std::fs::write(
             output.join("long.codes.json"),
             serde_json::to_vec(&generation).unwrap(),
@@ -593,14 +654,14 @@ fn real_coreml_long_stream_preserves_codes_and_contiguous_pcm() {
         assert!(generation.generated_frames() > maximum.get());
         assert!(generation.segments.len() > 1);
         assert_eq!(
-            generation.generated_frames() * engine.decoder_contract.samples_per_frame,
+            generation.generated_frames() * samples_per_frame,
             samples.len()
         );
         let mut writer = hound::WavWriter::create(
             output.join("long.wav"),
             hound::WavSpec {
                 channels: 2,
-                sample_rate: engine.sample_rate(),
+                sample_rate: rate,
                 bits_per_sample: 32,
                 sample_format: hound::SampleFormat::Float,
             },
@@ -614,7 +675,7 @@ fn real_coreml_long_stream_preserves_codes_and_contiguous_pcm() {
         progress(
             "complete",
             generation.codes.frames(),
-            generation.generated_frames() * engine.decoder_contract.samples_per_frame,
+            generation.generated_frames() * samples_per_frame,
         );
     });
 }

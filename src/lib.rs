@@ -33,3 +33,10 @@ pub mod coreml;
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 pub mod browser;
+#[cfg(all(
+    test,
+    feature = "coreml",
+    feature = "inference",
+    target_vendor = "apple"
+))]
+mod profiling;
