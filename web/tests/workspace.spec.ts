@@ -17,6 +17,91 @@ function referenceWav() {
   return { name: "reference.wav", mimeType: "audio/wav", buffer: wav };
 }
 
+for (const stop of ["failure", "cancellation"] as const) {
+  test(`${stop} preserves received audio and retry clears it`, async ({
+    page,
+  }) => {
+    await page.addInitScript(() =>
+      Object.defineProperty(navigator, "gpu", {
+        value: {},
+        configurable: true,
+      }),
+    );
+    await page.route("**/models.json", (route) =>
+      route.fulfill({
+        json: [
+          {
+            size: "0.6b",
+            manifest: "https://example.test/model.json",
+            sha256: "0".repeat(64),
+          },
+        ],
+      }),
+    );
+    await page.context().route("**/inference.worker-*.js", (route) =>
+      route.fulfill({
+        path: new URL("./fixtures/partial-worker.js", import.meta.url).pathname,
+        contentType: "text/javascript",
+        headers: {
+          "Cross-Origin-Embedder-Policy": "require-corp",
+          "Cross-Origin-Resource-Policy": "same-origin",
+        },
+      }),
+    );
+    await page.goto("/");
+    await page
+      .getByRole("button", { name: "Upload audio", exact: true })
+      .click();
+    await page
+      .getByLabel("Reference recording", { exact: true })
+      .setInputFiles(referenceWav());
+    await page
+      .getByLabel("Reference transcript")
+      .fill("法律让人安心。規則への信頼。규칙에 대한 신뢰.");
+    await page
+      .getByLabel("What should your voice say?")
+      .fill(stop === "failure" ? "fail" : "continue");
+    await page.getByRole("button", { name: "Generate speech" }).click();
+    if (stop === "cancellation") {
+      await expect(
+        page.getByText("Generating and playing", { exact: false }),
+      ).toBeVisible();
+      await page.getByRole("button", { name: "Cancel", exact: true }).click();
+    } else {
+      await expect(page.getByRole("alert")).toContainText(
+        "audio generated so far",
+      );
+    }
+    await expect(
+      page.getByRole("status").filter({ hasText: /incomplete audio saved/i }),
+    ).toBeVisible();
+    const download = page.getByRole("link", { name: "Download WAV" });
+    const samples = await download.evaluate(async (link) => {
+      const bytes = await (
+        await fetch((link as HTMLAnchorElement).href)
+      ).arrayBuffer();
+      const view = new DataView(bytes);
+      return {
+        channels: view.getUint16(22, true),
+        length: view.getUint32(40, true),
+        pcm: Array.from({ length: (bytes.byteLength - 44) / 2 }, (_, i) =>
+          view.getInt16(44 + i * 2, true),
+        ),
+      };
+    });
+    expect(samples).toEqual({
+      channels: 2,
+      length: 16,
+      pcm: [8192, 8192, -16384, -16384, 24575, 24575, -32768, -32768],
+    });
+    await page.getByLabel("What should your voice say?").fill("retry");
+    await page.getByRole("button", { name: "Generate speech" }).click();
+    await expect(download).toHaveCount(0);
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  });
+}
+
 test.beforeEach(async ({ page }) => {
   // UI tests never download real weights; GPU contract tests initialize explicitly.
   await page.route("**/models.json", (route) => route.fulfill({ json: [] }));
@@ -271,6 +356,17 @@ test("background preparation stays usable and cancellation terminates an unrespo
                 : command.kind === "finish"
                   ? { kind: "done" }
                   : null;
+        if (command.kind === "finish")
+          this.onmessage?.(
+            new MessageEvent("message", {
+              data: {
+                kind: "audio",
+                id: 0,
+                samples: new Float32Array([0.25]),
+                sampleRate: 24000,
+              },
+            }),
+          );
         if (event)
           this.onmessage?.(new MessageEvent("message", { data: event }));
       }
