@@ -77,10 +77,15 @@ fn select_kernel(
     let mut i = UNIT_POS as usize;
     while i < n {
         let value = logits[i * logits.stride(0)];
-        if value.is_nan() || value == f32::INFINITY {
+        // IEEE 754 binary32: clear the sign, then compare the exponent and
+        // significand against infinity's all-one exponent and zero significand.
+        let bits = value.to_bits();
+        let magnitude = bits & 0x7fff_ffffu32;
+        let infinity = 0x7f80_0000u32;
+        if magnitude > infinity || bits == infinity {
             status |= 2;
         }
-        if value > f32::NEG_INFINITY && value < f32::INFINITY {
+        if magnitude < infinity {
             status |= 1;
         }
         if cumulative[i * cumulative.stride(0)] > threshold {
