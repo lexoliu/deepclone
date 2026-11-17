@@ -41,7 +41,9 @@ class Packaging(unittest.TestCase):
             ]:
                 (audio / f"{component}.mlmodelc").symlink_to(shared)
                 (audio / f"{component}.contract.json").write_text(
-                    json.dumps({"compute_precision": precision})
+                    json.dumps(
+                        {"compute_precision": precision, "execution": "stateful_frame"}
+                    )
                 )
             (audio / "reference.wav").write_bytes(b"private fixture")
             first = package(transformers, audio, root / "first.tar.zst")

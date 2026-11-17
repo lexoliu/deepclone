@@ -418,11 +418,17 @@ fn recorded_reference(path: &std::path::Path) -> (Vec<f32>, u32, String) {
 
 #[cfg(all(feature = "cli", target_vendor = "apple"))]
 #[test]
-#[ignore = "requires Core ML models and packed real streaming decoder inputs"]
+#[ignore = "requires Core ML models and real growing-prefix decoder inputs"]
 fn real_coreml_waveform_replays_prediction_inputs() {
     use crate::sampling::Greedy;
     use ondevice_coreml::ComputeUnits;
     use std::path::PathBuf;
+    #[derive(serde::Deserialize)]
+    struct Call {
+        context: usize,
+        frames: usize,
+        values: Vec<i32>,
+    }
     futures_lite::future::block_on(async {
         let directory = |key| PathBuf::from(std::env::var_os(key).expect(key));
         let output = directory("DEEPCLONE_OUTPUT");
@@ -457,24 +463,21 @@ fn real_coreml_waveform_replays_prediction_inputs() {
         } else {
             None
         };
-        let bytes = std::fs::read(directory("DEEPCLONE_COREML_INPUTS")).unwrap();
+        let calls: Vec<Call> =
+            serde_json::from_slice(&std::fs::read(directory("DEEPCLONE_COREML_INPUTS")).unwrap())
+                .unwrap();
         let contract = &engine.decoder_contract;
-        let width = contract.capacity * contract.code_groups * size_of::<i32>();
-        let inputs = bytes.chunks_exact(width);
-        assert!(inputs.remainder().is_empty());
-        for (index, input) in inputs.enumerate() {
-            let codes = input
-                .as_chunks::<{ size_of::<i32>() }>()
-                .0
-                .iter()
-                .copied()
-                .map(i32::from_le_bytes)
-                .collect();
+        let mut context = None;
+        for (index, call) in calls.into_iter().enumerate() {
+            if context != Some(call.context) {
+                engine.generator.networks.reset_waveform();
+                context = Some(call.context);
+            }
             let start = std::time::Instant::now();
             let result = engine
                 .generator
                 .networks
-                .waveform(codes, contract.code_groups, contract.capacity)
+                .waveform(call.values, contract.code_groups, call.frames)
                 .await;
             reports.push(serde_json::json!({
                 "index": index,
@@ -488,10 +491,7 @@ fn real_coreml_waveform_replays_prediction_inputs() {
             )
             .unwrap();
             let samples = result.unwrap();
-            assert_eq!(
-                samples.len(),
-                contract.capacity * contract.samples_per_frame
-            );
+            assert_eq!(samples.len(), call.frames * contract.samples_per_frame);
             assert!(samples.iter().all(|v| v.is_finite()));
         }
         drop(reference);
