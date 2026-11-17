@@ -30,6 +30,8 @@ struct DecoderFiles {
 }
 
 pub struct CoreMl {
+    #[cfg(all(test, feature = "cli"))]
+    pub(crate) profile: crate::profiling::Profile,
     talker: Decoder,
     predictor: Decoder,
     talker_head: Function,
@@ -247,6 +249,8 @@ impl<T: TokenSampler, S: TokenSampler> Engine<CoreMl, T, S> {
             return Err(Error::Contract("Talker requires exactly one output head"));
         }
         let backend = CoreMl {
+            #[cfg(all(test, feature = "cli"))]
+            profile: crate::profiling::Profile::default(),
             talker: load_decoder(&manifest.decoders.talker)?,
             talker_head: open(transformers.join(&manifest.decoders.talker.heads[0]), units)?,
             predictor: load_decoder(&manifest.decoders.predictor)?,
@@ -307,6 +311,8 @@ impl Backend for CoreMl {
         self.talker.capacity()
     }
     fn reset_generation(&mut self) {
+        #[cfg(all(test, feature = "cli"))]
+        let _measurement = self.profile.measure("generation_reset");
         self.talker.reset();
         self.predictor.reset();
     }
@@ -317,30 +323,57 @@ impl Backend for CoreMl {
         self.waveform.reset();
     }
     fn reset_predictor(&mut self) {
+        #[cfg(all(test, feature = "cli"))]
+        let _measurement = self.profile.measure("predictor_reset");
         self.predictor.reset();
     }
     fn text(&mut self, token: u32) -> Result<Self::Hidden, Error> {
+        #[cfg(all(test, feature = "cli"))]
+        let _measurement = self.profile.measure("text_embedding");
         embed(&mut self.text_embedding, token, "text embedding")
     }
     fn code(&mut self, group: usize, token: u32) -> Result<Self::Hidden, Error> {
+        #[cfg(all(test, feature = "cli"))]
+        let _measurement = self.profile.measure("code_embedding");
         embed(&mut self.codec_embeddings[group], token, "codec embedding")
     }
     fn frame(&mut self, codes: &[u32], text: &Self::Hidden) -> Result<Self::Hidden, Error> {
+        #[cfg(all(test, feature = "cli"))]
+        let _measurement = self.profile.measure("frame_embedding");
         frame(&mut self.codec_frame, codes, text)
     }
     fn add(a: &Self::Hidden, b: &Self::Hidden) -> Result<Self::Hidden, Error> {
         add(a, b)
     }
     fn talker(&mut self, hidden: Self::Hidden) -> Result<Self::Hidden, Error> {
+        #[cfg(all(test, feature = "cli"))]
+        let _measurement = self.profile.measure("talker");
         Ok(self.talker.step(hidden)?)
+    }
+    #[cfg(all(test, feature = "cli"))]
+    fn prefill(
+        &mut self,
+        first: Self::Hidden,
+        remaining: impl IntoIterator<Item = Self::Hidden>,
+    ) -> Result<Self::Hidden, Error> {
+        let _measurement = self.profile.measure("prefill");
+        let mut hidden = self.talker.step(first)?;
+        for value in remaining {
+            hidden = self.talker.step(value)?;
+        }
+        Ok(hidden)
     }
     async fn talker_head(
         &mut self,
         hidden: Self::Hidden,
     ) -> Result<(Self::Hidden, Vec<f32>), Error> {
+        #[cfg(all(test, feature = "cli"))]
+        let _measurement = self.profile.measure("talker_head");
         head(&mut self.talker_head, &hidden, "Talker head")
     }
     fn project(&mut self, hidden: Self::Hidden) -> Result<Self::Hidden, Error> {
+        #[cfg(all(test, feature = "cli"))]
+        let _measurement = self.profile.measure("projection");
         if let Some(function) = &mut self.predictor_projection {
             let mut inputs = Inputs::new();
             inputs.insert("hidden", &hidden)?;
@@ -356,6 +389,8 @@ impl Backend for CoreMl {
         }
     }
     fn predictor(&mut self, hidden: Self::Hidden) -> Result<Self::Hidden, Error> {
+        #[cfg(all(test, feature = "cli"))]
+        let _measurement = self.profile.measure("predictor");
         Ok(self.predictor.step(hidden)?)
     }
     async fn predictor_head(
@@ -363,6 +398,8 @@ impl Backend for CoreMl {
         group: usize,
         hidden: Self::Hidden,
     ) -> Result<Vec<f32>, Error> {
+        #[cfg(all(test, feature = "cli"))]
+        let _measurement = self.profile.measure("predictor_head");
         Ok(head(
             &mut self.predictor_heads[group],
             &hidden,
@@ -376,6 +413,8 @@ impl Backend for CoreMl {
         mel: &[f32],
         channels: usize,
     ) -> Result<(Self::Hidden, Vec<Vec<u32>>), Error> {
+        #[cfg(all(test, feature = "cli"))]
+        let _measurement = self.profile.measure("conditioning_models");
         let mel = Tensor::from_slice(&[1, mel.len() / channels, channels], mel)?;
         let mut inputs = Inputs::new();
         inputs.insert("mel", &mel)?;
@@ -432,6 +471,8 @@ impl Backend for CoreMl {
         groups: usize,
         frames: usize,
     ) -> Result<Vec<f32>, Error> {
+        #[cfg(all(test, feature = "cli"))]
+        let _measurement = self.profile.measure("waveform");
         self.waveform.prefix(packed, groups, frames)
     }
 }
