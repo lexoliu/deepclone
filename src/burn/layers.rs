@@ -185,6 +185,19 @@ impl<P: Padding> Conv<P> {
         self.convolve(x)
     }
     fn convolve(&self, x: Tensor<3>) -> Tensor<3> {
+        let [output, input, kernel] = self.weight.dims();
+        if kernel == 1 && self.options.groups == 1 && self.options.stride == [1] {
+            let projected = super::projection::project(
+                x.swap_dims(1, 2),
+                self.weight.clone().reshape([output, input]).transpose(),
+            )
+            .swap_dims(1, 2);
+            return match &self.bias {
+                Some(bias) => projected + bias.clone().reshape([1, output, 1]),
+                None => projected,
+            };
+        }
+
         burn::tensor::module::conv1d(
             x,
             self.weight.clone(),
@@ -284,6 +297,121 @@ impl TransposeConv {
 mod tests {
     use super::*;
     use burn::tensor::{Device, TensorData};
+
+    #[test]
+    #[ignore = "requires a WebGPU adapter"]
+    fn convolution_matches_reference_across_layouts_and_stream_boundaries() {
+        futures_lite::future::block_on(async {
+            let device = Device::wgpu_options().init_async().await.unwrap();
+            for dtype in [DType::F16, DType::F32] {
+                for [batch, channels, time, outputs] in [[2, 6, 19, 10], [1, 38, 35, 22]] {
+                    for transposed in [false, true] {
+                        let mut input = Tensor::<3>::from_data(
+                            TensorData::new(
+                                (0..batch * channels * time)
+                                    .map(|i| (i as f32 * 0.017).sin())
+                                    .collect::<Vec<_>>(),
+                                if transposed {
+                                    [batch, time, channels]
+                                } else {
+                                    [batch, channels, time]
+                                },
+                            ),
+                            (&device, dtype),
+                        );
+                        if transposed {
+                            input = input.swap_dims(1, 2);
+                        }
+                        for bias in [false, true] {
+                            for [kernel, stride, dilation, groups] in
+                                [[1, 1, 1, 1], [3, 1, 2, 1], [1, 1, 1, 2], [3, 2, 1, 1]]
+                            {
+                                let layer = Conv {
+                                    weight: Tensor::from_data(
+                                        TensorData::new(
+                                            (0..outputs * channels / groups * kernel)
+                                                .map(|i| (i as f32 * 0.031).cos() / 100.)
+                                                .collect::<Vec<_>>(),
+                                            [outputs, channels / groups, kernel],
+                                        ),
+                                        (&device, dtype),
+                                    ),
+                                    bias: bias.then(|| {
+                                        Tensor::from_data(
+                                            TensorData::new(
+                                                (0..outputs)
+                                                    .map(|i| i as f32 / 100.)
+                                                    .collect::<Vec<_>>(),
+                                                [outputs],
+                                            ),
+                                            (&device, dtype),
+                                        )
+                                    }),
+                                    options: burn::tensor::ops::ConvOptions::new(
+                                        [stride],
+                                        [0],
+                                        [dilation],
+                                        groups,
+                                    ),
+                                    padding: Causal,
+                                };
+                                let padded = layer.padding.apply(
+                                    input.clone(),
+                                    (kernel - 1) * dilation + 1,
+                                    stride,
+                                );
+                                let pointwise = kernel == 1 && groups == 1 && stride == 1;
+                                let reference_dtype = if pointwise { DType::F32 } else { dtype };
+                                let reference = burn::tensor::module::conv1d(
+                                    padded.cast(reference_dtype),
+                                    layer.weight.clone().cast(reference_dtype),
+                                    layer.bias.clone().map(|v| v.cast(reference_dtype)),
+                                    layer.options.clone(),
+                                )
+                                .cast(dtype);
+                                let mut actual = vec![layer.forward(input.clone())];
+                                if pointwise {
+                                    let mut history = ConvHistory::default();
+                                    let mut start = 0;
+                                    let spans = [1, 8, time];
+                                    let streamed = spans
+                                        .into_iter()
+                                        .map(|end| {
+                                            let part = input.clone().slice([
+                                                0..batch,
+                                                0..channels,
+                                                start..end,
+                                            ]);
+                                            start = end;
+                                            layer.stream(part, &mut history)
+                                        })
+                                        .collect();
+                                    actual.push(Tensor::cat(streamed, 2));
+                                }
+                                let expected = super::super::read(reference).await.unwrap();
+                                for output in actual {
+                                    let output = super::super::read(output).await.unwrap();
+                                    assert_eq!(output.len(), expected.len());
+                                    assert!(output.iter().all(|v| v.is_finite()));
+                                    let error = output
+                                        .iter()
+                                        .zip(&expected)
+                                        .map(|(a, b)| (a - b).abs())
+                                        .fold(0f32, f32::max);
+                                    let tolerance = if dtype == DType::F16 { 0.001 } else { 1e-5 };
+                                    assert!(
+                                        error < tolerance,
+                                        "{dtype:?}, transposed={transposed}, bias={bias}, \
+                                         kernel={kernel}, stride={stride}, groups={groups}: {error}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     #[test]
     #[ignore = "requires a WebGPU adapter"]
