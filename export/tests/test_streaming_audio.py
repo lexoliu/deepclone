@@ -9,10 +9,11 @@ from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
     EuclideanCodebook,
     Qwen3TTSTokenizerV2Decoder,
     Qwen3TTSTokenizerV2DecoderConfig,
+    SplitResidualVectorQuantizer,
 )
 
 from audio_models import AudioDecoder
-from streaming_audio import StreamingAudioDecoder
+from streaming_audio import StreamingAudioDecoder, StreamingQuantizer
 from streaming_audio import metadata as rotary_metadata
 
 
@@ -57,6 +58,44 @@ def metadata(model, position, dtype):
 
 
 class StreamingAudio(unittest.TestCase):
+    def test_native_single_frame_quantizer_at_published_dimensions(self):
+        # Qwen's 12 Hz decoder uses 16 codebooks of 2048 vectors, each 256 wide.
+        original = SplitResidualVectorQuantizer(
+            dimension=256,
+            n_q=16,
+            n_q_semantic=1,
+            bins=2048,
+            input_dimension=512,
+            output_dimension=512,
+        ).eval()
+        torch.manual_seed(42)
+        with torch.inference_mode():
+            for module in original.modules():
+                if isinstance(module, EuclideanCodebook):
+                    module.embedding_sum.normal_()
+                    module.cluster_usage.uniform_(0.5, 2)
+            module = StreamingQuantizer(original).eval()
+            codes = (torch.arange(16, dtype=torch.int32) * 129 + 13).reshape(
+                1, 16, 1
+            ) % 2048
+            traced = torch.jit.trace(module, codes, check_trace=False)
+            native = ct.convert(
+                traced,
+                minimum_deployment_target=ct.target.macOS15,
+                inputs=[ct.TensorType(name="codes", shape=(1, 16, 1), dtype=np.int32)],
+                outputs=[ct.TensorType(name="hidden", dtype=np.float32)],
+                compute_precision=ct.precision.FLOAT16,
+                compute_units=ct.ComputeUnit.CPU_AND_NE,
+            )
+            for candidate in [codes, (codes + 719) % 2048]:
+                expected = original.decode(candidate)
+                torch.testing.assert_close(
+                    module(candidate), expected, rtol=1e-5, atol=1e-6
+                )
+                actual = native.predict({"codes": candidate.numpy()})["hidden"]
+                difference = np.linalg.norm(actual - expected.numpy())
+                self.assertLess(difference / np.linalg.norm(expected.numpy()), 0.01)
+
     def test_cached_equations_preserve_full_decoder_and_reset(self):
         original = decoder()
         streaming = StreamingAudioDecoder(original).eval()
