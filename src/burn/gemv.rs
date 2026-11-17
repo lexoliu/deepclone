@@ -38,6 +38,7 @@ impl VectorProjection for CubeBackend {
         } else {
             width.div_ceil(lanes)
         };
+        let weight_dtype = dtype_to_storage_type(weight.dtype);
         vector_projection_kernel::launch(
             &input.client,
             CubeCount::Static(groups as u32, 1, 1),
@@ -47,21 +48,23 @@ impl VectorProjection for CubeBackend {
             output.clone().into_tensor_arg(),
             cooperative,
             lanes,
-            dtype_to_storage_type(input.dtype),
+            [dtype_to_storage_type(input.dtype), weight_dtype],
         );
         output
     }
 }
 #[cube(launch)]
-fn vector_projection_kernel<F: Float>(
+fn vector_projection_kernel<F: Float, W: Float>(
     input: &Tensor<F>,
-    weight: &Tensor<F>,
+    weight: &Tensor<W>,
     output: &mut Tensor<F>,
     #[comptime] cooperative: bool,
     #[comptime] lanes: usize,
-    #[define(F)] _dtype: ElemType,
+    #[define(F, W)] _dtypes: [ElemType; 2],
 ) {
     let k = input.shape(2);
+    // Preserve the former weight-to-activation cast at each load, including
+    // FP32-to-FP16 rounding, without allocating a converted weight matrix.
     if cooperative {
         // A transposed row-major weight has contiguous reduction elements.
         // Cooperating lanes read adjacent K elements for one output column.
@@ -72,7 +75,9 @@ fn vector_projection_kernel<F: Float>(
             sum.store(
                 sum.read()
                     + f32::cast_from(input[i * input.stride(2)])
-                        * f32::cast_from(weight[i * weight.stride(0) + column * weight.stride(1)]),
+                        * f32::cast_from(F::cast_from(
+                            weight[i * weight.stride(0) + column * weight.stride(1)],
+                        )),
             );
             i += CUBE_DIM as usize;
         }
@@ -102,7 +107,9 @@ fn vector_projection_kernel<F: Float>(
             sum.store(
                 sum.read()
                     + f32::cast_from(input[i * input.stride(2)])
-                        * f32::cast_from(weight[i * weight.stride(0) + column * weight.stride(1)]),
+                        * f32::cast_from(F::cast_from(
+                            weight[i * weight.stride(0) + column * weight.stride(1)],
+                        )),
             );
         }
         output[column] = F::cast_from(sum.consume());
@@ -123,6 +130,52 @@ mod tests {
     fn gemv_contiguous_reduction_matches_reference() {
         check(true);
     }
+    #[test]
+    #[ignore = "requires a WebGPU adapter"]
+    fn mixed_storage_retains_weight_cast_rounding_and_reduction() {
+        futures_lite::future::block_on(async {
+            let device = Device::wgpu_options().init_async().await.unwrap();
+            for input_dtype in [DType::F16, DType::F32] {
+                for weight_dtype in [DType::F16, DType::F32] {
+                    for transposed in [false, true] {
+                        let (k, n) = (3072, 128);
+                        let input = BurnTensor::<3>::from_data(
+                            TensorData::new(
+                                (0..k)
+                                    .map(|i| (i as f32 * 0.017).sin() * 3.)
+                                    .collect::<Vec<_>>(),
+                                [1, 1, k],
+                            ),
+                            (&device, input_dtype),
+                        );
+                        let mut weight = BurnTensor::<2>::from_data(
+                            TensorData::new(
+                                (0..k * n)
+                                    .map(|i| (i as f32 * 0.031).cos() / 100.)
+                                    .collect::<Vec<_>>(),
+                                if transposed { [n, k] } else { [k, n] },
+                            ),
+                            (&device, weight_dtype),
+                        );
+                        if transposed {
+                            weight = weight.transpose();
+                        }
+                        let (actual, expected) = futures_lite::future::zip(
+                            super::super::read(project(input.clone(), weight.clone())),
+                            super::super::read(project(input, weight.cast(input_dtype))),
+                        )
+                        .await;
+                        assert_eq!(
+                            actual.unwrap(),
+                            expected.unwrap(),
+                            "{input_dtype:?}/{weight_dtype:?}, transposed={transposed}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     fn check(transposed: bool) {
         futures_lite::future::block_on(async {
             let device = Device::wgpu_options().init_async().await.unwrap();

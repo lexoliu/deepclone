@@ -28,7 +28,7 @@ impl Linear {
     pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let dtype = x.dtype();
         let y = if x.dims()[0] == 1 && x.dims()[1] == 1 {
-            super::gemv::project(x, self.weight.clone().cast(dtype))
+            super::gemv::project(x, self.weight.clone())
         } else {
             super::projection::project(x, self.weight.clone())
         };
