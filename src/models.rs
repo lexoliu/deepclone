@@ -22,11 +22,11 @@ use std::path::PathBuf;
 /// ```
 pub const fn qwen3_tts_0_6b() -> Bundle<'static> {
     Bundle::new(Pin {
-        url: "https://huggingface.co/lexoliu/deepclone-qwen3-tts-coreml/resolve/c22b483de06b287069a3f780a535da11ee032b8c/qwen3-tts-0.6b-coreml.tar.zst",
+        url: "https://huggingface.co/lexoliu/deepclone-qwen3-tts-coreml/resolve/d132983a8c77090eb29362603e68fdc50a789499/qwen3-tts-0.6b-coreml.tar.zst",
         sha256: Sha256::from_hex(
-            "48205c5b98e8b632ca6a22040c8a41a1f803f2d885c6b04d548f7b22e7822e63",
+            "2d9be296a0c7c2159ef2029be1d5945b7069c976d6edc219483807667396a4c9",
         ),
-        size: 1_882_797_495,
+        size: 1_882_818_272,
         kind: Archive,
     })
 }
@@ -34,11 +34,11 @@ pub const fn qwen3_tts_0_6b() -> Bundle<'static> {
 /// Published 1.7B FP16 model with FP32 reference conditioning.
 pub const fn qwen3_tts_1_7b() -> Bundle<'static> {
     Bundle::new(Pin {
-        url: "https://huggingface.co/lexoliu/deepclone-qwen3-tts-coreml/resolve/c22b483de06b287069a3f780a535da11ee032b8c/qwen3-tts-1.7b-coreml.tar.zst",
+        url: "https://huggingface.co/lexoliu/deepclone-qwen3-tts-coreml/resolve/d132983a8c77090eb29362603e68fdc50a789499/qwen3-tts-1.7b-coreml.tar.zst",
         sha256: Sha256::from_hex(
-            "3cf2e907ecf03ca6bf7f35c785f315f79c5ac06da7309a3db2e8aec50c31073a",
+            "eba1b707dbf4c1fb781eb8adecb6ab950aeacef60e2ee54e4322cb884ae7130f",
         ),
-        size: 3_497_919_717,
+        size: 3_497_929_525,
         kind: Archive,
     })
 }

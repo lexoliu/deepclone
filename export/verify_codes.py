@@ -92,8 +92,11 @@ def main():
             }
             if args.waveforms:
                 rust, rust_rate = sf.read(
-                    args.waveforms / (name + ".wav"), dtype="float32"
+                    args.waveforms / (name + ".wav"), dtype="float32", always_2d=True
                 )
+                if not np.all(rust == rust[:, :1]):
+                    raise ValueError("Rust listening-copy channels differ")
+                rust = rust[:, 0]
                 if rust_rate != rate or rust.shape != actual.shape:
                     raise ValueError("Rust waveform shape or sample rate differs")
                 reports[name]["rust_vs_coreml_max_absolute"] = float(
