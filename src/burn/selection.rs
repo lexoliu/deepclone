@@ -13,7 +13,7 @@ use burn::{
 
 #[backend_extension(Cube, Fusion)]
 trait SampleSelection: Backend {
-    #[fusion(meta = |_logits| burn::backend::fusion::custom::TensorSpec::new(Shape::from([1]), DType::I32))]
+    #[fusion(meta = |_logits, _cumulative, _indices, _draw| burn::backend::fusion::custom::TensorSpec::new(Shape::from([1]), DType::I32))]
     fn select_sample(
         _logits: FloatTensor<Self>,
         cumulative: FloatTensor<Self>,
@@ -53,7 +53,7 @@ impl SampleSelection for CubeBackend {
             cumulative.into_tensor_arg(),
             indices.into_tensor_arg(),
             output.clone().into_tensor_arg(),
-            ScalarArg::new(draw),
+            draw,
             dim.num_elems() as usize,
         );
         output
@@ -111,7 +111,7 @@ fn select_kernel(
             output[0] = -1;
         } else {
             // The former boolean argmax selected rank zero if no entry was true.
-            let selected = if ranks[0] == n { 0 } else { ranks[0] };
+            let selected = if ranks[0] == n { 0usize } else { ranks[0] };
             output[0] = indices[selected * indices.stride(0)];
         }
     }
