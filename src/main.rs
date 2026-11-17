@@ -90,7 +90,7 @@ struct Synthesize {
     prompts: Option<PathBuf>,
     #[arg(
         long,
-        help = "Read incremental UTF-8 text from stdin; EOF finishes the utterance"
+        help = "Read incremental UTF-8 text from stdin; EOF finishes the text stream"
     )]
     stdin: bool,
     #[arg(long, requires = "stdin", default_value = "auto")]
@@ -106,7 +106,7 @@ struct Synthesize {
     maximum_wait_ms: Option<u64>,
     #[arg(long)]
     text_chunk_chars: Option<NonZeroUsize>,
-    #[arg(long, help = "Maximum text tokens per automatically managed utterance")]
+    #[arg(long, help = "Maximum text tokens per continuous generation context")]
     text_segment_tokens: Option<NonZeroUsize>,
     #[arg(long)]
     unstable_text_bytes: Option<NonZeroUsize>,
@@ -121,7 +121,7 @@ struct Synthesize {
     output: PathBuf,
     #[arg(
         long,
-        help = "Maximum acoustic frames per utterance; does not limit total audio duration"
+        help = "Maximum acoustic frames per generation context; does not limit total audio duration"
     )]
     maximum_frames: NonZeroUsize,
     #[arg(

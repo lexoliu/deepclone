@@ -19,7 +19,8 @@ pub trait Model {
         let _ = valid;
         capacity
     }
-    fn reset(&mut self);
+    fn reset_generation(&mut self);
+    fn reset_waveform(&mut self);
     fn reset_predictor(&mut self);
     fn text(&mut self, token: u32) -> Result<Self::Hidden, Error>;
     fn code(&mut self, group: usize, token: u32) -> Result<Self::Hidden, Error>;
@@ -62,7 +63,7 @@ pub trait Model {
         frames: usize,
     ) -> Result<Vec<f32>, Error>;
 }
-pub struct Selection<T, S> {
+pub(crate) struct Selection<T, S> {
     pub talker: T,
     pub predictor: S,
     pub repetition: RepetitionPenalty,
@@ -73,20 +74,19 @@ pub struct Selection<T, S> {
     pub minimum_frames: usize,
 }
 
-pub struct Generator<B: Model, T, S> {
+pub(crate) struct Generator<B: Model, T, S> {
     pub(crate) networks: B,
     selection: Selection<T, S>,
 }
 
-pub struct Sequence<'a, B: Model, T, S> {
-    pub(crate) generator: &'a mut Generator<B, T, S>,
-    pending: Option<B::Hidden>,
+pub(crate) struct Sequence<H> {
+    pending: Option<H>,
     history: Vec<u32>,
     finished: bool,
 }
 
 /// EOS is checked before the frame allowance and before detail-code prediction.
-pub enum Frame {
+pub(crate) enum Frame {
     Codes(Vec<u32>),
     Eos,
     Limit,
@@ -112,8 +112,8 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Generator<B, T, S> {
     pub fn start(
         &mut self,
         prefill: impl IntoIterator<Item = B::Hidden>,
-    ) -> Result<Sequence<'_, B, T, S>, Error> {
-        self.networks.reset();
+    ) -> Result<Sequence<B::Hidden>, Error> {
+        self.networks.reset_generation();
         let mut prefill = prefill.into_iter();
         let first = prefill
             .next()
@@ -121,66 +121,59 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Generator<B, T, S> {
         let last = self.networks.prefill(first, prefill)?;
         let pending = Some(last);
         Ok(Sequence {
-            generator: self,
             pending,
             history: Vec::new(),
             finished: false,
         })
     }
-}
-
-impl<B: Model, T: TokenSampler, S: TokenSampler> Sequence<'_, B, T, S> {
-    pub fn embed_frame(&mut self, codes: &[u32], text: &B::Hidden) -> Result<B::Hidden, Error> {
-        self.generator.embed_frame(codes, text)
-    }
-
     /// Extend the conditioning prefix without resetting the KV state.
     pub fn prefill(
         &mut self,
+        sequence: &mut Sequence<B::Hidden>,
         first: B::Hidden,
         remaining: impl IntoIterator<Item = B::Hidden>,
     ) -> Result<(), Error> {
-        self.pending = None;
-        let hidden = self.generator.networks.prefill(first, remaining)?;
-        self.pending = Some(hidden);
+        sequence.pending = None;
+        let hidden = self.networks.prefill(first, remaining)?;
+        sequence.pending = Some(hidden);
         Ok(())
     }
 
     pub async fn next_frame(
         &mut self,
+        sequence: &mut Sequence<B::Hidden>,
         text: &B::Hidden,
         maximum_frames: usize,
     ) -> Result<Frame, Error> {
-        let Some(hidden) = self.pending.take() else {
-            return if self.finished {
+        let Some(hidden) = sequence.pending.take() else {
+            return if sequence.finished {
                 Ok(Frame::Eos)
             } else {
                 Err(Error::Contract("sequence failed; start a new request"))
             };
         };
-        let (past, logits) = self.generator.networks.talker_head(hidden).await?;
-        let selection = &mut self.generator.selection;
+        let (past, logits) = self.networks.talker_head(hidden).await?;
+        let selection = &mut self.selection;
         let logits = logits.constrain(
             selection.repetition,
-            &self.history,
+            &sequence.history,
             selection.eos,
             selection.reserved_start,
-            self.history.len() < selection.minimum_frames,
+            sequence.history.len() < selection.minimum_frames,
         )?;
         let first_token = selection.talker.sample(logits).await?;
         let first = self
-            .generator
             .networks
             .read_tokens(std::slice::from_ref(&first_token))
             .await?[0];
         if first == selection.eos {
-            self.finished = true;
+            sequence.finished = true;
             return Ok(Frame::Eos);
         }
-        if self.history.len() == maximum_frames {
+        if sequence.history.len() == maximum_frames {
             return Ok(Frame::Limit);
         }
-        let networks = &mut self.generator.networks;
+        let networks = &mut self.networks;
         networks.reset_predictor();
         let past = networks.project(past)?;
         networks.predictor(past)?;
@@ -195,8 +188,8 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Sequence<'_, B, T, S> {
         let codes = networks.read_tokens(&tokens).await?;
         let embedded = networks.frame(&codes, text)?;
         let hidden = networks.talker(embedded)?;
-        self.pending = Some(hidden);
-        self.history.push(first);
+        sequence.pending = Some(hidden);
+        sequence.history.push(first);
         Ok(Frame::Codes(codes))
     }
 }

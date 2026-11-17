@@ -135,18 +135,19 @@ impl Backend for CoreMl {
     fn context_capacity(&self) -> usize {
         self.talker.capacity()
     }
-    fn reset(&mut self) {
+    fn reset_generation(&mut self) {
         self.talker.reset();
         self.predictor.reset();
     }
+    fn reset_waveform(&mut self) {}
     fn reset_predictor(&mut self) {
         self.predictor.reset();
     }
     fn text(&mut self, token: u32) -> Result<Self::Hidden, Error> {
-        embed(&mut self.text_embedding, token)
+        embed(&mut self.text_embedding, token, "text embedding")
     }
     fn code(&mut self, group: usize, token: u32) -> Result<Self::Hidden, Error> {
-        embed(&mut self.codec_embeddings[group], token)
+        embed(&mut self.codec_embeddings[group], token, "codec embedding")
     }
     fn frame(&mut self, codes: &[u32], text: &Self::Hidden) -> Result<Self::Hidden, Error> {
         frame(&mut self.codec_frame, codes, text)
@@ -161,13 +162,19 @@ impl Backend for CoreMl {
         &mut self,
         hidden: Self::Hidden,
     ) -> Result<(Self::Hidden, Vec<f32>), Error> {
-        head(&mut self.talker_head, &hidden)
+        head(&mut self.talker_head, &hidden, "Talker head")
     }
     fn project(&mut self, hidden: Self::Hidden) -> Result<Self::Hidden, Error> {
         if let Some(function) = &mut self.predictor_projection {
             let mut inputs = Inputs::new();
             inputs.insert("hidden", &hidden)?;
-            Ok(function.predict(&inputs)?.tensor("hidden_out")?)
+            Ok(function
+                .predict(&inputs)
+                .map_err(|source| Error::CoreMlOperation {
+                    operation: "detail predictor projection",
+                    source,
+                })?
+                .tensor("hidden_out")?)
         } else {
             Ok(hidden)
         }
@@ -180,7 +187,12 @@ impl Backend for CoreMl {
         group: usize,
         hidden: Self::Hidden,
     ) -> Result<Vec<f32>, Error> {
-        Ok(head(&mut self.predictor_heads[group], &hidden)?.1)
+        Ok(head(
+            &mut self.predictor_heads[group],
+            &hidden,
+            "detail predictor head",
+        )?
+        .1)
     }
     async fn condition(
         &mut self,
@@ -193,7 +205,11 @@ impl Backend for CoreMl {
         inputs.insert("mel", &mel)?;
         let speaker = self
             .speaker
-            .predict(&inputs)?
+            .predict(&inputs)
+            .map_err(|source| Error::CoreMlOperation {
+                operation: "speaker encoder",
+                source,
+            })?
             .tensor::<f16>("speaker")?
             .read()
             .into_data();
@@ -208,7 +224,11 @@ impl Backend for CoreMl {
         inputs.insert("audio", &waveform)?;
         let prediction = self
             .encoder
-            .predict(&inputs)?
+            .predict(&inputs)
+            .map_err(|source| Error::CoreMlOperation {
+                operation: "reference codec encoder",
+                source,
+            })?
             .tensor::<i32>("codes")?
             .read();
         let shape = prediction.shape();
@@ -241,7 +261,11 @@ impl Backend for CoreMl {
         inputs.insert("codes", &tensor)?;
         Ok(self
             .waveform
-            .predict(&inputs)?
+            .predict(&inputs)
+            .map_err(|source| Error::CoreMlOperation {
+                operation: "waveform decoder",
+                source,
+            })?
             .tensor::<f32>("audio")?
             .read()
             .into_data())
@@ -259,25 +283,38 @@ fn frame(function: &mut Function, codes: &[u32], text: &Tensor<f16>) -> Result<T
     inputs.insert("text", text)?;
     Ok(function
         .predict(&inputs)
-        .map_err(Error::CoreMl)?
+        .map_err(|source| Error::CoreMlOperation {
+            operation: "codec frame embedding",
+            source,
+        })?
         .tensor("hidden")?)
 }
 
-pub fn embed(function: &mut Function, token: u32) -> Result<Tensor<f16>, Error> {
+pub fn embed(
+    function: &mut Function,
+    token: u32,
+    operation: &'static str,
+) -> Result<Tensor<f16>, Error> {
     let token = i32::try_from(token).map_err(|_| Error::Contract("token exceeds int32"))?;
     let tensor = Tensor::from_slice(&[1, 1], &[token])?;
     let mut inputs = Inputs::new();
     inputs.insert("token", &tensor)?;
     Ok(function
         .predict(&inputs)
-        .map_err(Error::CoreMl)?
+        .map_err(|source| Error::CoreMlOperation { operation, source })?
         .tensor("hidden")?)
 }
 
-fn head(function: &mut Function, hidden: &Tensor<f16>) -> Result<(Tensor<f16>, Vec<f32>), Error> {
+fn head(
+    function: &mut Function,
+    hidden: &Tensor<f16>,
+    operation: &'static str,
+) -> Result<(Tensor<f16>, Vec<f32>), Error> {
     let mut inputs = Inputs::new();
     inputs.insert("hidden", hidden)?;
-    let prediction = function.predict(&inputs).map_err(Error::CoreMl)?;
+    let prediction = function
+        .predict(&inputs)
+        .map_err(|source| Error::CoreMlOperation { operation, source })?;
     let logits = prediction
         .tensor::<f16>("logits")?
         .read()

@@ -138,11 +138,7 @@ fn multilingual_streams_match_validated_codes_and_waveforms() {
                 }
             }
             let codes = if item.reached_eos {
-                audio
-                    .take_generation()
-                    .expect("normal completion")
-                    .segments
-                    .remove(0)
+                audio.take_generation().expect("normal completion").codes
             } else {
                 assert!(audio.generation().is_none());
                 truncated.expect("the truncated baseline must produce a budget error")

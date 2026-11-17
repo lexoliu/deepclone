@@ -27,6 +27,13 @@ pub enum Error {
     #[error(transparent)]
     CoreMl(#[from] ondevice_coreml::Error),
     #[cfg(all(feature = "coreml", target_vendor = "apple"))]
+    #[error("Core ML {operation}: {source}")]
+    CoreMlOperation {
+        operation: &'static str,
+        #[source]
+        source: ondevice_coreml::Error,
+    },
+    #[cfg(all(feature = "coreml", target_vendor = "apple"))]
     #[error(transparent)]
     Decoder(#[from] crate::decoder::Error),
     #[error(transparent)]
@@ -168,15 +175,22 @@ impl AcousticCodes {
 pub struct Generation {
     pub model_size: String,
     pub transformer_weight_bits: u8,
-    pub segments: Vec<AcousticCodes>,
+    pub codes: AcousticCodes,
+    pub segments: Vec<SpeechSegment>,
 }
 impl Generation {
     pub fn generated_frames(&self) -> usize {
-        self.segments
-            .iter()
-            .map(AcousticCodes::generated_frames)
-            .sum()
+        self.codes.generated_frames()
     }
+}
+
+/// A naturally completed generation span in the continuous acoustic stream.
+/// Text tokens are paired with precisely this span when conditioning its successor.
+#[derive(Debug, Serialize)]
+pub struct SpeechSegment {
+    pub start_frame: usize,
+    pub end_frame: usize,
+    pub text_tokens: Vec<u32>,
 }
 
 pub struct Waveform {
@@ -241,10 +255,6 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Engine<B, T, S> {
             decoder_contract,
         })
     }
-    pub(crate) fn samples_per_frame(&self) -> usize {
-        self.decoder_contract.samples_per_frame
-    }
-
     pub fn sample_rate(&self) -> u32 {
         self.decoder_contract.sample_rate
     }
@@ -288,7 +298,7 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Engine<B, T, S> {
         })
     }
 
-    /// Synthesize bounded utterances and concatenate their PCM in order.
+    /// Synthesize continuous PCM while rolling generation contexts internally.
     pub async fn synthesize(
         &mut self,
         reference: &Reference<B::Hidden>,
@@ -296,32 +306,21 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Engine<B, T, S> {
         language: &str,
         options: SynthesisOptions,
     ) -> Result<Synthesis, Error> {
-        let mut split = self.splitter(reference, language, &options)?;
-        let mut texts = split.push(text, &self.tokenizer)?;
-        texts.extend(split.finish(&self.tokenizer)?);
+        let sample_rate = self.sample_rate();
+        let mut session = self.session(reference, language, options)?;
+        session.push_text(text)?;
+        session.finish_input()?;
         let mut samples = Vec::new();
-        let mut segments = Vec::new();
-        for text in texts {
-            let mut session = self.utterance(
-                reference,
-                language,
-                options.maximum_frames.get(),
-                options.unstable_text_bytes.get(),
-            )?;
-            session.push_text(&text)?;
-            session.finish_input()?;
-            while !session.finished {
-                if let Some(chunk) = session.next_chunk(12, || false).await? {
-                    samples.extend(chunk.samples);
-                }
+        while !session.finished {
+            if let Some(chunk) = session.next_chunk(12, || false).await? {
+                samples.extend(chunk.samples);
             }
-            segments.extend(session.into_generation()?.segments);
         }
         Ok(Synthesis {
-            generation: self.generation(segments)?,
+            generation: session.into_generation()?,
             waveform: Waveform {
                 samples,
-                sample_rate: self.sample_rate(),
+                sample_rate,
             },
         })
     }
@@ -333,82 +332,15 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Engine<B, T, S> {
         language: &str,
         options: SynthesisOptions,
     ) -> Result<Generation, Error> {
-        let mut split = self.splitter(reference, language, &options)?;
-        let mut texts = split.push(text, &self.tokenizer)?;
-        texts.extend(split.finish(&self.tokenizer)?);
-        let mut segments = Vec::new();
-        for text in texts {
-            let mut session = self.utterance(
-                reference,
-                language,
-                options.maximum_frames.get(),
-                options.unstable_text_bytes.get(),
-            )?;
-            session.push_text(&text)?;
-            session.finish_input()?;
-            while !session.finished {
-                session.advance(&|| false).await?;
-            }
-            segments.extend(session.into_generation()?.segments);
+        let mut session = self.session(reference, language, options)?;
+        session.push_text(text)?;
+        session.finish_input()?;
+        while !session.finished {
+            session.advance(&|| false).await?;
         }
-        self.generation(segments)
+        session.into_generation()
     }
 
-    pub(crate) fn generation(&self, segments: Vec<AcousticCodes>) -> Result<Generation, Error> {
-        if segments.is_empty() {
-            return Err(Error::Contract("text must be nonempty"));
-        }
-        Ok(Generation {
-            model_size: self.config.tts_model_size.clone(),
-            transformer_weight_bits: self.weight_bits,
-            segments,
-        })
-    }
-    pub(crate) fn tokenizer(&self) -> &tokenizers::Tokenizer {
-        &self.tokenizer
-    }
-
-    fn frame_capacity(
-        &self,
-        reference: &Reference<B::Hidden>,
-        language: &str,
-    ) -> Result<usize, Error> {
-        // The official assistant prefix has the language tags plus speaker,
-        // text BOS/codec PAD, and the first reference-text/codec BOS embedding.
-        let prefix =
-            self.tokenize("<|im_start|>assistant\n")?.len() + self.tags(language)?.len() + 3;
-        self.generator
-            .networks
-            .context_capacity()
-            .checked_sub(prefix + reference.codes.len())
-            .filter(|&frames| frames > 0)
-            .ok_or(Error::Contract(
-                "reference conditioning exhausts the Talker context",
-            ))
-    }
-    pub(crate) fn splitter(
-        &self,
-        reference: &Reference<B::Hidden>,
-        language: &str,
-        options: &SynthesisOptions,
-    ) -> Result<crate::utterances::Splitter, Error> {
-        let frames = options
-            .maximum_frames
-            .get()
-            .min(self.frame_capacity(reference, language)?);
-        // One text token is consumed per reference or generated frame; the first
-        // reference token is already in the prompt. Reserve a slot for text EOS.
-        let text = (frames + reference.codes.len())
-            .checked_sub(reference.text.len())
-            .filter(|&tokens| tokens > 0)
-            .ok_or(Error::Contract(
-                "reference text exhausts the utterance budget",
-            ))?;
-        Ok(crate::utterances::Splitter::new(
-            options.text_segment_tokens.get().min(text),
-            options.unstable_text_bytes.get(),
-        ))
-    }
     fn tags(&self, language: &str) -> Result<Vec<u32>, Error> {
         let cfg = &self.config.talker_config;
         let language = language.to_lowercase();
@@ -432,42 +364,14 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Engine<B, T, S> {
         }
     }
 
-    pub fn utterance<'a>(
+    pub fn session<'a>(
         &'a mut self,
         reference: &'a Reference<B::Hidden>,
         language: &str,
-        maximum_frames: usize,
-        text_capacity: usize,
-    ) -> Result<Utterance<'a, B, T, S>, Error> {
-        if maximum_frames == 0 {
-            return Err(Error::Contract("generation budget must be nonzero"));
-        }
-        let mut prefill = Vec::new();
-        for id in self.tokenize("<|im_start|>assistant\n")? {
-            prefill.push(self.generator.networks.text(id)?);
-        }
-        let padding = self.generator.networks.text(self.config.tts_pad_token_id)?;
-        let bos = self.generator.networks.text(self.config.tts_bos_token_id)?;
-        let cfg = &self.config.talker_config;
+        options: SynthesisOptions,
+    ) -> Result<Session<'a, B, T, S>, Error> {
         let tags = self.tags(language)?;
-        for id in tags {
-            prefill.push(B::add(&padding, &self.generator.embed_code(0, id)?)?);
-        }
-        prefill.push(B::add(&padding, &reference.speaker)?);
-        prefill.push(B::add(
-            &bos,
-            &self.generator.embed_code(0, cfg.codec_pad_id)?,
-        )?);
-        let codec_bos = cfg.codec_bos_id;
-        let (&first, remaining) = reference
-            .text
-            .split_first()
-            .ok_or(Error::Contract("reference text is empty"))?;
-        let first = self.generator.networks.text(first)?;
-        prefill.push(B::add(&first, &self.generator.embed_code(0, codec_bos)?)?);
-        let maximum_frames = maximum_frames.min(self.frame_capacity(reference, language)?);
-        let sequence = self.generator.start(prefill)?;
-        let text = crate::text::TextBuffer::new(&self.tokenizer, text_capacity);
+        let assistant = self.tokenize("<|im_start|>assistant\n")?;
         let groups = NonZeroUsize::new(self.encoder_contract.code_groups)
             .ok_or(Error::Contract("codec must have at least one code group"))?;
         let codes = AcousticCodes::new(
@@ -475,45 +379,51 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Engine<B, T, S> {
             reference.codes.iter().flatten().copied().collect(),
             reference.codes.len(),
         )?;
-        Ok(Utterance {
-            decoder_contract: &self.decoder_contract,
+        self.generator.networks.reset_waveform();
+        let emitted = codes.frames();
+        let splitter = crate::utterances::Splitter::new(
+            options.text_segment_tokens.get(),
+            options.unstable_text_bytes.get(),
+        );
+        let text_capacity = options.unstable_text_bytes.get();
+        Ok(Session {
+            generator: &mut self.generator,
             config: &self.config,
+            tokenizer: &self.tokenizer,
+            decoder_contract: &self.decoder_contract,
             weight_bits: self.weight_bits,
-            reference,
-            sequence,
-            padding,
-            text,
-            tokens: remaining.iter().copied().collect(),
-            prefix: 0,
+            speaker: &reference.speaker,
+            initial_text: &reference.text,
+            assistant,
+            tags,
+            options,
+            splitter,
+            text: crate::text::TextBuffer::new(&self.tokenizer, text_capacity),
+            pending: VecDeque::new(),
+            active: None,
             input_finished: false,
-            has_text: false,
             finished: false,
-            maximum_frames,
-            emitted: reference.codes.len(),
+            emitted,
             codes,
+            segments: Vec::new(),
             pending_error: None,
         })
     }
 
-    /// Decode independent utterances in order, excluding every reference prefix.
-    pub async fn decode(&mut self, segments: &[AcousticCodes]) -> Result<Waveform, Error> {
-        let mut samples = Vec::new();
-        for codes in segments {
-            self.generator.networks.reset();
-            samples.extend(
-                decode_range(
-                    &mut self.generator.networks,
-                    &self.decoder_contract,
-                    codes,
-                    codes.reference_frames,
-                    codes.frames(),
-                )
-                .await?,
-            );
-        }
+    /// Decode the continuous stream with the same absolute codec block boundaries.
+    pub async fn decode(&mut self, codes: &AcousticCodes) -> Result<Waveform, Error> {
+        self.generator.networks.reset_waveform();
+        let samples = decode_range(
+            &mut self.generator.networks,
+            &self.decoder_contract,
+            codes,
+            codes.reference_frames,
+            codes.frames(),
+        )
+        .await?;
         Ok(Waveform {
             samples,
-            sample_rate: self.decoder_contract.sample_rate,
+            sample_rate: self.sample_rate(),
         })
     }
 }
@@ -583,119 +493,286 @@ async fn decode_range<B: Model>(
     Ok(result)
 }
 
-/// Contiguous mono PCM with an absolute position in this utterance.
+/// Contiguous mono PCM with an absolute position in the whole output stream.
 pub struct AudioChunk {
     pub samples: Vec<f32>,
     pub sample_rate: u32,
     pub start_sample: usize,
 }
 
-pub struct Utterance<'a, B: Model, T, S> {
-    decoder_contract: &'a AudioContract,
+/// One text stream, one continuous codec timeline, and bounded generation contexts.
+pub struct Session<'a, B: Model, T, S> {
+    generator: &'a mut Generator<B, T, S>,
     config: &'a Config,
+    tokenizer: &'a tokenizers::Tokenizer,
+    decoder_contract: &'a AudioContract,
     weight_bits: u8,
-    reference: &'a Reference<B::Hidden>,
-    sequence: generation::Sequence<'a, B, T, S>,
-    padding: B::Hidden,
+    speaker: &'a B::Hidden,
+    initial_text: &'a [u32],
+    assistant: Vec<u32>,
+    tags: Vec<u32>,
+    options: SynthesisOptions,
+    splitter: crate::utterances::Splitter,
     text: crate::text::TextBuffer<'a>,
-    tokens: VecDeque<u32>,
-    prefix: usize,
+    pending: VecDeque<String>,
+    active: Option<Active<B::Hidden>>,
     input_finished: bool,
-    has_text: bool,
     pub(crate) finished: bool,
-    maximum_frames: usize,
     emitted: usize,
     codes: AcousticCodes,
+    segments: Vec<SpeechSegment>,
     pending_error: Option<Error>,
 }
-
-impl<B: Model, T: TokenSampler, S: TokenSampler> Utterance<'_, B, T, S> {
+struct Active<H> {
+    sequence: generation::Sequence<H>,
+    padding: H,
+    tokens: VecDeque<u32>,
+    target_tokens: Vec<u32>,
+    text: String,
+    prompt_end: usize,
+    prefix: usize,
+    generated_start: usize,
+    maximum_frames: usize,
+    text_capacity: usize,
+    input_finished: bool,
+}
+impl<B: Model, T: TokenSampler, S: TokenSampler> Session<'_, B, T, S> {
     pub fn push_text(&mut self, text: &str) -> Result<(), Error> {
         if self.input_finished {
             return Err(Error::Contract("text input is already finished"));
         }
-        self.has_text |= !text.is_empty();
-        self.tokens.extend(self.text.push(text)?);
+        self.pending
+            .extend(self.splitter.push(text, self.tokenizer)?);
         Ok(())
     }
-
     pub fn finish_input(&mut self) -> Result<(), Error> {
         if self.input_finished {
             return Err(Error::Contract("text input is already finished"));
         }
-        if !self.has_text {
-            return Err(Error::Contract("text must be nonempty"));
-        }
-        self.tokens.extend(self.text.finish()?);
-        self.tokens.push_back(self.config.tts_eos_token_id);
+        self.pending.extend(self.splitter.finish(self.tokenizer)?);
         self.input_finished = true;
         Ok(())
     }
-
-    fn text_embedding(&mut self) -> Result<Option<B::Hidden>, Error> {
-        if let Some(id) = self.tokens.pop_front() {
-            Ok(Some(self.sequence.generator.networks.text(id)?))
-        } else if self.input_finished {
-            Ok(Some(self.padding.clone()))
-        } else {
-            Ok(None)
+    fn open(&mut self) -> Result<(), Error> {
+        let (prompt_start, prompt_end, prompt_text) = self.segments.last().map_or(
+            (0, self.codes.reference_frames, self.initial_text),
+            |span| {
+                (
+                    span.start_frame,
+                    span.end_frame,
+                    span.text_tokens.as_slice(),
+                )
+            },
+        );
+        let (&first, remaining) = prompt_text
+            .split_first()
+            .ok_or(Error::Contract("conditioning text is empty"))?;
+        // Published streaming ICL prefix: assistant, language tags, speaker,
+        // text BOS/codec PAD, first reference token/codec BOS, reference frames.
+        let prefix = self.assistant.len() + self.tags.len() + 3;
+        let prompt_frames = prompt_end - prompt_start;
+        let maximum_frames = self
+            .generator
+            .networks
+            .context_capacity()
+            .checked_sub(prefix + prompt_frames)
+            .filter(|&capacity| capacity > 0)
+            .ok_or(Error::Contract("conditioning exhausts the Talker context"))?
+            .min(self.options.maximum_frames.get());
+        let text_capacity = (maximum_frames + prompt_frames)
+            .checked_sub(prompt_text.len())
+            .filter(|&capacity| capacity > 0)
+            .ok_or(Error::Contract(
+                "conditioning text exhausts the generation budget",
+            ))?
+            .min(self.options.text_segment_tokens.get());
+        let padding = self.generator.networks.text(self.config.tts_pad_token_id)?;
+        let mut prefill = Vec::new();
+        for &id in &self.assistant {
+            prefill.push(self.generator.networks.text(id)?);
         }
+        for &id in &self.tags {
+            prefill.push(B::add(&padding, &self.generator.embed_code(0, id)?)?);
+        }
+        prefill.push(B::add(&padding, self.speaker)?);
+        let bos = self.generator.networks.text(self.config.tts_bos_token_id)?;
+        prefill.push(B::add(
+            &bos,
+            &self
+                .generator
+                .embed_code(0, self.config.talker_config.codec_pad_id)?,
+        )?);
+        let first = self.generator.networks.text(first)?;
+        prefill.push(B::add(
+            &first,
+            &self
+                .generator
+                .embed_code(0, self.config.talker_config.codec_bos_id)?,
+        )?);
+        let sequence = self.generator.start(prefill)?;
+        self.active = Some(Active {
+            sequence,
+            padding,
+            tokens: remaining.iter().copied().collect(),
+            target_tokens: Vec::new(),
+            text: String::new(),
+            prompt_end,
+            prefix: prompt_start,
+            generated_start: self.codes.frames(),
+            maximum_frames,
+            text_capacity,
+            input_finished: false,
+        });
+        Ok(())
     }
-
-    /// False means text starvation; no padding or EOS is fabricated.
+    fn close_input(&mut self) -> Result<(), Error> {
+        let active = self
+            .active
+            .as_mut()
+            .ok_or(Error::Contract("no active context"))?;
+        let tail = self.text.finish()?;
+        active.target_tokens.extend_from_slice(&tail);
+        active.tokens.extend(tail);
+        active.tokens.push_back(self.config.tts_eos_token_id);
+        active.input_finished = true;
+        Ok(())
+    }
+    fn schedule(&mut self) -> Result<(), Error> {
+        if self.active.is_none() {
+            while self.pending.front().is_some_and(|s| s.trim().is_empty()) {
+                self.pending.pop_front();
+            }
+            if self.pending.is_empty() {
+                self.finished = self.input_finished;
+                return Ok(());
+            }
+            self.open()?;
+        }
+        while !self.active.as_ref().unwrap().input_finished {
+            let Some(next) = self.pending.front() else {
+                if self.input_finished {
+                    self.close_input()?;
+                }
+                break;
+            };
+            let active = self.active.as_ref().unwrap();
+            let mut combined = active.text.clone();
+            combined.push_str(next);
+            let count = self
+                .tokenizer
+                .encode(combined.as_str(), false)
+                .map_err(|e| Error::Tokenizer(e.to_string()))?
+                .len();
+            if count > active.text_capacity {
+                if !active.text.is_empty() {
+                    self.close_input()?;
+                    break;
+                }
+                // A previous generated prompt can leave less room than the
+                // initial recording. Repartition only this unconsumed sentence.
+                let mut split = crate::utterances::Splitter::new(
+                    active.text_capacity,
+                    self.options.unstable_text_bytes.get(),
+                );
+                let next = self.pending.pop_front().unwrap();
+                let mut pieces = split.push(&next, self.tokenizer)?;
+                pieces.extend(split.finish(self.tokenizer)?);
+                for piece in pieces.into_iter().rev() {
+                    self.pending.push_front(piece);
+                }
+                continue;
+            }
+            let next = self.pending.pop_front().unwrap();
+            let paragraph = combined.contains("\n\n")
+                || combined.contains("\r\n\r\n")
+                || combined.contains('\u{2029}');
+            let ids = self.text.push(&next)?;
+            let active = self.active.as_mut().unwrap();
+            active.text.push_str(&next);
+            active.target_tokens.extend_from_slice(&ids);
+            active.tokens.extend(ids);
+            if paragraph {
+                self.close_input()?;
+            }
+        }
+        Ok(())
+    }
+    /// False means text starvation; neither padding nor EOS is fabricated.
     async fn advance(&mut self, cancelled: &impl Fn() -> bool) -> Result<bool, Error> {
         if cancelled() {
             return Err(Error::Cancelled);
         }
+        self.schedule()?;
+        let Some(active) = self.active.as_mut() else {
+            return Ok(false);
+        };
         let mut prefix = Vec::new();
-        while self.prefix < self.reference.codes.len() {
+        while active.prefix < active.prompt_end {
             if cancelled() {
                 return Err(Error::Cancelled);
             }
-            let Some(text) = self.text_embedding()? else {
-                break;
+            let text = match active.tokens.pop_front() {
+                Some(id) => self.generator.networks.text(id)?,
+                None if active.input_finished => active.padding.clone(),
+                None => break,
             };
-            let embedded = self
-                .sequence
-                .embed_frame(&self.reference.codes[self.prefix], &text)?;
-            prefix.push(embedded);
-            self.prefix += 1;
+            let group = self.codes.groups.get();
+            prefix.push(self.generator.embed_frame(
+                &self.codes.values[active.prefix * group..(active.prefix + 1) * group],
+                &text,
+            )?);
+            active.prefix += 1;
         }
         let mut prefix = prefix.into_iter();
         if let Some(first) = prefix.next() {
-            self.sequence.prefill(first, prefix)?;
+            self.generator
+                .prefill(&mut active.sequence, first, prefix)?;
         }
-        if self.prefix < self.reference.codes.len() {
+        if active.prefix < active.prompt_end {
             return Ok(false);
         }
-        let Some(text) = self.text_embedding()? else {
-            return Ok(false);
+        let text = match active.tokens.pop_front() {
+            Some(id) => self.generator.networks.text(id)?,
+            None if active.input_finished => active.padding.clone(),
+            None => return Ok(false),
         };
-        match self.sequence.next_frame(&text, self.maximum_frames).await? {
-            generation::Frame::Codes(frame) => {
-                self.codes.values.extend(frame);
-            }
+        match self
+            .generator
+            .next_frame(&mut active.sequence, &text, active.maximum_frames)
+            .await?
+        {
+            generation::Frame::Codes(frame) => self.codes.values.extend(frame),
             generation::Frame::Eos => {
-                if !self.input_finished || !self.tokens.is_empty() {
+                if !active.input_finished || !active.tokens.is_empty() {
                     return Err(Error::PrematureEos);
                 }
-                self.finished = true;
+                if self.codes.frames() == active.generated_start {
+                    return Err(Error::Contract("generation completed without audio"));
+                }
+                self.segments.push(SpeechSegment {
+                    start_frame: active.generated_start,
+                    end_frame: self.codes.frames(),
+                    text_tokens: std::mem::take(&mut active.target_tokens),
+                });
+                self.active = None;
             }
             generation::Frame::Limit => {
                 return Err(Error::FrameBudget {
-                    limit: self.maximum_frames,
+                    limit: active.maximum_frames,
                     codes: self.codes.clone(),
                 });
             }
         }
         Ok(true)
     }
-
     pub async fn next_chunk(
         &mut self,
         frames: usize,
         cancelled: impl Fn() -> bool,
     ) -> Result<Option<AudioChunk>, Error> {
+        if frames == 0 {
+            return Err(Error::Contract("audio chunk frames must be nonzero"));
+        }
         if let Some(error) = self.pending_error.take() {
             return Err(error);
         }
@@ -718,7 +795,7 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Utterance<'_, B, T, S> {
         let start_sample =
             (self.emitted - self.codes.reference_frames) * self.decoder_contract.samples_per_frame;
         let samples = decode_range(
-            &mut self.sequence.generator.networks,
+            &mut self.generator.networks,
             self.decoder_contract,
             &self.codes,
             self.emitted,
@@ -732,15 +809,18 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Utterance<'_, B, T, S> {
             start_sample,
         }))
     }
-
     pub fn into_generation(self) -> Result<Generation, Error> {
         if !self.finished {
             return Err(Error::Contract("session has not completed"));
         }
+        if self.segments.is_empty() {
+            return Err(Error::Contract("text must be nonempty"));
+        }
         Ok(Generation {
             model_size: self.config.tts_model_size.clone(),
             transformer_weight_bits: self.weight_bits,
-            segments: vec![self.codes],
+            codes: self.codes,
+            segments: self.segments,
         })
     }
 }

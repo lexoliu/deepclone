@@ -105,7 +105,7 @@ where
     input?;
     result
 }
-/// Both worker environments share utterance boundaries, PCM positions and EOS handling.
+/// Native and browser workers share context rollover, codec history and PCM positions.
 pub(crate) async fn drive<B, T, S, C: Clock, F>(
     engine: &mut Engine<B, T, S>,
     reference: &Reference<B::Hidden>,
@@ -122,61 +122,52 @@ where
     F: AsyncFnMut(AudioChunk) -> Result<(), Error>,
 {
     let Execution { clock, cancelled } = execution;
-    let mut splitter = engine.splitter(reference, language, &options.generation)?;
+    let mut session = engine.session(reference, language, options.generation.clone())?;
     let mut input_finished = false;
-    let mut pending = std::collections::VecDeque::<String>::new();
-    let mut segments = Vec::new();
-    let mut position = 0;
     loop {
         if cancelled() {
             return Err(Error::Cancelled);
         }
-        if let Some(text) = pending.pop_front() {
-            let mut started = clock.now();
-            let mut session = engine.utterance(
-                reference,
-                language,
-                options.generation.maximum_frames.get(),
-                options.generation.unstable_text_bytes.get(),
-            )?;
-            session.push_text(&text)?;
-            session.finish_input()?;
-            while !session.finished {
-                if let Some(mut chunk) = session
-                    .next_chunk(options.audio_chunk_frames.get(), &cancelled)
-                    .await?
-                {
-                    chunk.start_sample += position;
-                    let ready = clock.now();
-                    let audio_seconds = chunk.samples.len() as f64 / f64::from(chunk.sample_rate);
-                    let start_sample = chunk.start_sample;
-                    consume(chunk).await?;
-                    tracing::debug!(
-                        start_sample,
-                        audio_seconds,
-                        production_ms = (ready - started).as_secs_f64() * 1000.,
-                        consumer_wait_ms = (clock.now() - ready).as_secs_f64() * 1000.,
-                        "audio chunk timing"
-                    );
-                    started = clock.now();
+        while !input_finished {
+            match receiver.try_recv() {
+                Ok(Some(text)) => session.push_text(&text)?,
+                Ok(None) => {
+                    session.finish_input()?;
+                    input_finished = true;
                 }
+                Err(async_channel::TryRecvError::Empty) => break,
+                Err(async_channel::TryRecvError::Closed) => return Err(Error::InputStopped),
             }
-            let generation = session.into_generation()?;
-            position += generation.generated_frames() * engine.samples_per_frame();
-            segments.extend(generation.segments);
+        }
+        let started = clock.now();
+        if let Some(chunk) = session
+            .next_chunk(options.audio_chunk_frames.get(), &cancelled)
+            .await?
+        {
+            let ready = clock.now();
+            let audio_seconds = chunk.samples.len() as f64 / f64::from(chunk.sample_rate);
+            let start_sample = chunk.start_sample;
+            consume(chunk).await?;
+            tracing::debug!(
+                start_sample,
+                audio_seconds,
+                production_ms = (ready - started).as_secs_f64() * 1000.,
+                consumer_wait_ms = (clock.now() - ready).as_secs_f64() * 1000.,
+                "audio chunk timing"
+            );
+        } else if session.finished {
+            break;
         } else if !input_finished {
             match receiver.recv().await.map_err(|_| Error::InputStopped)? {
-                Some(text) => pending.extend(splitter.push(&text, engine.tokenizer())?),
+                Some(text) => session.push_text(&text)?,
                 None => {
-                    pending.extend(splitter.finish(engine.tokenizer())?);
+                    session.finish_input()?;
                     input_finished = true;
                 }
             }
-        } else {
-            break;
         }
     }
-    engine.generation(segments)
+    session.into_generation()
 }
 
 pub(crate) async fn feed<I, E, C: Clock>(

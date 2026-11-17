@@ -79,9 +79,7 @@ impl Splitter {
             let remaining = self.pending.split_off(end);
             let text = std::mem::replace(&mut self.pending, remaining);
             self.checked = 0;
-            if !text.trim().is_empty() {
-                result.push(text);
-            }
+            result.push(text);
         }
         Ok(result)
     }
