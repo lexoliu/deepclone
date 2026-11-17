@@ -11,7 +11,8 @@ from coremltools.converters.mil.mil.scope import ScopeSource
 from qwen_tts import Qwen3TTSModel
 
 from artifact import save
-from audio_models import AudioDecoder, AudioEncoder
+from audio_models import AudioEncoder
+from streaming_audio import StreamingAudioDecoder
 
 
 def main():
@@ -95,21 +96,49 @@ def main():
         input_name, output_name = "audio", "codes"
         input_dtype, output_dtype = np.float32, np.int32
     else:
-        module = AudioDecoder(codec.decoder, args.capacity)
+        if compute_precision != "fp16" or weight_bits != 16:
+            parser.error("stateful waveform decoding requires uncompressed fp16")
+        module = StreamingAudioDecoder(codec.decoder)
         sample = torch.zeros(
-            1, codec.decoder.config.num_quantizers, args.capacity, dtype=torch.int32
+            1, codec.decoder.config.num_quantizers, 1, dtype=torch.int32
         )
         input_shape = tuple(sample.shape)
         input_name, output_name = "codes", "audio"
         input_dtype, output_dtype = np.int32, np.float32
     module.eval()
+    samples = (sample,)
+    inputs = [ct.TensorType(name=input_name, shape=input_shape, dtype=input_dtype)]
+    states = []
+    if args.component == "decoder":
+        config = codec.decoder.config
+        cosine = torch.ones(1, 1, 1, config.head_dim)
+        sine = torch.zeros_like(cosine)
+        mask = torch.full(
+            (1, 1, 1, config.sliding_window), torch.finfo(torch.float16).min
+        )
+        mask[..., -1] = 0
+        samples = (sample, cosine, sine, mask)
+        inputs.extend(
+            ct.TensorType(name=name, shape=tuple(value.shape), dtype=np.float16)
+            for name, value in zip(["cosine", "sine", "mask"], samples[1:])
+        )
+        states = [
+            ct.StateType(
+                wrapped_type=ct.TensorType(shape=tuple(value.shape), dtype=np.float16),
+                name=name,
+            )
+            for name, value in module.named_buffers()
+        ]
     with torch.inference_mode():
-        traced = torch.jit.trace(module, (sample,), check_trace=False)
+        traced = torch.jit.trace(module, samples, check_trace=False)
+    if states:
+        module.reset()
     model = ct.convert(
         traced,
         minimum_deployment_target=ct.target.macOS15,
-        inputs=[ct.TensorType(name=input_name, shape=input_shape, dtype=input_dtype)],
+        inputs=inputs,
         outputs=[ct.TensorType(name=output_name, dtype=output_dtype)],
+        states=states,
         compute_precision=ct.precision.FLOAT32
         if compute_precision == "fp32"
         else ct.transform.FP16ComputePrecision(
@@ -131,6 +160,16 @@ def main():
                 "sample_rate": codec.input_sample_rate,
                 "samples_per_frame": codec.decode_upsample_rate,
                 "code_groups": codec.encoder_valid_num_quantizers,
+                **(
+                    {
+                        "execution": "stateful_frame",
+                        "attention_window": codec.decoder.config.sliding_window,
+                        "rotary_frequencies": codec.decoder.pre_transformer.rotary_emb.inv_freq.tolist(),
+                        "rotary_scaling": codec.decoder.pre_transformer.rotary_emb.attention_scaling,
+                    }
+                    if args.component == "decoder"
+                    else {}
+                ),
             },
             indent=2,
         )
