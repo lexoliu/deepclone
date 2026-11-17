@@ -6,6 +6,8 @@ import torch
 from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2CausalConvNet,
     Qwen3TTSTokenizerV2CausalTransConvNet,
+    Qwen3TTSTokenizerV2ConvNeXtBlock,
+    SnakeBeta,
 )
 from torch import nn
 from torch.nn import functional as F
@@ -32,24 +34,47 @@ class StreamingConv(nn.Module):
                 "Waveform decoder requires unit-stride causal convolutions"
             )
         self.context = (self.conv.kernel_size[0] - 1) * self.conv.dilation[0]
+        self.depthwise = (
+            self.conv.groups == self.conv.in_channels == self.conv.out_channels
+        )
+        if self.conv.groups != 1 and not self.depthwise:
+            raise ValueError("Decoder convolutions must be dense or depthwise")
         if self.context:
             self.register_buffer(
-                "history", torch.zeros(1, self.conv.in_channels, 1, self.context)
+                "history", torch.zeros(1, 1, self.context, self.conv.in_channels)
             )
 
     def forward(self, hidden):
-        if not self.context:
-            return self.conv(hidden)
-        joined = torch.cat((self.history, hidden.unsqueeze(2)), dim=-1)
-        output = F.conv2d(
-            joined,
-            self.conv.weight.unsqueeze(2),
-            self.conv.bias,
-            dilation=(1, self.conv.dilation[0]),
-            groups=self.conv.groups,
-        )
-        self.history[:, :, :, :] = joined[..., -self.context :]
-        return output.squeeze(2)
+        values = hidden.permute(0, 2, 3, 1)
+        joined = torch.cat((self.history, values), dim=2) if self.context else values
+        windows = [
+            joined[
+                :,
+                :,
+                tap * self.conv.dilation[0] : tap * self.conv.dilation[0]
+                + hidden.shape[-1],
+                :,
+            ]
+            for tap in range(self.conv.kernel_size[0])
+        ]
+        if self.depthwise:
+            output = windows[0] * self.conv.weight[:, 0, 0].reshape(1, 1, 1, -1)
+            for tap in range(1, self.conv.kernel_size[0]):
+                output = output + windows[tap] * self.conv.weight[:, 0, tap].reshape(
+                    1, 1, 1, -1
+                )
+            if self.conv.bias is not None:
+                output = output + self.conv.bias.reshape(1, 1, 1, -1)
+        else:
+            # Concatenate taps in temporal order; permute the kernel to the
+            # same [tap, input-channel] order before its dense projection.
+            weight = self.conv.weight.permute(0, 2, 1).reshape(
+                self.conv.out_channels, -1
+            )
+            output = F.linear(torch.cat(windows, dim=-1), weight, self.conv.bias)
+        if self.context:
+            self.history[:, :, :, :] = joined[:, :, -self.context :, :]
+        return output.permute(0, 3, 1, 2)
 
 
 class StreamingTranspose(CausalTranspose):
@@ -57,21 +82,64 @@ class StreamingTranspose(CausalTranspose):
         super().__init__(original)
         if self.taps > 1:
             self.register_buffer(
-                "history", torch.zeros(1, original.conv.in_channels, 1, self.taps - 1)
+                "history", torch.zeros(1, 1, self.taps - 1, original.conv.in_channels)
             )
 
     def forward(self, hidden):
+        values = hidden.permute(0, 2, 3, 1)
         if self.taps > 1:
-            joined = torch.cat((self.history, hidden.unsqueeze(2)), dim=-1)
-            self.history[:, :, :, :] = joined[..., -(self.taps - 1) :]
+            joined = torch.cat((self.history, values), dim=2)
+            self.history[:, :, :, :] = joined[:, :, -(self.taps - 1) :, :]
         else:
-            joined = hidden.unsqueeze(2)
-        output = F.conv2d(joined, self.weight)
-        output = output.reshape(
-            hidden.shape[0], self.channels, self.stride, hidden.shape[-1]
+            joined = values
+        windows = [
+            joined[:, :, tap : tap + hidden.shape[-1], :] for tap in range(self.taps)
+        ]
+        weight = (
+            self.weight[:, :, 0, :]
+            .permute(0, 2, 1)
+            .reshape(self.channels * self.stride, -1)
         )
-        output = output.transpose(2, 3).reshape(hidden.shape[0], self.channels, -1)
-        return output if self.bias is None else output + self.bias.reshape(1, -1, 1)
+        output = F.linear(torch.cat(windows, dim=-1), weight)
+        output = output.reshape(
+            hidden.shape[0], 1, hidden.shape[-1], self.channels, self.stride
+        )
+        output = output.transpose(3, 4).reshape(hidden.shape[0], 1, -1, self.channels)
+        if self.bias is not None:
+            output = output + self.bias.reshape(1, 1, 1, -1)
+        return output.permute(0, 3, 1, 2)
+
+
+class StreamingConvNext(nn.Module):
+    def __init__(self, original):
+        super().__init__()
+        self.dwconv = StreamingConv(original.dwconv)
+        self.norm = original.norm
+        self.first = original.pwconv1
+        self.activation = original.act
+        self.last = original.pwconv2
+        self.gamma = original.gamma
+
+    def forward(self, hidden):
+        output = self.dwconv(hidden).permute(0, 2, 3, 1)
+        output = self.norm(output)
+        output = self.last(self.activation(self.first(output))) * self.gamma
+        return hidden + output.permute(0, 3, 1, 2)
+
+
+class StreamingSnake(nn.Module):
+    def __init__(self, original):
+        super().__init__()
+        self.alpha = nn.Parameter(original.alpha.detach().clone().reshape(1, 1, 1, -1))
+        self.beta = nn.Parameter(original.beta.detach().clone().reshape(1, 1, 1, -1))
+        self.epsilon = original.no_div_by_zero
+
+    def forward(self, hidden):
+        values = hidden.permute(0, 2, 3, 1)
+        alpha = self.alpha.exp()
+        beta = self.beta.exp()
+        output = values + (1.0 / (beta + self.epsilon)) * (values * alpha).sin().pow(2)
+        return output.permute(0, 3, 1, 2)
 
 
 class StreamingQuantizer(nn.Module):
@@ -117,7 +185,11 @@ class StreamingQuantizer(nn.Module):
 
 def lower(module):
     for name, child in list(module.named_children()):
-        if isinstance(child, Qwen3TTSTokenizerV2CausalConvNet):
+        if isinstance(child, Qwen3TTSTokenizerV2ConvNeXtBlock):
+            setattr(module, name, StreamingConvNext(child))
+        elif isinstance(child, SnakeBeta):
+            setattr(module, name, StreamingSnake(child))
+        elif isinstance(child, Qwen3TTSTokenizerV2CausalConvNet):
             setattr(module, name, StreamingConv(child))
         elif isinstance(child, Qwen3TTSTokenizerV2CausalTransConvNet):
             setattr(module, name, StreamingTranspose(child))
@@ -203,17 +275,19 @@ class StreamingAudioDecoder(nn.Module):
         self.decoder = decoder.decoder
 
     def forward(self, codes, cosine, sine, mask):
-        hidden = self.pre_conv(self.quantizer(codes)).transpose(1, 2)
+        hidden = (
+            self.pre_conv(self.quantizer(codes).unsqueeze(2)).squeeze(2).transpose(1, 2)
+        )
         hidden = self.input_proj(hidden)
         for layer in self.layers:
             hidden = layer(hidden, cosine, sine, mask)
-        hidden = self.output_proj(self.norm(hidden)).transpose(1, 2)
+        hidden = self.output_proj(self.norm(hidden)).transpose(1, 2).unsqueeze(2)
         for blocks in self.upsample:
             for block in blocks:
                 hidden = block(hidden)
         for block in self.decoder:
             hidden = block(hidden)
-        return hidden.clamp(-1, 1)
+        return hidden.clamp(-1, 1).squeeze(2)
 
     def reset(self):
         for buffer in self.buffers():

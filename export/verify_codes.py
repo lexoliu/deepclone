@@ -54,26 +54,31 @@ def main():
             offset = exported["reference_frames"] * codec.decode_upsample_rate
             if not 0 <= offset < codes.shape[-1] * codec.decode_upsample_rate:
                 raise ValueError("Reference boundary leaves no generated audio")
-            expected = codec.decoder.chunked_decode(codes).numpy().ravel()[offset:]
-            lowered_parts, native_parts = [], []
+            native_parts = []
             for start in range(0, codes.shape[-1], chunk_size):
                 end = min(start + chunk_size, codes.shape[-1])
                 context = min(start, left_context)
                 chunk = codes[..., start - context : end]
                 begin_sample = context * codec.decode_upsample_rate
                 end_sample = chunk.shape[-1] * codec.decode_upsample_rate
-                lowered_parts.append(
-                    lowered_decode(lowered, chunk, contract).ravel()[
-                        begin_sample:end_sample
-                    ]
-                )
                 native_parts.append(
                     native_decode(native, chunk, contract).ravel()[
                         begin_sample:end_sample
                     ]
                 )
-            rewritten = np.concatenate(lowered_parts)[offset:]
             actual = np.concatenate(native_parts)[offset:]
+            expected = codec.decoder.chunked_decode(codes).numpy().ravel()[offset:]
+            lowered_parts = []
+            for start in range(0, codes.shape[-1], chunk_size):
+                end = min(start + chunk_size, codes.shape[-1])
+                context = min(start, left_context)
+                chunk = codes[..., start - context : end]
+                lowered_parts.append(
+                    lowered_decode(lowered, chunk, contract).ravel()[
+                        context * codec.decode_upsample_rate :
+                    ]
+                )
+            rewritten = np.concatenate(lowered_parts)[offset:]
             name = path.name.removesuffix(".codes.json")
             rate = contract["sample_rate"]
             reports[name] = {

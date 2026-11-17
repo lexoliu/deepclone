@@ -7,13 +7,14 @@ import numpy as np
 import torch
 from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
     EuclideanCodebook,
+    Qwen3TTSTokenizerV2ConvNeXtBlock,
     Qwen3TTSTokenizerV2Decoder,
     Qwen3TTSTokenizerV2DecoderConfig,
     SplitResidualVectorQuantizer,
 )
 
 from audio_models import AudioDecoder
-from streaming_audio import StreamingAudioDecoder, StreamingQuantizer
+from streaming_audio import StreamingAudioDecoder, StreamingConvNext, StreamingQuantizer
 from streaming_audio import metadata as rotary_metadata
 
 
@@ -58,6 +59,54 @@ def metadata(model, position, dtype):
 
 
 class StreamingAudio(unittest.TestCase):
+    def test_native_convnext_at_published_dimensions(self):
+        # The first waveform upsampler doubles one 1024-channel codec frame.
+        torch.manual_seed(42)
+        original = Qwen3TTSTokenizerV2ConvNeXtBlock(1024).eval()
+        module = StreamingConvNext(original).eval()
+        with torch.inference_mode():
+            # Exercise the residual branch instead of its near-zero initializer.
+            original.gamma.uniform_(0.1, 0.5)
+            hidden = torch.randn(1, 1024, 8)
+            expected = original(hidden).numpy()
+            sample = hidden[..., :2].unsqueeze(2)
+            traced = torch.jit.trace(module, sample, check_trace=False)
+            module.dwconv.history.zero_()
+            native = ct.convert(
+                traced,
+                minimum_deployment_target=ct.target.macOS15,
+                inputs=[
+                    ct.TensorType(name="hidden", shape=sample.shape, dtype=np.float16)
+                ],
+                states=[
+                    ct.StateType(
+                        name=name,
+                        wrapped_type=ct.TensorType(shape=value.shape, dtype=np.float16),
+                    )
+                    for name, value in module.named_buffers()
+                ],
+                outputs=[ct.TensorType(name="output", dtype=np.float32)],
+                compute_precision=ct.precision.FLOAT16,
+                compute_units=ct.ComputeUnit.CPU_AND_NE,
+            )
+            state = native.make_state()
+            actual, lowered = [], []
+            for start in range(0, hidden.shape[-1], 2):
+                chunk = hidden[..., start : start + 2].unsqueeze(2)
+                lowered.append(module(chunk).squeeze(2).numpy())
+                actual.append(
+                    native.predict({"hidden": chunk.numpy()}, state=state)[
+                        "output"
+                    ].squeeze(2)
+                )
+            np.testing.assert_allclose(
+                np.concatenate(lowered, axis=-1), expected, atol=1e-6, rtol=1e-4
+            )
+            relative_error = np.linalg.norm(
+                np.concatenate(actual, axis=-1) - expected
+            ) / np.linalg.norm(expected)
+            self.assertLess(relative_error, 0.01)
+
     def test_native_single_frame_quantizer_at_published_dimensions(self):
         # Qwen's 12 Hz decoder uses 16 codebooks of 2048 vectors, each 256 wide.
         original = SplitResidualVectorQuantizer(
