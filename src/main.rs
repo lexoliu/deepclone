@@ -99,6 +99,8 @@ struct Synthesize {
     maximum_wait_ms: Option<u64>,
     #[arg(long)]
     text_chunk_chars: Option<NonZeroUsize>,
+    #[arg(long, help = "Maximum text tokens per automatically managed utterance")]
+    text_segment_tokens: Option<NonZeroUsize>,
     #[arg(long)]
     unstable_text_bytes: Option<NonZeroUsize>,
     #[arg(long)]
@@ -110,7 +112,10 @@ struct Synthesize {
         help = "Batch output directory, or with --stdin a WAV file; - streams mono f32le PCM to stdout"
     )]
     output: PathBuf,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Maximum acoustic frames per utterance; does not limit total audio duration"
+    )]
     maximum_frames: NonZeroUsize,
     #[arg(
         long,
@@ -357,6 +362,9 @@ async fn run<T: TokenSampler + Send + 'static, S: TokenSampler + Send + 'static>
     };
     tracing::info!(sample_rate = voice.sample_rate(), "voice ready");
     let mut options = Options::new(args.maximum_frames);
+    if let Some(tokens) = args.text_segment_tokens {
+        options.generation.text_segment_tokens = tokens;
+    }
     if let Some(value) = args.audio_chunk_frames {
         options.audio_chunk_frames = value;
     }
@@ -370,7 +378,7 @@ async fn run<T: TokenSampler + Send + 'static, S: TokenSampler + Send + 'static>
         options.text_chunk_chars = value;
     }
     if let Some(value) = args.unstable_text_bytes {
-        options.unstable_text_bytes = value;
+        options.generation.unstable_text_bytes = value;
     }
     if let Some(value) = args.input_queue_chunks {
         options.input_queue_chunks = value;
@@ -412,6 +420,7 @@ async fn run<T: TokenSampler + Send + 'static, S: TokenSampler + Send + 'static>
             serde_json::to_writer(&mut writer, &generation)?;
             writer.flush()?;
         }
+        let generated_frames = generation.generated_frames();
         results.push(Sample {
             model_size: generation.model_size,
             transformer_weight_bits: generation.transformer_weight_bits,
@@ -434,13 +443,13 @@ async fn run<T: TokenSampler + Send + 'static, S: TokenSampler + Send + 'static>
             repetition_penalty: args.repetition_penalty,
             sample_rate: voice.sample_rate(),
             samples,
-            generated_frames: generation.codes.generated_frames(),
+            generated_frames,
             synthesis_seconds: seconds,
         });
         let mut metadata = BufWriter::new(File::create(args.output.join("samples.json"))?);
         serde_json::to_writer_pretty(&mut metadata, &results)?;
         metadata.flush()?;
-        tracing::info!(language=%prompt.language,frames=generation.codes.generated_frames(),seconds,"saved audio");
+        tracing::info!(language=%prompt.language,frames=generated_frames,seconds,"saved audio");
     }
     Ok(())
 }

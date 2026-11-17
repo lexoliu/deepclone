@@ -43,41 +43,63 @@ def main():
     reports = {}
     with torch.inference_mode():
         for path in args.codes:
-            exported = json.loads(path.read_text())["codes"]
-            groups = exported["groups"]
-            if groups != contract["code_groups"]:
-                raise ValueError("Code groups differ from decoder contract")
-            codes = torch.tensor(exported["values"], dtype=torch.int64)
-            codes = codes.reshape(-1, groups).T.unsqueeze(0)
-            offset = exported["reference_frames"] * codec.decode_upsample_rate
-            if not 0 <= offset < codes.shape[-1] * codec.decode_upsample_rate:
-                raise ValueError("Reference boundary leaves no generated audio")
-            expected = codec.decoder.chunked_decode(codes).numpy().ravel()[offset:]
-            lowered_parts, native_parts = [], []
-            for start in range(0, codes.shape[-1], chunk_size):
-                end = min(start + chunk_size, codes.shape[-1])
-                context = min(start, left_context)
-                chunk = codes[..., start - context : end]
-                padded = torch.nn.functional.pad(chunk, (0, capacity - chunk.shape[-1]))
-                begin_sample = context * codec.decode_upsample_rate
-                end_sample = chunk.shape[-1] * codec.decode_upsample_rate
-                lowered_parts.append(
-                    lowered(padded).numpy().ravel()[begin_sample:end_sample]
+            segments = json.loads(path.read_text())["segments"]
+            if not segments:
+                raise ValueError("Generation contains no utterances")
+            expected_parts, rewritten_parts, actual_parts, segment_reports = (
+                [],
+                [],
+                [],
+                [],
+            )
+            for exported in segments:
+                groups = exported["groups"]
+                if groups != contract["code_groups"]:
+                    raise ValueError("Code groups differ from decoder contract")
+                codes = torch.tensor(exported["values"], dtype=torch.int64)
+                codes = codes.reshape(-1, groups).T.unsqueeze(0)
+                offset = exported["reference_frames"] * codec.decode_upsample_rate
+                if not 0 <= offset < codes.shape[-1] * codec.decode_upsample_rate:
+                    raise ValueError("Reference boundary leaves no generated audio")
+                expected_segment = (
+                    codec.decoder.chunked_decode(codes).numpy().ravel()[offset:]
                 )
-                native_parts.append(
-                    native.predict({"codes": padded.numpy().astype(np.int32)})[
-                        "audio"
-                    ].ravel()[begin_sample:end_sample]
+                lowered_parts, native_parts = [], []
+                for start in range(0, codes.shape[-1], chunk_size):
+                    end = min(start + chunk_size, codes.shape[-1])
+                    context = min(start, left_context)
+                    chunk = codes[..., start - context : end]
+                    padded = torch.nn.functional.pad(
+                        chunk, (0, capacity - chunk.shape[-1])
+                    )
+                    begin_sample = context * codec.decode_upsample_rate
+                    end_sample = chunk.shape[-1] * codec.decode_upsample_rate
+                    lowered_parts.append(
+                        lowered(padded).numpy().ravel()[begin_sample:end_sample]
+                    )
+                    native_parts.append(
+                        native.predict({"codes": padded.numpy().astype(np.int32)})[
+                            "audio"
+                        ].ravel()[begin_sample:end_sample]
+                    )
+                expected_parts.append(expected_segment)
+                rewritten_parts.append(np.concatenate(lowered_parts)[offset:])
+                actual_parts.append(np.concatenate(native_parts)[offset:])
+                segment_reports.append(
+                    {
+                        "frames": codes.shape[-1],
+                        "reference_frames": exported["reference_frames"],
+                    }
                 )
-            rewritten = np.concatenate(lowered_parts)[offset:]
-            actual = np.concatenate(native_parts)[offset:]
+            expected = np.concatenate(expected_parts)
+            rewritten = np.concatenate(rewritten_parts)
+            actual = np.concatenate(actual_parts)
             name = path.name.removesuffix(".codes.json")
             rust, rate = sf.read(args.waveforms / (name + ".wav"), dtype="float32")
             if rate != contract["sample_rate"] or rust.shape != actual.shape:
                 raise ValueError("Rust waveform shape or sample rate differs")
             reports[name] = {
-                "frames": codes.shape[-1],
-                "reference_frames": exported["reference_frames"],
+                "segments": segment_reports,
                 "lowered_padded_fp32": metrics(rewritten, expected),
                 "coreml_fp16": metrics(actual, expected),
                 "coreml_last_second": metrics(actual[-rate:], expected[-rate:]),

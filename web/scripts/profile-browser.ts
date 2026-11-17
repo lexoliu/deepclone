@@ -110,6 +110,8 @@ page.on("console", (event) => {
   if (event.type() === "error") process.stderr.write(`${event.text()}\n`);
   if (
     event.text().startsWith("Speech codec timing") ||
+    event.text().startsWith("Speech chunk timing") ||
+    event.text().startsWith("Speech playback timing") ||
     event.text().startsWith("Speech diagnostic phase")
   )
     process.stdout.write(`${JSON.stringify({ codec: event.text() })}\n`);

@@ -205,51 +205,26 @@ fn serve<B: crate::generation::Model, T: TokenSampler, S: TokenSampler>(
         }
         tracing::debug!("session started");
         let result = futures_lite::future::block_on(async {
-            let mut session = engine.session(
+            let generation = super::drive(
+                &mut engine,
                 &reference,
+                &request.text,
                 &request.language,
-                request.options.maximum_frames.get(),
-                request.options.unstable_text_bytes.get(),
-            )?;
-            while !session.finished {
-                if request.audio.is_closed() {
-                    return Ok(());
-                }
-                if let Some(chunk) = session
-                    .next_chunk(request.options.audio_chunk_frames.get(), || {
-                        request.audio.is_closed()
-                    })
-                    .await?
-                {
-                    tracing::debug!(
-                        start_sample = chunk.start_sample,
-                        samples = chunk.samples.len(),
-                        "audio ready"
-                    );
-                    if request.audio.send_blocking(Ok(chunk)).is_err() {
-                        return Ok(());
-                    }
-                } else if !session.finished {
-                    tracing::trace!("waiting for text");
-                    match request.text.recv_blocking() {
-                        Ok(Some(text)) => {
-                            tracing::trace!(bytes = text.len(), "text received");
-                            session.push_text(&text)?;
-                        }
-                        Ok(None) => {
-                            tracing::debug!("finishing text input");
-                            session.finish_input()?;
-                        }
-                        Err(_) => {
-                            if request.audio.is_closed() {
-                                return Ok(());
-                            }
-                            return Err(Error::InputStopped);
-                        }
-                    }
-                }
-            }
-            let _ = request.completion.send_blocking(session.into_generation()?);
+                &request.options,
+                super::Execution {
+                    clock: TokioClock(Instant::now()),
+                    cancelled: || request.audio.is_closed(),
+                },
+                async |chunk| {
+                    request
+                        .audio
+                        .send(Ok(chunk))
+                        .await
+                        .map_err(|_| Error::Cancelled)
+                },
+            )
+            .await?;
+            let _ = request.completion.send(generation).await;
             Ok::<_, Error>(())
         });
         if let Err(error) = result {

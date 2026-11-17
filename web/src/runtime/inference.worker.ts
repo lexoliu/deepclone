@@ -122,12 +122,17 @@ async function execute(command: Command): Promise<void> {
       input = new module.TextInput(2);
       send({ kind: "started" });
       try {
+        let resumed = performance.now();
+        let chunks = 0;
         await voice.run(
           input,
           command.language,
           command.frames,
           command.chunkFrames,
           async (samples, sampleRate) => {
+            const ready = performance.now();
+            const productionMs = ready - resumed;
+            const audioSeconds = samples.length / sampleRate;
             const id = audioId++;
             const copy = samples.slice();
             const acknowledged = new Promise<void>((resolve, reject) =>
@@ -137,6 +142,13 @@ async function execute(command: Command): Promise<void> {
               copy.buffer,
             ]);
             await acknowledged;
+            resumed = performance.now();
+            console.info("Speech chunk timing", {
+              chunk: chunks++,
+              productionMs,
+              consumerWaitMs: resumed - ready,
+              audioSeconds,
+            });
           },
         );
         send({ kind: "done" });

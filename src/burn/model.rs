@@ -152,6 +152,9 @@ impl Model for Burn {
     fn groups(&self) -> usize {
         self.codes.len()
     }
+    fn context_capacity(&self) -> usize {
+        self.talker.capacity()
+    }
     fn reset(&mut self) {
         self.talker.reset();
         self.predictor.reset();

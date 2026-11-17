@@ -132,6 +132,9 @@ impl Backend for CoreMl {
     fn groups(&self) -> usize {
         self.codec_embeddings.len()
     }
+    fn context_capacity(&self) -> usize {
+        self.talker.capacity()
+    }
     fn reset(&mut self) {
         self.talker.reset();
         self.predictor.reset();

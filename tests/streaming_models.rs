@@ -111,7 +111,8 @@ fn multilingual_streams_match_validated_codes_and_waveforms() {
                 .collect();
             let mut policy = options();
             if !item.reached_eos {
-                policy.maximum_frames = NonZeroUsize::new(item.generated_frames).unwrap();
+                policy.generation.maximum_frames =
+                    NonZeroUsize::new(item.generated_frames).unwrap();
             }
             let mut audio = voice
                 .synthesize(stream::iter(parts), &item.prompt.language, policy)
@@ -137,7 +138,11 @@ fn multilingual_streams_match_validated_codes_and_waveforms() {
                 }
             }
             let codes = if item.reached_eos {
-                audio.take_generation().expect("normal completion").codes
+                audio
+                    .take_generation()
+                    .expect("normal completion")
+                    .segments
+                    .remove(0)
             } else {
                 assert!(audio.generation().is_none());
                 truncated.expect("the truncated baseline must produce a budget error")

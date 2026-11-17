@@ -19,6 +19,8 @@ pub mod inference;
 
 #[cfg(feature = "inference")]
 mod text;
+#[cfg(feature = "inference")]
+mod utterances;
 
 #[cfg(feature = "streaming")]
 pub mod streaming;

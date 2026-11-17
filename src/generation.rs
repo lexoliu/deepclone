@@ -12,6 +12,8 @@ pub trait Model {
     fn code_token(&mut self, group: usize, token: &Self::Token) -> Result<Self::Hidden, Error>;
     async fn read_tokens(&self, tokens: &[Self::Token]) -> Result<Vec<u32>, Error>;
     fn groups(&self) -> usize;
+    /// Available Talker KV positions in this backend's loaded model.
+    fn context_capacity(&self) -> usize;
     /// Fixed-shape backends can retain their model capacity; dynamic backends use the valid span.
     fn waveform_frames(&self, valid: usize, capacity: usize) -> usize {
         let _ = valid;
@@ -83,6 +85,13 @@ pub struct Sequence<'a, B: Model, T, S> {
     finished: bool,
 }
 
+/// EOS is checked before the frame allowance and before detail-code prediction.
+pub enum Frame {
+    Codes(Vec<u32>),
+    Eos,
+    Limit,
+}
+
 impl<B: Model, T: TokenSampler, S: TokenSampler> Generator<B, T, S> {
     pub fn embed_code(&mut self, group: usize, token: u32) -> Result<B::Hidden, Error> {
         self.networks.code(group, token)
@@ -137,10 +146,14 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Sequence<'_, B, T, S> {
         Ok(())
     }
 
-    pub async fn next_frame(&mut self, text: &B::Hidden) -> Result<Option<Vec<u32>>, Error> {
+    pub async fn next_frame(
+        &mut self,
+        text: &B::Hidden,
+        maximum_frames: usize,
+    ) -> Result<Frame, Error> {
         let Some(hidden) = self.pending.take() else {
             return if self.finished {
-                Ok(None)
+                Ok(Frame::Eos)
             } else {
                 Err(Error::Contract("sequence failed; start a new request"))
             };
@@ -162,7 +175,10 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Sequence<'_, B, T, S> {
             .await?[0];
         if first == selection.eos {
             self.finished = true;
-            return Ok(None);
+            return Ok(Frame::Eos);
+        }
+        if self.history.len() == maximum_frames {
+            return Ok(Frame::Limit);
         }
         let networks = &mut self.generator.networks;
         networks.reset_predictor();
@@ -181,6 +197,6 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Sequence<'_, B, T, S> {
         let hidden = networks.talker(embedded)?;
         self.pending = Some(hidden);
         self.history.push(first);
-        Ok(Some(codes))
+        Ok(Frame::Codes(codes))
     }
 }
