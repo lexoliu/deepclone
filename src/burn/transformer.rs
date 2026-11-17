@@ -55,8 +55,9 @@ impl Layer {
                 w,
                 ["gate", "up"].map(|name| format!("{prefix}.mlp.{name}_proj")),
             )?,
-            down: Linear::load(w, &format!("{prefix}.mlp.down_proj"))?
-                .cast(burn::tensor::DType::F32),
+            // The gated activation accumulates in FP32 while projection weights
+            // retain model storage; GEMV converts each weight as it is read.
+            down: Linear::load(w, &format!("{prefix}.mlp.down_proj"))?,
             keys: Tensor::<4>::zeros(shape, w.device()).cast(w.dtype()),
             values: Tensor::<4>::zeros(shape, w.device()).cast(w.dtype()),
         })
