@@ -52,13 +52,29 @@ export function useVoice() {
     console.error("Voice workspace failed", value);
     if (cancelling.current) return;
     operation.current++;
+    const active = player.current;
+    const partial = saveOutput(active);
     stopWorker(value);
-    void player.current?.close();
     player.current = null;
-    setError("Speech could not be prepared. Please try again.");
+    void active?.close();
+    setError(
+      partial
+        ? "Speech generation stopped before finishing. You can listen to or download the audio generated so far."
+        : timing.current?.conditioned === undefined
+          ? "Speech could not be prepared. Please try again."
+          : "Speech generation stopped before audio was produced. Please try again.",
+    );
     setBusy(false);
     setRunning(false);
-    setStatus("Operation stopped");
+    setStatus(partial ? "Incomplete audio saved" : "Operation stopped");
+  }
+  function saveOutput(active: Player | null) {
+    if (!active?.hasAudio) return false;
+    if (audioUrl.current) URL.revokeObjectURL(audioUrl.current);
+    audioUrl.current = URL.createObjectURL(active.wav());
+    setAudio(audioUrl.current);
+    console.info("Speech playback timing", active.diagnostics());
+    return true;
   }
   function stopWorker(
     reason: Error = new DOMException("Cancelled", "AbortError"),
@@ -111,12 +127,13 @@ export function useVoice() {
         setSeconds((value) => value + event.samples.length / event.sampleRate);
         void player
           .current!.enqueue(event.samples, event.sampleRate)
-          .then(() =>
+          .then(() => {
+            if (instance !== worker.current) return;
             instance.postMessage({
               kind: "ack",
               id: event.id,
-            } satisfies Command),
-          )
+            } satisfies Command);
+          })
           .catch((reason) => {
             if (instance === worker.current) fail(reason);
           });
@@ -149,9 +166,9 @@ export function useVoice() {
           ?.finish()
           .then(() => {
             if (instance !== worker.current || cancelling.current) return;
-            if (audioUrl.current) URL.revokeObjectURL(audioUrl.current);
-            audioUrl.current = URL.createObjectURL(active.wav());
-            setAudio(audioUrl.current);
+            saveOutput(active);
+            player.current = null;
+            void active.close();
             setRunning(false);
             setBusy(false);
             setStatus("Ready to listen");
@@ -226,6 +243,8 @@ export function useVoice() {
     setBusy(true);
     setSeconds(0);
     setElapsed(0);
+    if (audioUrl.current) URL.revokeObjectURL(audioUrl.current);
+    audioUrl.current = null;
     setAudio(null);
     setStatus("Preparing reference voice");
     const current = ++operation.current;
@@ -281,13 +300,15 @@ export function useVoice() {
   function cancel() {
     operation.current++;
     cancelling.current = true;
+    const active = player.current;
+    const partial = saveOutput(active);
     stopWorker();
-    void player.current?.close();
     player.current = null;
+    void active?.close();
     setRunning(false);
     setBusy(false);
     setError(null);
-    setStatus("Cancelled");
+    setStatus(partial ? "Cancelled · incomplete audio saved" : "Cancelled");
     initializeWorker();
   }
   return {

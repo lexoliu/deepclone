@@ -24,6 +24,10 @@ export class Player {
   private waiting: Promise<void>[] = [];
   private chunks: Float32Array[] = [];
   private rate = 24000;
+  private underruns = 0;
+  private gapSeconds = 0;
+  private consumerWaitMs = 0;
+  private firstPlayback: number | null = null;
   constructor() {
     this.context = new AudioContext();
   }
@@ -47,11 +51,22 @@ export class Player {
         resolve();
       };
     });
-    source.start(Math.max(this.context.currentTime, this.end));
-    this.end = Math.max(this.context.currentTime, this.end) + buffer.duration;
+    const now = this.context.currentTime;
+    if (this.end > 0 && now > this.end) {
+      this.underruns++;
+      this.gapSeconds += now - this.end;
+    }
+    const start = Math.max(now, this.end);
+    this.firstPlayback ??= performance.now() + (start - now) * 1000;
+    source.start(start);
+    this.end = start + buffer.duration;
     this.waiting.push(ended);
     // Bound playback to the current chunk plus one queued chunk.
-    if (this.waiting.length >= 2) await this.waiting.shift();
+    if (this.waiting.length >= 2) {
+      const waiting = performance.now();
+      await this.waiting.shift();
+      this.consumerWaitMs += performance.now() - waiting;
+    }
   }
   async finish() {
     await Promise.all(this.waiting);
@@ -59,6 +74,17 @@ export class Player {
   }
   wav() {
     return encodeWav(this.chunks, this.rate);
+  }
+  get hasAudio() {
+    return this.chunks.some((chunk) => chunk.length > 0);
+  }
+  diagnostics() {
+    return {
+      underruns: this.underruns,
+      gapSeconds: this.gapSeconds,
+      consumerWaitMs: this.consumerWaitMs,
+      firstPlayback: this.firstPlayback,
+    };
   }
   async close() {
     if (this.context.state === "closed") return;
