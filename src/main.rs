@@ -28,6 +28,13 @@ use std::{
 #[derive(Parser)]
 #[command(about = "Local streaming voice cloning")]
 struct Args {
+    #[arg(
+        short,
+        long,
+        global = true,
+        help = "Include detailed streaming diagnostics"
+    )]
+    verbose: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -601,6 +608,11 @@ fn main() -> ExitCode {
     let args = Args::parse();
     let subscriber = tracing_subscriber::fmt()
         .without_time()
+        .with_max_level(if args.verbose {
+            tracing::Level::DEBUG
+        } else {
+            tracing::Level::INFO
+        })
         .with_writer(std::io::stderr)
         .finish();
     tracing::subscriber::with_default(subscriber, || {
