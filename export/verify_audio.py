@@ -11,7 +11,49 @@ import torch
 from qwen_tts import Qwen3TTSModel
 from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
 
-from audio_models import AudioDecoder, AudioEncoder
+from audio_models import AudioEncoder
+from streaming_audio import StreamingAudioDecoder, metadata
+
+
+def native_decode(native, codes, contract):
+    if contract["execution"] != "stateful_frame":
+        raise ValueError("Waveform verification requires stateful_frame execution")
+    state = native.make_state()
+    parts = []
+    for index in range(codes.shape[-1]):
+        values = metadata(
+            contract["rotary_frequencies"],
+            contract["rotary_scaling"],
+            contract["attention_window"],
+            index,
+            torch.float16,
+        )
+        inputs = {"codes": codes[..., index : index + 1].numpy().astype(np.int32)}
+        inputs.update(
+            (name, value.numpy())
+            for name, value in zip(["cosine", "sine", "mask"], values)
+        )
+        parts.append(native.predict(inputs, state=state)["audio"])
+    return np.concatenate(parts, axis=-1)
+
+
+def lowered_decode(module, codes, contract):
+    module.reset()
+    return torch.cat(
+        [
+            module(
+                codes[..., index : index + 1],
+                *metadata(
+                    contract["rotary_frequencies"],
+                    contract["rotary_scaling"],
+                    contract["attention_window"],
+                    index,
+                ),
+            )
+            for index in range(codes.shape[-1])
+        ],
+        dim=-1,
+    ).numpy()
 
 
 def metrics(actual, expected):
@@ -88,23 +130,19 @@ def main():
             )
             actual = native.predict({"mel": mel.numpy()})["speaker"]
             record("speaker_" + units.name, metrics(actual, speaker))
-        capacity = json.loads((args.models / "decoder.contract.json").read_text())[
-            "capacity"
-        ]
+        contract = json.loads((args.models / "decoder.contract.json").read_text())
+        capacity = contract["capacity"]
         short = codes[..., :capacity]
         expected = codec.decoder(short).numpy()
-        padded_codes = torch.nn.functional.pad(short, (0, capacity - short.shape[-1]))
-        rewritten = AudioDecoder(codec.decoder, capacity)(padded_codes).numpy()[
-            ..., : expected.shape[-1]
-        ]
+        rewritten = lowered_decode(
+            StreamingAudioDecoder(codec.decoder), short, contract
+        )
         record("decoder_equations", metrics(rewritten, expected))
         for units in units_to_check:
             native = ct.models.CompiledMLModel(
                 str(args.models / "decoder.mlmodelc"), compute_units=units
             )
-            actual = native.predict({"codes": padded_codes.numpy().astype(np.int32)})[
-                "audio"
-            ][..., : expected.shape[-1]]
+            actual = native_decode(native, short, contract)
             record("decoder_" + units.name, metrics(actual, expected))
             sf.write(
                 args.output / ("decoded_reference_" + units.name + ".wav"),

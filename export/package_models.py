@@ -40,8 +40,13 @@ def inputs(transformers, audio):
         ("decoder", "fp16"),
     ]:
         contract = f"{component}.contract.json"
-        if json.loads((audio / contract).read_text())["compute_precision"] != precision:
+        metadata = json.loads((audio / contract).read_text())
+        if metadata["compute_precision"] != precision:
             raise ValueError(f"{component} must use {precision}")
+        if component == "decoder" and metadata.get("execution") != "stateful_frame":
+            raise ValueError(
+                "Published waveform decoder must use stateful_frame execution"
+            )
         selected["audio"][1].extend([contract, f"{component}.mlmodelc"])
     files = {}
     for prefix, (root, names) in selected.items():

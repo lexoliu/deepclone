@@ -9,17 +9,33 @@ struct Step: Codable {
   let maximum: Float?
   let error: String?
 }
+
+struct CodecCall: Decodable {
+  let context: Int
+  let frames: Int
+  let values: [Int32]
+}
+
+struct CodecContract: Decodable {
+  let codeGroups: Int
+  let samplesPerFrame: Int
+  let rotaryFrequencies: [Float]
+  let rotaryScaling: Float
+  let attentionWindow: Int
+}
+
 @main struct Probe {
   static func main() async throws {
     let args = CommandLine.arguments
     let report = URL(fileURLWithPath: args[3])
-    let bytes = try Data(contentsOf: URL(fileURLWithPath: args[2]))
-    // The published 12 Hz codec has 16 groups; each block holds 300
-    // frames plus 25 frames of left context.
-    let groups = 16
-    let capacity = 300 + 25
-    let count = groups * capacity
-    guard bytes.count % (count * 4) == 0 else { throw CocoaError(.fileReadCorruptFile) }
+    let calls = try JSONDecoder().decode(
+      [CodecCall].self, from: Data(contentsOf: URL(fileURLWithPath: args[2])))
+    let decoder = JSONDecoder()
+    decoder.keyDecodingStrategy = .convertFromSnakeCase
+    let modelURL = URL(fileURLWithPath: args[1])
+    let contract = try decoder.decode(
+      CodecContract.self,
+      from: Data(contentsOf: modelURL.deletingPathExtension().appendingPathExtension("contract.json")))
     let configuration = MLModelConfiguration()
     configuration.computeUnits = .cpuAndNeuralEngine
     if args.count > 6 && args[6] == "static" {
@@ -74,14 +90,27 @@ struct Step: Codable {
       }
     }
     let load = Date()
-    let model = try MLModel(contentsOf: URL(fileURLWithPath: args[1]), configuration: configuration)
+    let model = try MLModel(contentsOf: modelURL, configuration: configuration)
+    var codecState = model.makeState()
+    var context: Int?
+    var consumed = 0
+
+    func rotaryArray(_ values: [Float16]) throws -> MLMultiArray {
+      let array = try MLMultiArray(
+        shape: [1, 1, 1, NSNumber(value: values.count)], dataType: .float16)
+      array.withUnsafeMutableBytes { ptr, strides in
+        let data = ptr.baseAddress!.assumingMemoryBound(to: Float16.self)
+        for index in values.indices { data[index * strides[3]] = values[index] }
+      }
+      return array
+    }
     steps.append(
       Step(
         iteration: -1, stage: "load", seconds: Date().timeIntervalSince(load), samples: nil,
         maximum: nil, error: nil))
     try save()
-    for i in 0..<(bytes.count / (count * 4)) {
-      let start = Date()
+    for (i, call) in calls.enumerated() {
+      let transformerStart = Date()
       if args.count > 5 {
         let rounds = Int(args[5])!
         for _ in 0..<rounds {
@@ -91,34 +120,68 @@ struct Step: Codable {
           }
         }
       }
+      steps.append(
+        Step(iteration: i, stage: "transformers", seconds: Date().timeIntervalSince(transformerStart),
+             samples: nil, maximum: nil, error: nil))
+      let start = Date()
       do {
         let result: Step = try autoreleasepool {
-          let codes = try MLMultiArray(
-            shape: [1, NSNumber(value: groups), NSNumber(value: capacity)], dataType: .int32)
-          bytes.withUnsafeBytes { ptr in
-            codes.dataPointer.copyMemory(
-              from: ptr.baseAddress!.advanced(by: i * count * 4), byteCount: count * 4)
+          if call.context != context {
+            context = call.context
+            consumed = 0
+            codecState = model.makeState()
           }
-          let features = try MLDictionaryFeatureProvider(dictionary: [
-            "codes": MLFeatureValue(multiArray: codes)
-          ])
-          let output = try model.prediction(from: features)
-          guard let audio = output.featureValue(for: "audio")?.multiArrayValue else {
-            throw CocoaError(.coderValueNotFound)
+          guard call.frames >= consumed,
+                call.values.count == contract.codeGroups * call.frames else {
+            throw CocoaError(.fileReadCorruptFile)
           }
-          guard audio.strides.last!.intValue == 1, audio.dataType == .float32 else {
-            throw CocoaError(.coderReadCorrupt)
-          }
-          let values = audio.dataPointer.assumingMemoryBound(to: Float.self)
+          let appended = call.frames - consumed
           var maximum: Float = 0
-          for index in 0..<audio.count {
-            let value = values[index]
-            guard value.isFinite else { throw CocoaError(.coderReadCorrupt) }
-            maximum = max(maximum, abs(value))
+          for position in consumed..<call.frames {
+            let codes = try MLMultiArray(
+              shape: [1, NSNumber(value: contract.codeGroups), 1], dataType: .int32)
+            codes.withUnsafeMutableBytes { ptr, strides in
+              let data = ptr.baseAddress!.assumingMemoryBound(to: Int32.self)
+              for group in 0..<contract.codeGroups {
+                data[group * strides[1]] = call.values[group * call.frames + position]
+              }
+            }
+            var cosine: [Float16] = []
+            var sine: [Float16] = []
+            for frequency in contract.rotaryFrequencies {
+              let phase = frequency * Float(position)
+              cosine.append(Float16(cos(phase) * contract.rotaryScaling))
+              sine.append(Float16(sin(phase) * contract.rotaryScaling))
+            }
+            cosine += cosine
+            sine += sine
+            let mask = (0..<contract.attentionWindow).map { index in
+              index < contract.attentionWindow - min(position + 1, contract.attentionWindow)
+                ? -Float16.greatestFiniteMagnitude : Float16(0)
+            }
+            let features = try MLDictionaryFeatureProvider(dictionary: [
+              "codes": MLFeatureValue(multiArray: codes),
+              "cosine": MLFeatureValue(multiArray: rotaryArray(cosine)),
+              "sine": MLFeatureValue(multiArray: rotaryArray(sine)),
+              "mask": MLFeatureValue(multiArray: rotaryArray(mask)),
+            ])
+            let output = try model.prediction(from: features, using: codecState)
+            guard let audio = output.featureValue(for: "audio")?.multiArrayValue,
+                  audio.count == contract.samplesPerFrame,
+                  audio.strides.last!.intValue == 1, audio.dataType == .float32 else {
+              throw CocoaError(.coderReadCorrupt)
+            }
+            let values = audio.dataPointer.assumingMemoryBound(to: Float.self)
+            for index in 0..<audio.count {
+              let value = values[index]
+              guard value.isFinite else { throw CocoaError(.coderReadCorrupt) }
+              maximum = max(maximum, abs(value))
+            }
           }
+          consumed = call.frames
           return Step(
             iteration: i, stage: "predict", seconds: Date().timeIntervalSince(start),
-            samples: audio.count, maximum: maximum, error: nil)
+            samples: appended * contract.samplesPerFrame, maximum: maximum, error: nil)
         }
         steps.append(result)
         try save()

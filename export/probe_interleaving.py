@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import struct
 import subprocess
 from pathlib import Path
 
@@ -27,11 +26,15 @@ def inputs(codes, capacity, chunk_frames):
             stop = min(end, block + 300)
             if stop - context > capacity:
                 raise ValueError("Decoder capacity cannot hold this codec block")
-            yield [
-                values[frame * groups + group] if frame < stop else 0
-                for group in range(groups)
-                for frame in range(context, context + capacity)
-            ]
+            yield {
+                "context": context,
+                "frames": stop - context,
+                "values": [
+                    values[frame * groups + group]
+                    for group in range(groups)
+                    for frame in range(context, stop)
+                ],
+            }
             cursor = stop
         start = end
 
@@ -52,6 +55,8 @@ def main():
         raise ValueError("Chunk frames must be positive")
     manifest = json.loads((args.transformers / "transformers.json").read_text())
     contract = json.loads((args.audio_models / "decoder.contract.json").read_text())
+    if contract["execution"] != "stateful_frame":
+        raise ValueError("Interleaved replay requires stateful_frame execution")
     codes = json.loads(args.codes.read_text())["codes"]
     if codes["groups"] != contract["code_groups"]:
         raise ValueError("Acoustic code groups differ from decoder contract")
@@ -70,10 +75,10 @@ def main():
         for name in ["speaker.mlmodelc", "encoder.mlmodelc"]
     )
     args.output.mkdir(parents=True, exist_ok=True)
-    packed = args.output / "inputs.bin"
-    with packed.open("wb") as writer:
-        for values in inputs(codes, contract["capacity"], args.chunk_frames):
-            writer.write(struct.pack(f"<{len(values)}i", *values))
+    packed = args.output / "inputs.json"
+    packed.write_text(
+        json.dumps(list(inputs(codes, contract["capacity"], args.chunk_frames)))
+    )
     residents = args.output / "models.json"
     residents.write_text(json.dumps(models))
     subprocess.run(
