@@ -412,6 +412,20 @@ fn real_coreml_long_stream_preserves_codes_and_contiguous_pcm() {
         let directory = |key| PathBuf::from(std::env::var_os(key).expect(key));
         let output = directory("DEEPCLONE_OUTPUT");
         std::fs::create_dir_all(&output).unwrap();
+        let started = std::time::Instant::now();
+        let progress = |stage: &str, frames: usize, samples: usize| {
+            std::fs::write(
+                output.join("progress.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "stage": stage,
+                    "seconds": started.elapsed().as_secs_f64(),
+                    "frames": frames,
+                    "samples": samples,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
         let reference_path = directory("DEEPCLONE_REFERENCE");
         let mut reader = hound::WavReader::open(reference_path.join("reference.wav")).unwrap();
         let samples = reader
@@ -425,6 +439,7 @@ fn real_coreml_long_stream_preserves_codes_and_contiguous_pcm() {
             serde_json::from_slice(&std::fs::read(directory("DEEPCLONE_PROMPTS")).unwrap())
                 .unwrap();
         let parameters = Parameters::new(0.9, NonZeroUsize::new(50), 1.).unwrap();
+        progress("load", 0, 0);
         let mut engine = Engine::open(
             &directory("DEEPCLONE_TRANSFORMERS"),
             &directory("DEEPCLONE_AUDIO_MODELS"),
@@ -437,6 +452,7 @@ fn real_coreml_long_stream_preserves_codes_and_contiguous_pcm() {
             },
         )
         .unwrap();
+        progress("reference", 0, 0);
         let reference = engine
             .reference(
                 &samples,
@@ -458,14 +474,17 @@ fn real_coreml_long_stream_preserves_codes_and_contiguous_pcm() {
             .unwrap();
         session.finish_input().unwrap();
         let mut samples = Vec::new();
+        progress("synthesis", session.codes.frames(), 0);
         while !session.finished {
             match session.next_chunk(12, || false).await {
                 Ok(Some(chunk)) => {
                     assert_eq!(chunk.start_sample, samples.len());
                     samples.extend(chunk.samples);
+                    progress("pcm", session.codes.frames(), samples.len());
                 }
                 Ok(None) => {}
                 Err(error) => {
+                    progress("error", session.codes.frames(), samples.len());
                     std::fs::write(
                         output.join("failure.codes.json"),
                         serde_json::to_vec(
@@ -505,5 +524,10 @@ fn real_coreml_long_stream_preserves_codes_and_contiguous_pcm() {
             writer.write_sample(sample).unwrap();
         }
         writer.finalize().unwrap();
+        progress(
+            "complete",
+            generation.codes.frames(),
+            generation.generated_frames() * engine.decoder_contract.samples_per_frame,
+        );
     });
 }
