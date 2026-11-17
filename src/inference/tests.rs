@@ -401,6 +401,104 @@ fn incremental_cjk_and_english_inputs_preserve_context_boundaries_and_pcm() {
 }
 
 #[cfg(all(feature = "cli", target_vendor = "apple"))]
+fn recorded_reference(path: &std::path::Path) -> (Vec<f32>, u32, String) {
+    let mut reader = hound::WavReader::open(path.join("reference.wav")).unwrap();
+    let samples = reader
+        .samples::<f32>()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let transcript: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("reference.json")).unwrap()).unwrap();
+    (
+        samples,
+        reader.spec().sample_rate,
+        transcript["text"].as_str().unwrap().to_owned(),
+    )
+}
+
+#[cfg(all(feature = "cli", target_vendor = "apple"))]
+#[test]
+#[ignore = "requires Core ML models and packed real streaming decoder inputs"]
+fn real_coreml_waveform_replays_prediction_inputs() {
+    use crate::sampling::Greedy;
+    use ondevice_coreml::ComputeUnits;
+    use std::path::PathBuf;
+    futures_lite::future::block_on(async {
+        let directory = |key| PathBuf::from(std::env::var_os(key).expect(key));
+        let output = directory("DEEPCLONE_OUTPUT");
+        std::fs::create_dir_all(&output).unwrap();
+        let started = std::time::Instant::now();
+        let mut engine = Engine::open(
+            &directory("DEEPCLONE_TRANSFORMERS"),
+            &directory("DEEPCLONE_AUDIO_MODELS"),
+            ComputeUnits::CpuAndNeuralEngine,
+            Sampling {
+                talker: Greedy,
+                predictor: Greedy,
+                repetition: RepetitionPenalty::new(1.05).unwrap(),
+                minimum_frames: 2,
+            },
+        )
+        .unwrap();
+        let mut reports = vec![serde_json::json!({
+            "stage": "load", "seconds": started.elapsed().as_secs_f64()
+        })];
+        let reference = if let Some(path) = std::env::var_os("DEEPCLONE_REFERENCE") {
+            let (samples, sample_rate, text) = recorded_reference(&PathBuf::from(path));
+            let start = std::time::Instant::now();
+            let reference = engine
+                .reference(&samples, sample_rate, &text)
+                .await
+                .unwrap();
+            reports.push(serde_json::json!({
+                "stage": "reference", "seconds": start.elapsed().as_secs_f64()
+            }));
+            Some(reference)
+        } else {
+            None
+        };
+        let bytes = std::fs::read(directory("DEEPCLONE_COREML_INPUTS")).unwrap();
+        let contract = &engine.decoder_contract;
+        let width = contract.capacity * contract.code_groups * size_of::<i32>();
+        let inputs = bytes.chunks_exact(width);
+        assert!(inputs.remainder().is_empty());
+        for (index, input) in inputs.enumerate() {
+            let codes = input
+                .as_chunks::<{ size_of::<i32>() }>()
+                .0
+                .iter()
+                .copied()
+                .map(i32::from_le_bytes)
+                .collect();
+            let start = std::time::Instant::now();
+            let result = engine
+                .generator
+                .networks
+                .waveform(codes, contract.code_groups, contract.capacity)
+                .await;
+            reports.push(serde_json::json!({
+                "index": index,
+                "seconds": start.elapsed().as_secs_f64(),
+                "samples": result.as_ref().ok().map(Vec::len),
+                "error": result.as_ref().err().map(ToString::to_string),
+            }));
+            std::fs::write(
+                output.join("replay.json"),
+                serde_json::to_vec(&reports).unwrap(),
+            )
+            .unwrap();
+            let samples = result.unwrap();
+            assert_eq!(
+                samples.len(),
+                contract.capacity * contract.samples_per_frame
+            );
+            assert!(samples.iter().all(|v| v.is_finite()));
+        }
+        drop(reference);
+    });
+}
+
+#[cfg(all(feature = "cli", target_vendor = "apple"))]
 #[test]
 #[ignore = "requires Core ML models, a private recording and a long-form prompt"]
 fn real_coreml_long_stream_preserves_codes_and_contiguous_pcm() {
@@ -427,14 +525,7 @@ fn real_coreml_long_stream_preserves_codes_and_contiguous_pcm() {
             .unwrap();
         };
         let reference_path = directory("DEEPCLONE_REFERENCE");
-        let mut reader = hound::WavReader::open(reference_path.join("reference.wav")).unwrap();
-        let samples = reader
-            .samples::<f32>()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let transcript: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(reference_path.join("reference.json")).unwrap())
-                .unwrap();
+        let (samples, sample_rate, text) = recorded_reference(&reference_path);
         let prompts: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(directory("DEEPCLONE_PROMPTS")).unwrap())
                 .unwrap();
@@ -454,11 +545,7 @@ fn real_coreml_long_stream_preserves_codes_and_contiguous_pcm() {
         .unwrap();
         progress("reference", 0, 0);
         let reference = engine
-            .reference(
-                &samples,
-                reader.spec().sample_rate,
-                transcript["text"].as_str().unwrap(),
-            )
+            .reference(&samples, sample_rate, &text)
             .await
             .unwrap();
         let maximum = NonZeroUsize::new(512).unwrap(); // Former total stream frame limit.
