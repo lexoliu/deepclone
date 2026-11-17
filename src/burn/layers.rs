@@ -27,11 +27,10 @@ impl Linear {
     }
     pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let dtype = x.dtype();
-        let weight = self.weight.clone().cast(dtype);
         let y = if x.dims()[0] == 1 && x.dims()[1] == 1 {
-            super::gemv::project(x, weight)
+            super::gemv::project(x, self.weight.clone().cast(dtype))
         } else {
-            x.matmul(weight.unsqueeze())
+            super::projection::project(x, self.weight.clone())
         };
         match &self.bias {
             Some(bias) => y + bias.clone().cast(dtype).unsqueeze(),
