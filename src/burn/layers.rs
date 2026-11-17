@@ -30,7 +30,7 @@ impl Linear {
         let y = if x.dims()[0] == 1 && x.dims()[1] == 1 {
             super::gemv::project(x, self.weight.clone())
         } else {
-            x.matmul(self.weight.clone().cast(dtype).unsqueeze())
+            super::projection::project(x, self.weight.clone())
         };
         match &self.bias {
             Some(bias) => y + bias.clone().cast(dtype).unsqueeze(),

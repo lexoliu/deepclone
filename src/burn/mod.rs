@@ -3,6 +3,7 @@ mod attention;
 mod codec_decoder;
 mod gemv;
 mod layers;
+mod projection;
 pub mod sampling;
 mod sort;
 pub use codec_decoder::{CodecDecoder, CodecDecoderConfig};
