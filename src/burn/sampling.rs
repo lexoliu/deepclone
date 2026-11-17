@@ -111,11 +111,11 @@ impl Logits for DeviceLogits {
             weights = weights.mask_fill(excluded, 0.);
         }
         let cumulative = weights.cumsum(0);
-        let total = cumulative.clone().narrow(0, n - 1, 1);
         // Rounding an f64 draw to f32 must not include the upper endpoint.
         let draw = (sampler.random.random::<f64>() as f32).min(f32::from_bits(1f32.to_bits() - 1));
-        let rank = cumulative.greater(total * draw).int().argmax(0);
-        Ok(checked(original, indices.gather(0, rank).reshape([1])))
+        Ok(DeviceToken(super::selection::select(
+            original, cumulative, indices, draw,
+        )))
     }
     async fn sample_host<S: HostSampler>(self, sampler: &mut S) -> Result<DeviceToken, Error> {
         let device = self.0.device();
@@ -159,6 +159,12 @@ mod tests {
                 for values in [
                     vec![0.1, 2.3, -1.7, 0.9, f32::NEG_INFINITY],
                     vec![2., 2., 0., -1.],
+                    (0..2048)
+                        .map(|i| ((i * 31) % 137) as f32 / 16. - 4.)
+                        .collect(),
+                    (0..3072)
+                        .map(|i| ((i * 47) % 173) as f32 / 16. - 5.)
+                        .collect(),
                 ] {
                     let mut host = Multinomial::new(StdRng::seed_from_u64(42), parameters);
                     let mut gpu = Multinomial::new(StdRng::seed_from_u64(42), parameters);

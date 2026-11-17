@@ -4,6 +4,7 @@ mod codec_decoder;
 mod gemv;
 mod layers;
 pub mod sampling;
+mod selection;
 mod sort;
 pub use codec_decoder::{CodecDecoder, CodecDecoderConfig};
 mod codec_encoder;
