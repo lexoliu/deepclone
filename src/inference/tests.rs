@@ -399,3 +399,111 @@ fn incremental_cjk_and_english_inputs_preserve_context_boundaries_and_pcm() {
         }
     });
 }
+
+#[cfg(all(feature = "cli", target_vendor = "apple"))]
+#[test]
+#[ignore = "requires Core ML models, a private recording and a long-form prompt"]
+fn real_coreml_long_stream_preserves_codes_and_contiguous_pcm() {
+    use crate::sampling::{Multinomial, Parameters};
+    use ondevice_coreml::ComputeUnits;
+    use rand::{SeedableRng, rngs::StdRng};
+    use std::path::PathBuf;
+    futures_lite::future::block_on(async {
+        let directory = |key| PathBuf::from(std::env::var_os(key).expect(key));
+        let output = directory("DEEPCLONE_OUTPUT");
+        std::fs::create_dir_all(&output).unwrap();
+        let reference_path = directory("DEEPCLONE_REFERENCE");
+        let mut reader = hound::WavReader::open(reference_path.join("reference.wav")).unwrap();
+        let samples = reader
+            .samples::<f32>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let transcript: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(reference_path.join("reference.json")).unwrap())
+                .unwrap();
+        let prompts: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(directory("DEEPCLONE_PROMPTS")).unwrap())
+                .unwrap();
+        let parameters = Parameters::new(0.9, NonZeroUsize::new(50), 1.).unwrap();
+        let mut engine = Engine::open(
+            &directory("DEEPCLONE_TRANSFORMERS"),
+            &directory("DEEPCLONE_AUDIO_MODELS"),
+            ComputeUnits::CpuAndNeuralEngine,
+            Sampling {
+                talker: Multinomial::new(StdRng::seed_from_u64(42), parameters),
+                predictor: Multinomial::new(StdRng::seed_from_u64(42), parameters),
+                repetition: RepetitionPenalty::new(1.05).unwrap(),
+                minimum_frames: 2,
+            },
+        )
+        .unwrap();
+        let reference = engine
+            .reference(
+                &samples,
+                reader.spec().sample_rate,
+                transcript["text"].as_str().unwrap(),
+            )
+            .await
+            .unwrap();
+        let maximum = NonZeroUsize::new(512).unwrap(); // Former total stream frame limit.
+        let mut session = engine
+            .session(
+                &reference,
+                prompts[0]["language"].as_str().unwrap(),
+                SynthesisOptions::new(maximum),
+            )
+            .unwrap();
+        session
+            .push_text(prompts[0]["text"].as_str().unwrap())
+            .unwrap();
+        session.finish_input().unwrap();
+        let mut samples = Vec::new();
+        while !session.finished {
+            match session.next_chunk(12, || false).await {
+                Ok(Some(chunk)) => {
+                    assert_eq!(chunk.start_sample, samples.len());
+                    samples.extend(chunk.samples);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    std::fs::write(
+                        output.join("failure.codes.json"),
+                        serde_json::to_vec(
+                            &serde_json::json!({"codes":session.codes,"segments":session.segments}),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    panic!("long-form decoding failed after saving its acoustic codes: {error}");
+                }
+            }
+        }
+        let generation = session.into_generation().unwrap();
+        std::fs::write(
+            output.join("long.codes.json"),
+            serde_json::to_vec(&generation).unwrap(),
+        )
+        .unwrap();
+        assert!(generation.generated_frames() > maximum.get());
+        assert!(generation.segments.len() > 1);
+        assert_eq!(
+            generation.generated_frames() * engine.decoder_contract.samples_per_frame,
+            samples.len()
+        );
+        let mut writer = hound::WavWriter::create(
+            output.join("long.wav"),
+            hound::WavSpec {
+                channels: 2,
+                sample_rate: engine.sample_rate(),
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            },
+        )
+        .unwrap();
+        for sample in samples {
+            writer.write_sample(sample).unwrap();
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+    });
+}
