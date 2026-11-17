@@ -50,6 +50,7 @@ impl BatchedProjection for CubeBackend {
             weight.clone().into_tensor_arg(),
             output.clone().into_tensor_arg(),
             weight.meta.strides()[0] == 1,
+            input.meta.strides()[1] < input.meta.strides()[2],
             tile,
             [
                 dtype_to_storage_type(input.dtype),
@@ -66,6 +67,7 @@ fn projection_kernel<F: Float, W: Float>(
     weight: &Tensor<W>,
     output: &mut Tensor<F>,
     #[comptime] transposed: bool,
+    #[comptime] input_transposed: bool,
     #[comptime] tile: usize,
     #[define(F, W)] _dtypes: [ElemType; 2],
 ) {
@@ -81,12 +83,30 @@ fn projection_kernel<F: Float, W: Float>(
     let mut right = Shared::<[F]>::new_slice(tile * tile);
     let sum = RuntimeCell::<f32>::new(0f32);
     for block in 0..k.div_ceil(tile) {
-        let left_k = block * tile + local_column;
+        // Channel-first convolutions expose time as the contiguous input axis.
+        // Read that axis cooperatively, transposing only the shared-memory tile.
+        let input_row = (CUBE_POS_Y as usize) * tile
+            + if input_transposed {
+                local_column
+            } else {
+                local_row
+            };
+        let input_k = block * tile
+            + if input_transposed {
+                local_row
+            } else {
+                local_column
+            };
         let mut a = F::new(0_f32);
-        if row < input.shape(1) && left_k < k {
-            a = input[batch * input.stride(0) + row * input.stride(1) + left_k * input.stride(2)];
+        if input_row < input.shape(1) && input_k < k {
+            a = input
+                [batch * input.stride(0) + input_row * input.stride(1) + input_k * input.stride(2)];
         }
-        left[local_row * tile + local_column] = a;
+        if input_transposed {
+            left[local_column * tile + local_row] = a;
+        } else {
+            left[local_row * tile + local_column] = a;
+        }
         // Read the contiguous dimension cooperatively for either weight layout.
         let weight_k = block * tile + if transposed { local_column } else { local_row };
         let weight_n =
