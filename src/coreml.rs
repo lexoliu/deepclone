@@ -290,7 +290,7 @@ fn frame(function: &mut Function, codes: &[u32], text: &Tensor<f16>) -> Result<T
         .tensor("hidden")?)
 }
 
-pub fn embed(
+fn embed(
     function: &mut Function,
     token: u32,
     operation: &'static str,

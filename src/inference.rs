@@ -553,7 +553,7 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Session<'_, B, T, S> {
         self.input_finished = true;
         Ok(())
     }
-    fn open(&mut self) -> Result<(), Error> {
+    fn open(&mut self) -> Result<Active<B::Hidden>, Error> {
         let (prompt_start, prompt_end, prompt_text) = self.segments.last().map_or(
             (0, self.codes.reference_frames, self.initial_text),
             |span| {
@@ -610,7 +610,7 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Session<'_, B, T, S> {
                 .embed_code(0, self.config.talker_config.codec_bos_id)?,
         )?);
         let sequence = self.generator.start(prefill)?;
-        self.active = Some(Active {
+        Ok(Active {
             sequence,
             padding,
             tokens: remaining.iter().copied().collect(),
@@ -622,14 +622,9 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Session<'_, B, T, S> {
             maximum_frames,
             text_capacity,
             input_finished: false,
-        });
-        Ok(())
+        })
     }
-    fn close_input(&mut self) -> Result<(), Error> {
-        let active = self
-            .active
-            .as_mut()
-            .ok_or(Error::Contract("no active context"))?;
+    fn close_input(&mut self, active: &mut Active<B::Hidden>) -> Result<(), Error> {
         let tail = self.text.finish()?;
         active.target_tokens.extend_from_slice(&tail);
         active.tokens.extend(tail);
@@ -646,18 +641,20 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Session<'_, B, T, S> {
                 self.finished = self.input_finished;
                 return Ok(());
             }
-            self.open()?;
         }
-        while !self.active.as_ref().unwrap().input_finished {
-            let Some(next) = self.pending.front() else {
+        let mut active = match self.active.take() {
+            Some(active) => active,
+            None => self.open()?,
+        };
+        while !active.input_finished {
+            let Some(next) = self.pending.pop_front() else {
                 if self.input_finished {
-                    self.close_input()?;
+                    self.close_input(&mut active)?;
                 }
                 break;
             };
-            let active = self.active.as_ref().unwrap();
             let mut combined = active.text.clone();
-            combined.push_str(next);
+            combined.push_str(&next);
             let count = self
                 .tokenizer
                 .encode(combined.as_str(), false)
@@ -665,16 +662,16 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Session<'_, B, T, S> {
                 .len();
             if count > active.text_capacity {
                 if !active.text.is_empty() {
-                    self.close_input()?;
+                    self.pending.push_front(next);
+                    self.close_input(&mut active)?;
                     break;
                 }
-                // A previous generated prompt can leave less room than the
-                // initial recording. Repartition only this unconsumed sentence.
+                // The generated continuation prompt can leave less room than
+                // the initial recording. Repartition only unconsumed text.
                 let mut split = crate::utterances::Splitter::new(
                     active.text_capacity,
                     self.options.unstable_text_bytes.get(),
                 );
-                let next = self.pending.pop_front().unwrap();
                 let mut pieces = split.push(&next, self.tokenizer)?;
                 pieces.extend(split.finish(self.tokenizer)?);
                 for piece in pieces.into_iter().rev() {
@@ -682,19 +679,18 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Session<'_, B, T, S> {
                 }
                 continue;
             }
-            let next = self.pending.pop_front().unwrap();
             let paragraph = combined.contains("\n\n")
                 || combined.contains("\r\n\r\n")
                 || combined.contains('\u{2029}');
             let ids = self.text.push(&next)?;
-            let active = self.active.as_mut().unwrap();
             active.text.push_str(&next);
             active.target_tokens.extend_from_slice(&ids);
             active.tokens.extend(ids);
             if paragraph {
-                self.close_input()?;
+                self.close_input(&mut active)?;
             }
         }
+        self.active = Some(active);
         Ok(())
     }
     /// False means text starvation; neither padding nor EOS is fabricated.
