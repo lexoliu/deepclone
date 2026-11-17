@@ -1,6 +1,6 @@
 #![cfg(all(feature = "burn", feature = "cli"))]
 use deepclone::{
-    inference::{Engine, Sampling},
+    inference::{Engine, Sampling, SynthesisOptions},
     sampling::{Multinomial, Parameters, RepetitionPenalty},
 };
 use rand::{SeedableRng, rngs::StdRng};
@@ -53,7 +53,13 @@ fn cloned_speech_completes_in_four_languages() {
             ("Korean", "오늘은 조용한 길을 걸으며 내일을 생각해 봅시다."),
         ] {
             let sample_rate = engine.sample_rate();
-            let mut session = engine.session(&voice, language, 512, usize::MAX).unwrap();
+            let mut session = engine
+                .session(
+                    &voice,
+                    language,
+                    SynthesisOptions::new(NonZeroUsize::new(512).unwrap()),
+                )
+                .unwrap();
             session.push_text(text).unwrap();
             session.finish_input().unwrap();
             let spec = hound::WavSpec {

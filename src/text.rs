@@ -37,24 +37,7 @@ impl<'a> TextBuffer<'a> {
         let mut boundary = splits.len().checked_sub(2).map_or(0, |i| splits[i].1.0);
         // Added tokens are recognized before pre-tokenization, including tokens
         // split across network messages. Do not commit any prefix of one.
-        for token in self.tokenizer.get_added_tokens_decoder().values() {
-            for (start, _) in self.tail.char_indices() {
-                if start >= boundary {
-                    break;
-                }
-                let remaining = &self.tail[start..];
-                if token.content.starts_with(remaining)
-                    || (remaining.starts_with(&token.content)
-                        && start + token.content.len() > boundary)
-                {
-                    boundary = start;
-                    if token.lstrip {
-                        boundary = self.tail[..boundary].trim_end().len();
-                    }
-                    break;
-                }
-            }
-        }
+        boundary = AddedBoundaries::new(self.tokenizer, &self.tail, true).before(boundary);
         let ids = self
             .tokenizer
             .encode(&self.tail[..boundary], false)
@@ -80,8 +63,51 @@ impl<'a> TextBuffer<'a> {
     }
 }
 
+/// Protect complete added-token spans and possible unfinished suffixes.
+pub(crate) struct AddedBoundaries {
+    spans: Vec<std::ops::Range<usize>>,
+    unstable: usize,
+}
+impl AddedBoundaries {
+    pub(crate) fn new(tokenizer: &Tokenizer, tail: &str, incomplete: bool) -> Self {
+        let mut spans = Vec::new();
+        let mut unstable = tail.len();
+        for token in tokenizer
+            .get_added_vocabulary()
+            .get_added_tokens_decoder()
+            .values()
+        {
+            for (start, _) in tail.char_indices() {
+                let remaining = &tail[start..];
+                let begin = if token.lstrip {
+                    tail[..start].trim_end().len()
+                } else {
+                    start
+                };
+                if incomplete && token.content.starts_with(remaining) {
+                    unstable = unstable.min(begin);
+                }
+                if remaining.starts_with(&token.content) {
+                    spans.push(begin..start + token.content.len());
+                }
+            }
+        }
+        spans.sort_unstable_by_key(|span| std::cmp::Reverse(span.start));
+        Self { spans, unstable }
+    }
+    pub(crate) fn before(&self, boundary: usize) -> usize {
+        let mut boundary = boundary.min(self.unstable);
+        for span in &self.spans {
+            if span.start < boundary && boundary < span.end {
+                boundary = span.start;
+            }
+        }
+        boundary
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tokenizers::{
         AddedToken,
@@ -94,7 +120,7 @@ mod tests {
         },
     };
 
-    fn tokenizer() -> Tokenizer {
+    pub(crate) fn tokenizer() -> Tokenizer {
         let mut alphabet: Vec<_> = ByteLevel::alphabet().into_iter().collect();
         alphabet.sort();
         let vocab: Vocab = alphabet

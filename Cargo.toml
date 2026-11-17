@@ -17,7 +17,7 @@ burn = ["dep:burn", "dep:safetensors", "inference"]
 sampling = ["dep:rand", "dep:thiserror"]
 coreml = ["dep:ondevice-coreml", "dep:thiserror"]
 generation = ["sampling"]
-inference = ["generation", "dep:serde", "dep:serde_json", "dep:tokenizers", "dep:realfft"]
+inference = ["generation", "dep:serde", "dep:serde_json", "dep:tokenizers", "dep:realfft", "dep:unicode-segmentation"]
 streaming = ["inference", "dep:tracing", "dep:async-channel", "dep:futures-lite", "dep:tokio"]
 download = ["dep:ondevice"]
 http = ["download", "ondevice/zenwave"]
@@ -43,6 +43,7 @@ serde = { version = "1.0.229", default-features = false, features = ["derive", "
 serde_json = { version = "1.0.154", default-features = false, features = ["std"], optional = true }
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"], optional = true }
 realfft = { version = "3.5.1", default-features = false, optional = true }
+unicode-segmentation = { version = "1.13.3", default-features = false, optional = true }
 clap = { version = "4.6.7", default-features = false, features = ["derive", "std", "help", "usage", "error-context"], optional = true }
 hound = { version = "3.5.1", default-features = false, optional = true }
 tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }

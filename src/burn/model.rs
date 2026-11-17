@@ -152,9 +152,14 @@ impl Model for Burn {
     fn groups(&self) -> usize {
         self.codes.len()
     }
-    fn reset(&mut self) {
+    fn context_capacity(&self) -> usize {
+        self.talker.capacity()
+    }
+    fn reset_generation(&mut self) {
         self.talker.reset();
         self.predictor.reset();
+    }
+    fn reset_waveform(&mut self) {
         self.decoder_cache = self
             .reference_decoder_cache
             .clone()

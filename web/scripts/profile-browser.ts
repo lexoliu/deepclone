@@ -56,6 +56,9 @@ const profiler =
     ? await browser.newBrowserCDPSession()
     : null;
 const shaderCaptures: Promise<void>[] = [];
+const diagnosticCaptures: Promise<void>[] = [];
+const diagnostics: unknown[] = [];
+let activeRun = 0;
 let shaderIndex = 0;
 let profileSession: string | undefined;
 profiler?.on("Target.detachedFromTarget", ({ sessionId }) => {
@@ -110,9 +113,20 @@ page.on("console", (event) => {
   if (event.type() === "error") process.stderr.write(`${event.text()}\n`);
   if (
     event.text().startsWith("Speech codec timing") ||
+    event.text().startsWith("Speech chunk timing") ||
+    event.text().startsWith("Speech playback timing") ||
     event.text().startsWith("Speech diagnostic phase")
-  )
+  ) {
     process.stdout.write(`${JSON.stringify({ codec: event.text() })}\n`);
+    const run = activeRun;
+    diagnosticCaptures.push(
+      Promise.all(event.args().map((argument) => argument.jsonValue())).then(
+        (args) => {
+          diagnostics.push({ run, args });
+        },
+      ),
+    );
+  }
 });
 try {
   await page.goto(values.url!);
@@ -188,6 +202,7 @@ try {
     }
   }
   for (let run = 1; run <= runs; run++) {
+    activeRun = run;
     const measured = page.waitForEvent("console", {
       predicate: (event) => event.text().startsWith("Speech generation timing"),
       timeout,
@@ -284,7 +299,11 @@ try {
       });
     }
   } finally {
-    await Promise.all(shaderCaptures);
+    await Promise.all([...shaderCaptures, ...diagnosticCaptures]);
+    await writeFile(
+      join(values.output!, "diagnostics.json"),
+      JSON.stringify(diagnostics, null, 2),
+    );
     await page.close();
     await browser.close();
   }
