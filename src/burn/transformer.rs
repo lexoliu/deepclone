@@ -211,6 +211,9 @@ impl Decoder {
     pub fn reset(&mut self) {
         self.position = 0;
     }
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
     pub fn step(&mut self, mut hidden: Tensor<3>) -> Result<Tensor<3>, Error> {
         let [batch, tokens, width] = hidden.dims();
         if tokens > self.capacity - self.position {

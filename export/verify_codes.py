@@ -45,7 +45,8 @@ def main():
     reports = {}
     with torch.inference_mode():
         for path in args.codes:
-            exported = json.loads(path.read_text())["codes"]
+            generation = json.loads(path.read_text())
+            exported = generation["codes"]
             groups = exported["groups"]
             if groups != contract["code_groups"]:
                 raise ValueError("Code groups differ from decoder contract")
@@ -82,6 +83,7 @@ def main():
             name = path.name.removesuffix(".codes.json")
             rate = contract["sample_rate"]
             reports[name] = {
+                "segments": generation["segments"],
                 "frames": codes.shape[-1],
                 "reference_frames": exported["reference_frames"],
                 "incremental_fp32": metrics(rewritten, expected),
