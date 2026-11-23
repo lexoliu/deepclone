@@ -115,7 +115,8 @@ jobs:
         with:
           bun-version: 1.4.2
       - run: bun install --cwd web --frozen-lockfile
-      - run: bun audit --cwd web
+      - run: bun test ./.github/scripts/audit_web.test.ts
+      - run: bun run .github/scripts/audit_web.ts
       - run: bun run --cwd web test
       - run: bun run --cwd web build
       - run: bun run --cwd web playwright install --with-deps chromium

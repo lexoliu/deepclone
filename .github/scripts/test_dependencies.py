@@ -31,6 +31,14 @@ class DependencyPolicy(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unresolved advisory"):
             validate(self.active, audit)
 
+    def test_new_zip_exception_is_still_rejected_when_reachable(self):
+        audit = copy.deepcopy(self.audit)
+        for advisory in ["RUSTSEC-2026-0548", "RUSTSEC-2026-0545"]:
+            audit["vulnerabilities"]["list"][0]["advisory"]["id"] = advisory
+            validate(self.active, audit)
+            with self.assertRaisesRegex(ValueError, "Unresolved advisory"):
+                validate({("zip", "0.6.6")}, audit)
+
     def test_libtorch_is_rejected_even_without_advisories(self):
         self.active.add(("tch", "0.22.0"))
         with self.assertRaisesRegex(ValueError, "LibTorch"):

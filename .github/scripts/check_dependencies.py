@@ -13,6 +13,8 @@ DORMANT = {
         "RUSTSEC-2026-0367",
         "RUSTSEC-2026-0368",
         "RUSTSEC-2026-0369",
+        "RUSTSEC-2026-0548",
+        "RUSTSEC-2026-0545",
     },
     ("zstd-safe", "5.0.2+zstd.1.5.2"): {
         "RUSTSEC-2026-0403",
