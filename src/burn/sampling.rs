@@ -103,7 +103,7 @@ impl Logits for DeviceLogits {
             let excluded = sorted.clone().lower(cutoff);
             sorted = sorted.mask_fill(excluded, f32::NEG_INFINITY);
         }
-        let maximum = sorted.clone().max_dim(0);
+        let maximum = sorted.clone().narrow(0, 0, 1);
         let mut weights = ((sorted - maximum) / sampler.parameters.temperature).exp();
         if sampler.parameters.top_p < 1. {
             let threshold = weights.clone().sum_dim(0) * sampler.parameters.top_p;
@@ -176,14 +176,29 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(read_tokens(&[token]).await.unwrap(), [1]);
+            let parameters = Parameters::new(0.9, NonZeroUsize::new(1), 1.).unwrap();
+            let mut sampler = Multinomial::new(StdRng::seed_from_u64(42), parameters);
             for values in [vec![f32::NAN, 1.], vec![f32::INFINITY, 1.]] {
                 let token = scores(&device, &values).greedy().unwrap();
                 assert!(matches!(
                     read_tokens(&[token]).await,
                     Err(Error::InvalidLogits)
                 ));
+                let token = sampler.sample(scores(&device, &values)).await.unwrap();
+                assert!(matches!(
+                    read_tokens(&[token]).await,
+                    Err(Error::InvalidLogits)
+                ));
             }
             let token = scores(&device, &[f32::NEG_INFINITY; 2]).greedy().unwrap();
+            assert!(matches!(
+                read_tokens(&[token]).await,
+                Err(Error::NoCandidate)
+            ));
+            let token = sampler
+                .sample(scores(&device, &[f32::NEG_INFINITY; 2]))
+                .await
+                .unwrap();
             assert!(matches!(
                 read_tokens(&[token]).await,
                 Err(Error::NoCandidate)

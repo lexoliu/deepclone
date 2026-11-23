@@ -30,10 +30,14 @@ pub(super) fn descending(input: BurnTensor<1>) -> (BurnTensor<1>, BurnTensor<1, 
 impl VocabularySort for CubeBackend {
     fn vocabulary_sort(input: FloatTensor<Self>) -> (FloatTensor<Self>, IntTensor<Self>) {
         let shape = input.shape();
-        let padded = shape.num_elements().next_power_of_two();
+        let len = shape.num_elements();
+        let padded = len.next_power_of_two();
+        let shared_slots =
+            input.client.properties().hardware.max_shared_memory_size / size_of::<u32>();
+        let cached_scores = if padded + len <= shared_slots { len } else { 0 };
         let values = Self::float_empty(shape.clone(), &input.device, FloatDType::F32);
         let indices = Self::int_empty(shape, &input.device, IntDType::I32);
-        let dim = CubeDim::new(&input.client, padded);
+        let dim = CubeDim::new(&input.client, (padded / 2).max(1));
         stable_sort::launch(
             &input.client,
             CubeCount::Static(1, 1, 1),
@@ -42,6 +46,7 @@ impl VocabularySort for CubeBackend {
             values.clone().into_tensor_arg(),
             indices.clone().into_tensor_arg(),
             padded,
+            cached_scores,
         );
         (values, indices)
     }
@@ -53,13 +58,18 @@ fn stable_sort(
     values: &mut Tensor<f32>,
     indices: &mut Tensor<i32>,
     #[comptime] padded: usize,
+    #[comptime] cached_scores: usize,
 ) {
-    // Sorting indices needs half the shared storage of sorting (value,index) pairs.
-    let mut order = Shared::<[u32]>::new_slice(padded);
+    // The first padded slots hold indices. If space permits, the remaining
+    // slots cache the original scores without duplicating the padded values.
+    let mut data = Shared::<[u32]>::new_slice(padded + cached_scores);
     let n = input.shape(0);
     let mut i = UNIT_POS as usize;
     while i < padded {
-        order[i] = i as u32;
+        data[i] = i as u32;
+        if cached_scores > 0 && i < n {
+            data[padded + i] = u32::reinterpret(input[i * input.stride(0)]);
+        }
         i += CUBE_DIM as usize;
     }
     sync_cube();
@@ -67,30 +77,40 @@ fn stable_sort(
     while size <= padded {
         let mut distance = size / 2;
         while distance > 0 {
-            let mut i = UNIT_POS as usize;
-            while i < padded {
-                let other = i ^ distance;
-                if other > i {
-                    let a = order[i];
-                    let b = order[other];
-                    let before = if (a as usize) < n {
-                        if (b as usize) < n {
-                            let av = input[a as usize * input.stride(0)];
-                            let bv = input[b as usize * input.stride(0)];
-                            av > bv || (av == bv && a < b)
+            let mut pair = UNIT_POS as usize;
+            while pair < padded / 2 {
+                // Insert a zero at distance's bit to enumerate only the lower
+                // side of each independent compare-exchange pair.
+                let low = distance - 1;
+                let i = ((pair & !low) << 1) | (pair & low);
+                let other = i + distance;
+                let a = data[i] as usize;
+                let b = data[other] as usize;
+                let before = if a < n {
+                    if b < n {
+                        let av = if cached_scores > 0 {
+                            f32::reinterpret(data[padded + a])
                         } else {
-                            true
-                        }
+                            input[a * input.stride(0)]
+                        };
+                        let bv = if cached_scores > 0 {
+                            f32::reinterpret(data[padded + b])
+                        } else {
+                            input[b * input.stride(0)]
+                        };
+                        av > bv || (av == bv && a < b)
                     } else {
-                        if (b as usize) < n { false } else { a < b }
-                    };
-                    let descending = (i & size) == 0;
-                    if descending != before {
-                        order[i] = b;
-                        order[other] = a;
+                        true
                     }
+                } else {
+                    b >= n && a < b
+                };
+                let descending = (i & size) == 0;
+                if descending != before {
+                    data[i] = b as u32;
+                    data[other] = a as u32;
                 }
-                i += CUBE_DIM as usize;
+                pair += CUBE_DIM as usize;
             }
             sync_cube();
             distance /= 2;
@@ -99,8 +119,12 @@ fn stable_sort(
     }
     let mut i = UNIT_POS as usize;
     while i < n {
-        let original = order[i] as usize;
-        values[i] = input[original * input.stride(0)];
+        let original = data[i] as usize;
+        values[i] = if cached_scores > 0 {
+            f32::reinterpret(data[padded + original])
+        } else {
+            input[original * input.stride(0)]
+        };
         indices[i] = original as i32;
         i += CUBE_DIM as usize;
     }
