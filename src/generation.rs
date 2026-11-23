@@ -192,7 +192,9 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Generator<B, T, S> {
             let logits = networks.predictor_head(index, hidden).await?;
             tokens.push(selection.predictor.sample(logits).await?);
         }
-        let codes = networks.read_tokens(&tokens).await?;
+        let mut codes = Vec::with_capacity(tokens.len());
+        codes.push(first);
+        codes.extend(networks.read_tokens(&tokens[1..]).await?);
         let embedded = networks.frame(&codes, text)?;
         let hidden = networks.talker(embedded)?;
         sequence.pending = Some(hidden);
