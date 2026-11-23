@@ -1,6 +1,6 @@
 mod cli_io;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(all(feature = "coreml", target_vendor = "apple"))]
 use deepclone::streaming::Load;
 use deepclone::{
@@ -49,17 +49,46 @@ enum Command {
 
 #[derive(clap::Args)]
 struct Download {
-    #[arg(long, value_parser = parse_model, help = "Published model: 0.6b or 1.7b")]
-    model: Bundle<'static>,
+    #[arg(long, value_enum, help = "Published model")]
+    model: ModelSize,
+    #[arg(long, value_enum, default_value = "cpu-and-ne")]
+    compute_units: Compute,
     #[arg(long, help = "Content-addressed model cache directory")]
     cache_dir: PathBuf,
 }
 
-fn parse_model(value: &str) -> Result<Bundle<'static>, String> {
-    match value {
-        "0.6b" => Ok(deepclone::models::qwen3_tts_0_6b()),
-        "1.7b" => Ok(deepclone::models::qwen3_tts_1_7b()),
-        _ => Err("model must be 0.6b or 1.7b".into()),
+#[derive(Clone, Copy, ValueEnum)]
+enum ModelSize {
+    #[value(name = "0.6b")]
+    Small,
+    #[value(name = "1.7b")]
+    Large,
+}
+
+impl ModelSize {
+    fn bundle(self, compute: Compute) -> Bundle<'static> {
+        match (self, compute) {
+            (Self::Small, Compute::CpuAndNe) => deepclone::models::qwen3_tts_0_6b(),
+            (Self::Small, _) => deepclone::models::qwen3_tts_0_6b_fixed_shape(),
+            (Self::Large, _) => deepclone::models::qwen3_tts_1_7b(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Compute {
+    Cpu,
+    CpuAndNe,
+    All,
+}
+
+impl Compute {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::CpuAndNe => "cpu-and-ne",
+            Self::All => "all",
+        }
     }
 }
 
@@ -73,8 +102,13 @@ struct Synthesize {
     transformers: Option<PathBuf>,
     #[arg(long, required_unless_present_any = ["model", "burn_model"], conflicts_with = "model")]
     audio_models: Option<PathBuf>,
-    #[arg(long, value_parser = parse_model, requires = "cache_dir", help = "Download or reuse published model: 0.6b or 1.7b")]
-    model: Option<Bundle<'static>>,
+    #[arg(
+        long,
+        value_enum,
+        requires = "cache_dir",
+        help = "Download or reuse a published model"
+    )]
+    model: Option<ModelSize>,
     #[arg(long, requires = "model")]
     cache_dir: Option<PathBuf>,
     #[arg(long, help = "Mono or multichannel WAV at the model sample rate")]
@@ -134,8 +168,8 @@ struct Synthesize {
     seed: u64,
     #[arg(long)]
     greedy: bool,
-    #[arg(long,default_value="cpu-and-ne",value_parser=["cpu","cpu-and-ne","all"])]
-    compute_units: String,
+    #[arg(long, value_enum, default_value = "cpu-and-ne")]
+    compute_units: Compute,
     // Sampling defaults from Qwen3TTSModel._merge_generate_kwargs.
     #[arg(long, default_value_t = 0.9)]
     temperature: f32,
@@ -149,7 +183,7 @@ struct Synthesize {
 
 #[cfg(test)]
 mod tests {
-    use super::Args;
+    use super::{Args, Compute, ModelSize};
     use clap::{CommandFactory, Parser};
 
     #[test]
@@ -241,6 +275,20 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn published_06b_uses_fixed_shapes_for_cpu() {
+        let realtime = deepclone::models::qwen3_tts_0_6b();
+        let fixed_shape = deepclone::models::qwen3_tts_0_6b_fixed_shape();
+        assert_eq!(
+            ModelSize::Small.bundle(Compute::CpuAndNe).pin().url,
+            realtime.pin().url
+        );
+        assert_eq!(
+            ModelSize::Small.bundle(Compute::Cpu).pin().url,
+            fixed_shape.pin().url
+        );
+    }
 }
 #[derive(Deserialize)]
 struct Transcript {
@@ -278,18 +326,17 @@ async fn run<T: TokenSampler + Send + 'static, S: TokenSampler + Send + 'static>
     predictor: S,
 ) -> Result<(), Box<dyn Error>> {
     #[cfg(all(feature = "coreml", target_vendor = "apple"))]
-    let units = match args.compute_units.as_str() {
-        "cpu" => ComputeUnits::CpuOnly,
-        "cpu-and-ne" => ComputeUnits::CpuAndNeuralEngine,
-        "all" => ComputeUnits::All,
-        _ => unreachable!("clap validates compute units"),
+    let units = match args.compute_units {
+        Compute::Cpu => ComputeUnits::CpuOnly,
+        Compute::CpuAndNe => ComputeUnits::CpuAndNeuralEngine,
+        Compute::All => ComputeUnits::All,
     };
     let paths = if args.burn_model.is_some() {
         None
     } else {
         Some(match (&args.model, &args.cache_dir) {
             (Some(model), Some(cache)) => {
-                let installed = download(model, cache).await?;
+                let installed = download(&model.bundle(args.compute_units), cache).await?;
                 (installed.transformers(), installed.audio())
             }
             _ => (
@@ -441,7 +488,7 @@ async fn run<T: TokenSampler + Send + 'static, S: TokenSampler + Send + 'static>
             requested_compute_units: args
                 .burn_model
                 .is_none()
-                .then_some(args.compute_units.as_str()),
+                .then_some(args.compute_units.name()),
             seed: args.seed,
             greedy: args.greedy,
             temperature: args.temperature,
@@ -586,7 +633,7 @@ async fn download(
 async fn execute(command: Command) -> Result<(), Box<dyn Error>> {
     let args = match command {
         Command::Download(args) => {
-            download(&args.model, &args.cache_dir).await?;
+            download(&args.model.bundle(args.compute_units), &args.cache_dir).await?;
             return Ok(());
         }
         Command::Synthesize(args) => args,

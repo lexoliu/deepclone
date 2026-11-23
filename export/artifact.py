@@ -31,7 +31,7 @@ def enumerated_axis(value, axes, lengths):
     return ct.EnumeratedShapes(shapes, default=default)
 
 
-def save(model, output, weight_bits):
+def save(model, output, weight_bits, *, placement_units=ct.ComputeUnit.CPU_AND_NE):
     if output.exists():
         raise FileExistsError(output)
     if weight_bits in (4, 8):
@@ -52,7 +52,7 @@ def save(model, output, weight_bits):
         compiled = staging / output.name
         model.save(str(package))
         ct.models.utils.compile_model(str(package), destination_path=str(compiled))
-        report = placement(compiled)
+        report = placement(compiled, placement_units)
         report["weight_bits"] = weight_bits
         report["compiled_bytes"] = sum(
             p.stat().st_size for p in compiled.rglob("*") if p.is_file()
@@ -63,10 +63,8 @@ def save(model, output, weight_bits):
         report_path.replace(output.with_suffix(".json"))
 
 
-def placement(path):
-    plan = MLComputePlan.load_from_path(
-        str(path), compute_units=ct.ComputeUnit.CPU_AND_NE
-    )
+def placement(path, units):
+    plan = MLComputePlan.load_from_path(str(path), compute_units=units)
     counts = Counter()
 
     def visit(block):
@@ -84,7 +82,7 @@ def placement(path):
     for function in plan.model_structure.program.functions.values():
         visit(function.block)
     return {
-        "requested_compute_units": "CPU_AND_NE",
+        "requested_compute_units": units.name,
         "evidence": "compiler compute plan; not runtime utilization",
         "operations": [
             {"operator": operator, "preferred_device": device, "count": count}
@@ -94,7 +92,16 @@ def placement(path):
 
 
 def convert(
-    module, inputs, names, outputs, output, weight_bits, states=(), shapes=None
+    module,
+    inputs,
+    names,
+    outputs,
+    output,
+    weight_bits,
+    states=(),
+    shapes=None,
+    *,
+    placement_units=ct.ComputeUnit.CPU_AND_NE,
 ):
     module.eval()
     with torch.inference_mode():
@@ -123,4 +130,4 @@ def convert(
         compute_precision=ct.precision.FLOAT16,
         skip_model_load=True,
     )
-    save(model, output, weight_bits)
+    save(model, output, weight_bits, placement_units=placement_units)

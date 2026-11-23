@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 import coremltools as ct
 import numpy as np
 import torch
+from coremltools.models.compute_device import MLNeuralEngineComputeDevice
 from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSTalkerConfig
 from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSTalkerDecoderLayer
 
@@ -72,16 +73,32 @@ class Prefill(unittest.TestCase):
                     torch.testing.assert_close(value, states[name])
 
     def test_native_mixed_lengths_preserve_kv_state_and_reset(self):
-        # Use the shipped cache layout to exercise the same native state path.
-        count = 16
-        model, inputs = self.fixture(1024, 16, 8, 128, 3072, 1024, count)
+        devices = ct.models.MLModel.get_available_compute_devices()
+        has_ane = any(
+            isinstance(device, MLNeuralEngineComputeDevice) for device in devices
+        )
+        # Check the shipped flexible graph on ANE and native batched state
+        # updates with a fixed-shape graph on the virtual CPU runner.
+        dimensions = (
+            (1024, 16, 8, 128, 3072, 1024) if has_ane else (32, 4, 2, 8, 64, 16)
+        )
+        units = ct.ComputeUnit.CPU_AND_NE if has_ane else ct.ComputeUnit.CPU_ONLY
+        lengths = [4, 1, 8, 1, 1, 1] if has_ane else [4] * 4
+        count = sum(lengths)
+        model, inputs = self.fixture(*dimensions, count)
         model.half()
         names = ["hidden", "cosine", "sine", "mask"]
-        examples = tuple(value.half() for value in inputs(0, 1))
-        shapes = {
-            name: enumerated_axis(value, (axis,), [1, 4, 8])
-            for name, value, axis in zip(names, examples, [3, 3, 3, 2])
-        }
+        examples = tuple(
+            value.half() for value in inputs(0, 1 if has_ane else lengths[0])
+        )
+        shapes = (
+            {
+                name: enumerated_axis(value, (axis,), [1, 4, 8])
+                for name, value, axis in zip(names, examples, [3, 3, 3, 2])
+            }
+            if has_ane
+            else None
+        )
         with TemporaryDirectory() as directory:
             output = Path(directory) / "decoder.mlmodelc"
             convert(
@@ -93,15 +110,14 @@ class Prefill(unittest.TestCase):
                 16,
                 list(model.named_buffers()),
                 shapes,
+                placement_units=units,
             )
-            native = ct.models.CompiledMLModel(
-                str(output), compute_units=ct.ComputeUnit.CPU_AND_NE
-            )
+            native = ct.models.CompiledMLModel(str(output), compute_units=units)
             for _ in range(2):
                 state = native.make_state()
                 model.reset()
                 offset = 0
-                for length in [4, 1, 8, 1, 1, 1]:
+                for length in lengths:
                     batch = tuple(value.half() for value in inputs(offset, length))
                     with torch.inference_mode():
                         expected = model(*batch).float().numpy()
