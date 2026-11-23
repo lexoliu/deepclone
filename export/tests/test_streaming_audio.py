@@ -47,7 +47,7 @@ def decoder():
     return model
 
 
-def metadata(model, position, dtype):
+def metadata(model, position, dtype, frames=1):
     rotary = model.pre_transformer.rotary_emb
     return rotary_metadata(
         rotary.inv_freq,
@@ -55,6 +55,7 @@ def metadata(model, position, dtype):
         model.config.sliding_window,
         position,
         dtype,
+        frames,
     )
 
 
@@ -163,6 +164,17 @@ class StreamingAudio(unittest.TestCase):
                 torch.testing.assert_close(
                     torch.cat(parts, dim=-1), expected, atol=1e-6, rtol=1e-4
                 )
+            streaming.reset()
+            parts = [
+                streaming(
+                    codes[..., start:end],
+                    *metadata(original, start, torch.float32, end - start),
+                )
+                for start, end in [(0, 1), (1, 7), (7, 9), (9, 17)]
+            ]
+            torch.testing.assert_close(
+                torch.cat(parts, dim=-1), expected, atol=1e-6, rtol=1e-4
+            )
             # A new official block must restart every convolution and KV state.
             streaming.reset()
             short = codes[..., -3:]

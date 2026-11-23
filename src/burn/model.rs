@@ -3,7 +3,10 @@ use super::{
     CodecDecoder, CodecDecoderConfig, CodecEncoder, Decoder, DecoderConfig, EncoderConfig, Speaker,
     SpeakerConfig, WeightSource, layers::Linear,
 };
-use crate::{generation::Model, inference::Error};
+use crate::{
+    generation::{Codec, Model},
+    inference::Error,
+};
 use burn::tensor::{DType, Device, Tensor, TensorData, activation};
 use serde::Deserialize;
 use std::num::NonZeroUsize;
@@ -51,11 +54,14 @@ pub struct Burn {
     projection: Option<Linear>,
     speaker: Speaker,
     encoder: CodecEncoder,
+    device: Device,
+    dtype: DType,
+}
+pub struct BurnCodec {
     decoder: CodecDecoder,
     decoder_cache: super::codec_decoder::CodecCache,
     reference_decoder_cache: Option<super::codec_decoder::CodecCache>,
     device: Device,
-    dtype: DType,
 }
 impl Burn {
     pub fn load(
@@ -65,7 +71,7 @@ impl Burn {
         config: SpeechConfig,
         codec: AudioConfig,
         capacity: NonZeroUsize,
-    ) -> Result<Self, Error> {
+    ) -> Result<(Self, BurnCodec), Error> {
         let c = config.talker_config;
         if c.hidden_act != "silu" {
             return Err(Error::Contract("unsupported text projection activation"));
@@ -86,37 +92,42 @@ impl Burn {
         };
         let decoder = CodecDecoder::load(audio, &codec.decoder_config)?;
         let decoder_cache = decoder.cache();
-        Ok(Self {
-            talker: Decoder::load(speech, "talker.model", c.decoder, capacity)?,
-            predictor: Decoder::load(
-                speech,
-                "talker.code_predictor.model",
-                c.code_predictor_config,
-                NonZeroUsize::new(c.num_code_groups + 1)
-                    .ok_or(Error::Contract("empty code groups"))?,
-            )?,
-            text: speech.tensor("talker.model.text_embedding.weight")?,
-            text_first: Linear::load(speech, "talker.text_projection.linear_fc1")?,
-            text_last: Linear::load(speech, "talker.text_projection.linear_fc2")?,
-            codes,
-            talker_head: Linear::load(speech, "talker.codec_head")?,
-            predictor_heads: (0..c.num_code_groups - 1)
-                .map(|i| Linear::load(speech, &format!("talker.code_predictor.lm_head.{i}")))
-                .collect::<Result<_, _>>()?,
-            projection,
-            speaker: Speaker::load(conditioning, &config.speaker_encoder_config)?,
-            encoder: CodecEncoder::load(
-                audio,
-                &codec.encoder_config,
-                codec.encoder_valid_num_quantizers,
-                codec.encode_downsample_rate,
-            )?,
-            decoder,
-            decoder_cache,
-            reference_decoder_cache: None,
-            device: speech.device().clone(),
-            dtype: speech.dtype(),
-        })
+        Ok((
+            Self {
+                talker: Decoder::load(speech, "talker.model", c.decoder, capacity)?,
+                predictor: Decoder::load(
+                    speech,
+                    "talker.code_predictor.model",
+                    c.code_predictor_config,
+                    NonZeroUsize::new(c.num_code_groups + 1)
+                        .ok_or(Error::Contract("empty code groups"))?,
+                )?,
+                text: speech.tensor("talker.model.text_embedding.weight")?,
+                text_first: Linear::load(speech, "talker.text_projection.linear_fc1")?,
+                text_last: Linear::load(speech, "talker.text_projection.linear_fc2")?,
+                codes,
+                talker_head: Linear::load(speech, "talker.codec_head")?,
+                predictor_heads: (0..c.num_code_groups - 1)
+                    .map(|i| Linear::load(speech, &format!("talker.code_predictor.lm_head.{i}")))
+                    .collect::<Result<_, _>>()?,
+                projection,
+                speaker: Speaker::load(conditioning, &config.speaker_encoder_config)?,
+                encoder: CodecEncoder::load(
+                    audio,
+                    &codec.encoder_config,
+                    codec.encoder_valid_num_quantizers,
+                    codec.encode_downsample_rate,
+                )?,
+                device: speech.device().clone(),
+                dtype: speech.dtype(),
+            },
+            BurnCodec {
+                decoder,
+                decoder_cache,
+                reference_decoder_cache: None,
+                device: speech.device().clone(),
+            },
+        ))
     }
     fn embed(&self, table: &Tensor<2>, token: u32) -> Result<Tensor<3>, Error> {
         let [vocabulary, width] = table.dims();
@@ -135,6 +146,7 @@ impl Model for Burn {
     type Hidden = Tensor<3>;
     type Token = super::sampling::DeviceToken;
     type Logits = super::sampling::DeviceLogits;
+    type Codec = BurnCodec;
     fn code_token(&mut self, group: usize, token: &Self::Token) -> Result<Self::Hidden, Error> {
         let table = &self.codes[group];
         let width = table.dims()[1];
@@ -146,9 +158,6 @@ impl Model for Burn {
     async fn read_tokens(&self, tokens: &[Self::Token]) -> Result<Vec<u32>, Error> {
         Ok(super::sampling::read_tokens(tokens).await?)
     }
-    fn waveform_frames(&self, valid: usize, _capacity: usize) -> usize {
-        valid
-    }
     fn groups(&self) -> usize {
         self.codes.len()
     }
@@ -158,12 +167,6 @@ impl Model for Burn {
     fn reset_generation(&mut self) {
         self.talker.reset();
         self.predictor.reset();
-    }
-    fn reset_waveform(&mut self) {
-        self.decoder_cache = self
-            .reference_decoder_cache
-            .clone()
-            .unwrap_or_else(|| self.decoder.cache());
     }
     fn reset_predictor(&mut self) {
         self.predictor.reset();
@@ -265,15 +268,27 @@ impl Model for Burn {
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
-        // Prepare the official block containing the first generated frame once
-        // per voice. Each utterance clones its history; changed code prefixes
-        // invalidate it through the same decoder cache contract.
-        let context = crate::inference::codec_context_start(frames);
+        Ok((speaker, codes))
+    }
+}
+impl Codec for BurnCodec {
+    fn reset(&mut self) {
+        self.decoder_cache = self
+            .reference_decoder_cache
+            .clone()
+            .unwrap_or_else(|| self.decoder.cache());
+    }
+    async fn prepare_reference(&mut self, codes: &[Vec<u32>]) -> Result<(), Error> {
+        let groups = codes
+            .first()
+            .ok_or(Error::Contract("reference contains no codec frames"))?
+            .len();
+        let context = crate::inference::codec_context_start(codes.len());
         let packed = (0..groups)
-            .flat_map(|g| {
-                values[g * frames + context..(g + 1) * frames]
+            .flat_map(|group| {
+                codes[context..]
                     .iter()
-                    .copied()
+                    .map(move |frame| frame[group] as i32)
             })
             .collect();
         let mut checkpoint = self.decoder.cache();
@@ -281,15 +296,15 @@ impl Model for Burn {
             .prefix(
                 packed,
                 groups,
-                frames - context,
+                codes.len() - context,
                 &mut checkpoint,
                 &self.device,
             )
             .await?;
         self.reference_decoder_cache = Some(checkpoint);
-        Ok((speaker, codes))
+        Ok(())
     }
-    async fn waveform(
+    async fn decode_prefix(
         &mut self,
         packed: Vec<i32>,
         groups: usize,

@@ -106,7 +106,7 @@ impl ModelBuilder {
             samples_per_frame: audio.decode_upsample_rate,
             code_groups: audio.encoder_valid_num_quantizers,
         };
-        let backend = Burn::load(
+        let (backend, codec) = Burn::load(
             &self.weights,
             &self.weights,
             &self.weights,
@@ -124,6 +124,7 @@ impl ModelBuilder {
         };
         let engine = Engine::new(
             backend,
+            codec,
             Assets {
                 weight_bits: if self.precision == DType::F16 { 16 } else { 32 },
                 config: serde_json::from_str(config).map_err(error)?,

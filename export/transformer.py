@@ -4,6 +4,7 @@ Original implementation, MIT OR Apache-2.0. Weights retain their model license.
 """
 
 import math
+from types import SimpleNamespace
 
 import torch
 from torch import nn
@@ -11,31 +12,30 @@ from torch.nn import functional as F
 
 
 class Projection(nn.Module):
-    def __init__(self, linear, accumulation_width=128):
+    def __init__(self, linear):
         super().__init__()
-        self.accumulation_width = accumulation_width
         self.weight = nn.Parameter(linear.weight.detach().clone()[:, :, None, None])
         self.bias = (
             None if linear.bias is None else nn.Parameter(linear.bias.detach().clone())
         )
 
     def forward(self, x):
-        # Bound each half-precision reduction, then combine partial sums as a
-        # balanced tree rather than accumulating every channel sequentially.
-        width = self.accumulation_width
-        parts = [
-            F.conv2d(x[:, start : start + width], self.weight[:, start : start + width])
-            for start in range(0, self.weight.shape[1], width)
-        ]
-        while len(parts) > 1:
-            parts = [
-                parts[index] + parts[index + 1]
-                if index + 1 < len(parts)
-                else parts[index]
-                for index in range(0, len(parts), 2)
-            ]
-        output = parts[0]
-        return output if self.bias is None else output + self.bias.reshape(1, -1, 1, 1)
+        return F.conv2d(x, self.weight, self.bias)
+
+    @classmethod
+    def join(cls, *layers):
+        weight = torch.cat([layer.weight.detach() for layer in layers], dim=0)
+        bias = None
+        if any(layer.bias is not None for layer in layers):
+            bias = torch.cat(
+                [
+                    layer.bias.detach()
+                    if layer.bias is not None
+                    else layer.weight.new_zeros(layer.out_features)
+                    for layer in layers
+                ]
+            )
+        return cls(SimpleNamespace(weight=weight, bias=bias))
 
 
 class RmsNorm(nn.Module):
@@ -76,49 +76,58 @@ class DecoderLayer(nn.Module):
         self.input_norm = RmsNorm(layer.input_layernorm)
         self.post_norm = RmsNorm(layer.post_attention_layernorm)
         attention = layer.self_attn
-        self.query = Projection(attention.q_proj)
-        self.key = Projection(attention.k_proj)
-        self.value = Projection(attention.v_proj)
+        self.qkv = Projection.join(attention.q_proj, attention.k_proj, attention.v_proj)
         self.output = Projection(attention.o_proj)
         self.query_norm = RmsNorm(attention.q_norm, axis=2)
         self.key_norm = RmsNorm(attention.k_norm, axis=2)
-        self.gate = Projection(layer.mlp.gate_proj)
-        self.up = Projection(layer.mlp.up_proj)
+        self.gate_up = Projection.join(layer.mlp.gate_proj, layer.mlp.up_proj)
         self.down = Projection(layer.mlp.down_proj)
         self.heads = config.num_attention_heads
         self.kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.groups = self.heads // self.kv_heads
         self.scaling = self.head_dim**-0.5
+        self.widths = [
+            self.heads * self.head_dim,
+            self.kv_heads * self.head_dim,
+            self.kv_heads * self.head_dim,
+        ]
 
     def forward(self, hidden, cosine, sine, mask, keys, values):
+        length = hidden.shape[-1]
         normalized = self.input_norm(hidden)
-        query = self.query(normalized).reshape(1, self.heads, self.head_dim, 1)
-        key = self.key(normalized).reshape(1, self.kv_heads, self.head_dim, 1)
-        value = self.value(normalized).reshape(1, self.kv_heads, self.head_dim, 1)
+        query, key, value = self.qkv(normalized).split(self.widths, dim=1)
+        query = query.reshape(1, self.heads, self.head_dim, length)
+        key = key.reshape(1, self.kv_heads, self.head_dim, length)
+        value = value.reshape(1, self.kv_heads, self.head_dim, length)
         query = rotary(self.query_norm(query), cosine, sine)
         key = rotary(self.key_norm(key), cosine, sine)
         # Fixed-shape cache rotation keeps cache updates inside the execution
         # graph. The caller rejects context exhaustion instead of dropping tokens.
-        keys = torch.cat((keys[:, :, 1:, :], key.transpose(2, 3)), dim=2)
-        values = torch.cat((values[:, :, 1:, :], value.transpose(2, 3)), dim=2)
-        expanded_keys = keys.repeat_interleave(self.groups, dim=1)
-        expanded_values = values.repeat_interleave(self.groups, dim=1)
-        scores = (
-            torch.matmul(
-                query.transpose(2, 3) * self.scaling, expanded_keys.transpose(2, 3)
-            )
-            + mask
+        keys = torch.cat((keys[:, :, length:, :], key.transpose(2, 3)), dim=2)
+        values = torch.cat((values[:, :, length:, :], value.transpose(2, 3)), dim=2)
+        # Queries sharing a KV head occupy separate rows of the same matmul.
+        # Keep the cache resident once per KV head, including during prefill.
+        queries = query.transpose(2, 3).reshape(
+            1, self.kv_heads, self.groups * length, self.head_dim
         )
-        attention = torch.softmax(scores, dim=-1)
-        mixed = torch.matmul(attention, expanded_values).transpose(2, 3)
+        scores = torch.matmul(queries * self.scaling, keys.transpose(2, 3))
+        capacity = mask.shape[-1]
+        scores = scores.reshape(1, self.heads, length, capacity) + mask
+        attention = torch.softmax(scores, dim=-1).reshape(
+            1, self.kv_heads, self.groups * length, capacity
+        )
+        mixed = (
+            torch.matmul(attention, values)
+            .reshape(1, self.heads, length, self.head_dim)
+            .transpose(2, 3)
+        )
         hidden = hidden + self.output(
-            mixed.reshape(1, self.heads * self.head_dim, 1, 1)
+            mixed.reshape(1, self.heads * self.head_dim, 1, length)
         )
         normalized = self.post_norm(hidden)
-        hidden = hidden + self.down(
-            gated_silu(self.gate(normalized), self.up(normalized))
-        )
+        gate, up = self.gate_up(normalized).chunk(2, dim=1)
+        hidden = hidden + self.down(gated_silu(gate, up))
         return hidden, keys, values
 
 

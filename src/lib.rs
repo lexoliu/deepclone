@@ -8,6 +8,9 @@ pub mod sampling;
 #[cfg(all(feature = "coreml", target_vendor = "apple"))]
 pub mod decoder;
 
+#[cfg(all(feature = "coreml", target_vendor = "apple"))]
+mod coreml_batch;
+
 #[cfg(feature = "inference")]
 pub mod generation;
 
@@ -33,3 +36,10 @@ pub mod coreml;
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 pub mod browser;
+#[cfg(all(
+    test,
+    feature = "coreml",
+    feature = "inference",
+    target_vendor = "apple"
+))]
+mod profiling;

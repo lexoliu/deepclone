@@ -15,20 +15,30 @@ from audio_models import AudioEncoder
 from streaming_audio import StreamingAudioDecoder, metadata
 
 
+def batches(frames, contract):
+    sizes = contract.get("batch_frames", [1])
+    offset = 0
+    while offset < frames:
+        count = next(size for size in reversed(sizes) if size <= frames - offset)
+        yield offset, count
+        offset += count
+
+
 def native_decode(native, codes, contract):
     if contract["execution"] != "stateful_frame":
         raise ValueError("Waveform verification requires stateful_frame execution")
     state = native.make_state()
     parts = []
-    for index in range(codes.shape[-1]):
+    for index, count in batches(codes.shape[-1], contract):
         values = metadata(
             contract["rotary_frequencies"],
             contract["rotary_scaling"],
             contract["attention_window"],
             index,
             torch.float16,
+            count,
         )
-        inputs = {"codes": codes[..., index : index + 1].numpy().astype(np.int32)}
+        inputs = {"codes": codes[..., index : index + count].numpy().astype(np.int32)}
         inputs.update(
             (name, value.numpy())
             for name, value in zip(["cosine", "sine", "mask"], values)
@@ -42,15 +52,16 @@ def lowered_decode(module, codes, contract):
     return torch.cat(
         [
             module(
-                codes[..., index : index + 1],
+                codes[..., index : index + count],
                 *metadata(
                     contract["rotary_frequencies"],
                     contract["rotary_scaling"],
                     contract["attention_window"],
                     index,
+                    frames=count,
                 ),
             )
-            for index in range(codes.shape[-1])
+            for index, count in batches(codes.shape[-1], contract)
         ],
         dim=-1,
     ).numpy()

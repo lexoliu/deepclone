@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 from qwen_tts import Qwen3TTSModel
 
-from artifact import convert
+from artifact import convert, enumerated_axis
 from provenance import snapshot, verify_or_record
 from transformer import (
     CodecEmbedding,
@@ -20,12 +20,21 @@ from transformer import (
 )
 
 
-def export(reference, output, context, chunk_layers, weight_bits, resume=False):
+def export(
+    reference,
+    output,
+    context,
+    chunk_layers,
+    predictor_chunk_layers,
+    weight_bits,
+    sequence_lengths,
+    resume=False,
+):
     talker = reference.model.talker
     manifest = {"weight_bits": weight_bits, "decoders": {}}
     token = torch.zeros((1, 1), dtype=torch.int32)
 
-    def component(module, inputs, names, outputs, name, states=()):
+    def component(module, inputs, names, outputs, name, states=(), shapes=None):
         path = output / (name + ".mlmodelc")
         if resume and path.exists():
             report_path = path.with_suffix(".json")
@@ -37,7 +46,9 @@ def export(reference, output, context, chunk_layers, weight_bits, resume=False):
             # The component was interrupted before its completion report was
             # published. The run's provenance has already been checked.
             shutil.rmtree(path)
-        convert(module.half(), inputs, names, outputs, path, weight_bits, states)
+        convert(
+            module.half(), inputs, names, outputs, path, weight_bits, states, shapes
+        )
         return path.name
 
     manifest["text_embedding"] = component(
@@ -100,9 +111,20 @@ def export(reference, output, context, chunk_layers, weight_bits, resume=False):
         )
         mask[..., -1] = 0
         chunks = []
-        for start in range(0, len(decoder.model.layers), chunk_layers):
+        lengths = sequence_lengths if name == "talker" else [1]
+        shapes = {
+            feature: enumerated_axis(value, (axis,), lengths)
+            for feature, value, axis in [
+                ("hidden", hidden, 3),
+                ("cosine", cosine, 3),
+                ("sine", sine, 3),
+                ("mask", mask, 2),
+            ]
+        }
+        layers_per_chunk = chunk_layers if name == "talker" else predictor_chunk_layers
+        for start in range(0, len(decoder.model.layers), layers_per_chunk):
             chunk = DecoderChunk(
-                decoder.model.layers[start : start + chunk_layers], config, capacity
+                decoder.model.layers[start : start + layers_per_chunk], config, capacity
             )
             chunks.append(
                 component(
@@ -112,12 +134,14 @@ def export(reference, output, context, chunk_layers, weight_bits, resume=False):
                     ["hidden_out"],
                     f"{name}-{start}",
                     list(chunk.named_buffers()),
+                    shapes,
                 )
             )
         manifest["decoders"][name] = {
             "chunks": chunks,
             "rope_theta": config.rope_theta,
             "context": capacity,
+            "sequence_lengths": lengths,
             "heads": [
                 component(
                     OutputHead(decoder.model.norm, head),
@@ -142,7 +166,19 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--context", type=int, required=True)
     parser.add_argument("--chunk-layers", type=int, default=4)
+    parser.add_argument(
+        "--predictor-chunk-layers",
+        type=int,
+        help="Defaults to the Talker layer group size",
+    )
     parser.add_argument("--weight-bits", type=int, choices=[4, 8, 16], default=16)
+    parser.add_argument(
+        "--sequence-lengths",
+        type=int,
+        nargs="+",
+        default=[1],
+        help="Ordered unique Talker token lengths, beginning with 1, for batched prefill",
+    )
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -151,6 +187,15 @@ def main():
     args = parser.parse_args()
     if args.context <= 0 or args.chunk_layers <= 0:
         parser.error("context and chunk-layers must be positive")
+    if args.predictor_chunk_layers is not None and args.predictor_chunk_layers <= 0:
+        parser.error("predictor-chunk-layers must be positive")
+    predictor_chunk_layers = args.predictor_chunk_layers or args.chunk_layers
+    if (
+        args.sequence_lengths != sorted(set(args.sequence_lengths))
+        or args.sequence_lengths[0] != 1
+        or args.sequence_lengths[-1] > args.context
+    ):
+        parser.error("sequence-lengths must increase from 1 and fit the context")
     args.output.mkdir(parents=True, exist_ok=args.resume)
     verify_or_record(
         args.output,
@@ -159,7 +204,9 @@ def main():
             {
                 "context": args.context,
                 "chunk_layers": args.chunk_layers,
+                "predictor_chunk_layers": predictor_chunk_layers,
                 "weight_bits": args.weight_bits,
+                "sequence_lengths": args.sequence_lengths,
             },
         ),
         args.resume,
@@ -175,7 +222,9 @@ def main():
         args.output,
         args.context,
         args.chunk_layers,
+        predictor_chunk_layers,
         args.weight_bits,
+        args.sequence_lengths,
         args.resume,
     )
 

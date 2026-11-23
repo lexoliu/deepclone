@@ -1,7 +1,9 @@
 //! Runtime-independent text coalescing and continuous PCM inference.
 use crate::{
     generation::Model,
-    inference::{AudioChunk, Engine, Error, Generation, Reference, SynthesisOptions},
+    inference::{
+        AudioChunk, CodeSession, DecodePlan, Engine, Error, Generation, Reference, SynthesisOptions,
+    },
     sampling::TokenSampler,
 };
 use async_channel::Sender;
@@ -121,8 +123,34 @@ where
     S: TokenSampler,
     F: AsyncFnMut(AudioChunk) -> Result<(), Error>,
 {
+    let crate::inference::Session {
+        producer: session,
+        codec,
+    } = engine.session(reference, language, options.generation.clone())?;
+    drive_codes(
+        session,
+        receiver,
+        options.audio_chunk_frames,
+        execution,
+        async |plan| consume(plan.decode(codec).await?).await,
+    )
+    .await
+}
+
+pub(crate) async fn drive_codes<B, T, S, C: Clock, F>(
+    mut session: CodeSession<'_, B, T, S>,
+    receiver: &async_channel::Receiver<Option<String>>,
+    frames: NonZeroUsize,
+    execution: Execution<C, impl Fn() -> bool>,
+    mut consume: F,
+) -> Result<Generation, Error>
+where
+    B: Model,
+    T: TokenSampler,
+    S: TokenSampler,
+    F: AsyncFnMut(DecodePlan) -> Result<(), Error>,
+{
     let Execution { clock, cancelled } = execution;
-    let mut session = engine.session(reference, language, options.generation.clone())?;
     let mut input_finished = false;
     loop {
         if cancelled() {
@@ -140,20 +168,13 @@ where
             }
         }
         let started = clock.now();
-        if let Some(chunk) = session
-            .next_chunk(options.audio_chunk_frames.get(), &cancelled)
-            .await?
-        {
+        if let Some(plan) = session.next_plan(frames.get(), &cancelled).await? {
             let ready = clock.now();
-            let audio_seconds = chunk.samples.len() as f64 / f64::from(chunk.sample_rate);
-            let start_sample = chunk.start_sample;
-            consume(chunk).await?;
+            consume(plan).await?;
             tracing::debug!(
-                start_sample,
-                audio_seconds,
                 production_ms = (ready - started).as_secs_f64() * 1000.,
                 consumer_wait_ms = (clock.now() - ready).as_secs_f64() * 1000.,
-                "audio chunk timing"
+                "acoustic chunk timing"
             );
         } else if session.finished {
             break;

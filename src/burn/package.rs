@@ -63,9 +63,10 @@ impl<T: crate::sampling::TokenSampler, S: crate::sampling::TokenSampler>
                 },
             )?;
         }
-        let backend = Burn::load(&weights, &weights, &weights, config, audio, capacity)?;
+        let (backend, codec) = Burn::load(&weights, &weights, &weights, config, audio, capacity)?;
         Self::new(
             backend,
+            codec,
             Assets {
                 weight_bits: 16,
                 config: json(path.join("config.json"))?,

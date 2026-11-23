@@ -16,7 +16,22 @@ from coremltools.optimize.coreml import (
 )
 
 
-def save(model, output, weight_bits):
+def enumerated_axis(value, axes, lengths):
+    default = tuple(value.shape)
+    if len(lengths) == 1:
+        return default
+    # Examples use a single frame or token. In a sliding attention mask,
+    # the key axis incorporates each additional query as well.
+    shapes = []
+    for length in lengths:
+        shape = list(default)
+        for dimension in axes:
+            shape[dimension] += length - 1
+        shapes.append(shape)
+    return ct.EnumeratedShapes(shapes, default=default)
+
+
+def save(model, output, weight_bits, *, placement_units=ct.ComputeUnit.CPU_AND_NE):
     if output.exists():
         raise FileExistsError(output)
     if weight_bits in (4, 8):
@@ -37,7 +52,7 @@ def save(model, output, weight_bits):
         compiled = staging / output.name
         model.save(str(package))
         ct.models.utils.compile_model(str(package), destination_path=str(compiled))
-        report = placement(compiled)
+        report = placement(compiled, placement_units)
         report["weight_bits"] = weight_bits
         report["compiled_bytes"] = sum(
             p.stat().st_size for p in compiled.rglob("*") if p.is_file()
@@ -48,10 +63,8 @@ def save(model, output, weight_bits):
         report_path.replace(output.with_suffix(".json"))
 
 
-def placement(path):
-    plan = MLComputePlan.load_from_path(
-        str(path), compute_units=ct.ComputeUnit.CPU_AND_NE
-    )
+def placement(path, units):
+    plan = MLComputePlan.load_from_path(str(path), compute_units=units)
     counts = Counter()
 
     def visit(block):
@@ -69,7 +82,7 @@ def placement(path):
     for function in plan.model_structure.program.functions.values():
         visit(function.block)
     return {
-        "requested_compute_units": "CPU_AND_NE",
+        "requested_compute_units": units.name,
         "evidence": "compiler compute plan; not runtime utilization",
         "operations": [
             {"operator": operator, "preferred_device": device, "count": count}
@@ -78,7 +91,18 @@ def placement(path):
     }
 
 
-def convert(module, inputs, names, outputs, output, weight_bits, states=()):
+def convert(
+    module,
+    inputs,
+    names,
+    outputs,
+    output,
+    weight_bits,
+    states=(),
+    shapes=None,
+    *,
+    placement_units=ct.ComputeUnit.CPU_AND_NE,
+):
     module.eval()
     with torch.inference_mode():
         traced = torch.jit.trace(module, inputs, check_trace=False)
@@ -90,7 +114,7 @@ def convert(module, inputs, names, outputs, output, weight_bits, states=()):
         inputs=[
             ct.TensorType(
                 name=name,
-                shape=tuple(value.shape),
+                shape=(shapes or {}).get(name, tuple(value.shape)),
                 dtype=np.int32 if value.dtype == torch.int32 else np.float16,
             )
             for name, value in zip(names, inputs)
@@ -106,4 +130,4 @@ def convert(module, inputs, names, outputs, output, weight_bits, states=()):
         compute_precision=ct.precision.FLOAT16,
         skip_model_load=True,
     )
-    save(model, output, weight_bits)
+    save(model, output, weight_bits, placement_units=placement_units)

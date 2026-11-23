@@ -1,6 +1,6 @@
 //! End-to-end cloning on an application-owned inference worker.
 use crate::{
-    generation::{self, Generator, Model, Selection},
+    generation::{self, Codec, Generator, Model, Selection},
     mel::Spectrogram,
     sampling::{RepetitionPenalty, TokenSampler},
 };
@@ -206,6 +206,7 @@ pub struct Synthesis {
 pub struct Engine<B: Model, T, S> {
     weight_bits: u8,
     generator: Generator<B, T, S>,
+    pub(crate) codec: B::Codec,
     spectrogram: Spectrogram,
     tokenizer: tokenizers::Tokenizer,
     config: Config,
@@ -214,7 +215,12 @@ pub struct Engine<B: Model, T, S> {
 }
 
 impl<B: Model, T: TokenSampler, S: TokenSampler> Engine<B, T, S> {
-    pub fn new(backend: B, assets: Assets, sampling: Sampling<T, S>) -> Result<Self, Error> {
+    pub fn new(
+        backend: B,
+        codec: B::Codec,
+        assets: Assets,
+        sampling: Sampling<T, S>,
+    ) -> Result<Self, Error> {
         let Assets {
             weight_bits,
             config,
@@ -248,6 +254,7 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Engine<B, T, S> {
         Ok(Self {
             weight_bits,
             generator: Generator::new(backend, selection)?,
+            codec,
             spectrogram: Spectrogram::new(filters)?,
             tokenizer,
             config,
@@ -291,6 +298,7 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Engine<B, T, S> {
             .networks
             .condition(samples, &mel, channels)
             .await?;
+        self.codec.prepare_reference(&codes).await?;
         Ok(Reference {
             codes,
             speaker,
@@ -311,7 +319,7 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Engine<B, T, S> {
         session.push_text(text)?;
         session.finish_input()?;
         let mut samples = Vec::new();
-        while !session.finished {
+        while !session.producer.finished {
             if let Some(chunk) = session.next_chunk(12, || false).await? {
                 samples.extend(chunk.samples);
             }
@@ -335,8 +343,8 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Engine<B, T, S> {
         let mut session = self.session(reference, language, options)?;
         session.push_text(text)?;
         session.finish_input()?;
-        while !session.finished {
-            session.advance(&|| false).await?;
+        while !session.producer.finished {
+            session.producer.advance(&|| false).await?;
         }
         session.into_generation()
     }
@@ -379,7 +387,7 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Engine<B, T, S> {
             reference.codes.iter().flatten().copied().collect(),
             reference.codes.len(),
         )?;
-        self.generator.networks.reset_waveform();
+        self.codec.reset();
         let emitted = codes.frames();
         let splitter = crate::utterances::Splitter::new(
             options.text_segment_tokens.get(),
@@ -387,40 +395,44 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Engine<B, T, S> {
         );
         let text_capacity = options.unstable_text_bytes.get();
         Ok(Session {
-            generator: &mut self.generator,
-            config: &self.config,
-            tokenizer: &self.tokenizer,
-            decoder_contract: &self.decoder_contract,
-            weight_bits: self.weight_bits,
-            speaker: &reference.speaker,
-            initial_text: &reference.text,
-            assistant,
-            tags,
-            options,
-            splitter,
-            text: crate::text::TextBuffer::new(&self.tokenizer, text_capacity),
-            pending: VecDeque::new(),
-            active: None,
-            input_finished: false,
-            finished: false,
-            emitted,
-            codes,
-            segments: Vec::new(),
-            pending_error: None,
+            producer: CodeSession {
+                generator: &mut self.generator,
+                config: &self.config,
+                tokenizer: &self.tokenizer,
+                decoder_contract: &self.decoder_contract,
+                weight_bits: self.weight_bits,
+                speaker: &reference.speaker,
+                initial_text: &reference.text,
+                assistant,
+                tags,
+                options,
+                splitter,
+                text: crate::text::TextBuffer::new(&self.tokenizer, text_capacity),
+                pending: VecDeque::new(),
+                active: None,
+                input_finished: false,
+                finished: false,
+                emitted,
+                codes,
+                segments: Vec::new(),
+                pending_error: None,
+            },
+            codec: &mut self.codec,
         })
     }
 
     /// Decode the continuous stream with the same absolute codec block boundaries.
     pub async fn decode(&mut self, codes: &AcousticCodes) -> Result<Waveform, Error> {
-        self.generator.networks.reset_waveform();
-        let samples = decode_range(
-            &mut self.generator.networks,
+        self.codec.reset();
+        let samples = DecodePlan::new(
             &self.decoder_contract,
             codes,
             codes.reference_frames,
             codes.frames(),
-        )
-        .await?;
+        )?
+        .decode(&mut self.codec)
+        .await?
+        .samples;
         Ok(Waveform {
             samples,
             sample_rate: self.sample_rate(),
@@ -437,60 +449,86 @@ pub(crate) fn codec_context_start(frame: usize) -> usize {
     (frame / CODEC_BLOCK_FRAMES * CODEC_BLOCK_FRAMES).saturating_sub(CODEC_LEFT_CONTEXT)
 }
 
-async fn decode_range<B: Model>(
-    waveform: &mut B,
-    decoder_contract: &AudioContract,
-    codes: &AcousticCodes,
-    mut start: usize,
-    end: usize,
-) -> Result<Vec<f32>, Error> {
-    if codes.groups.get() != decoder_contract.code_groups {
-        return Err(Error::Contract(
-            "code group count differs from waveform decoder",
-        ));
-    }
-    // Qwen's chunked_decode resets at 300 frames with 25 frames of left
-    // context. Incremental output preserves these absolute boundaries.
-    let capacity = decoder_contract.capacity;
-    if capacity < CODEC_CAPACITY {
-        return Err(Error::Contract(
-            "waveform decoder capacity must cover 300 frames and 25 context frames",
-        ));
-    }
-    let groups = codes.groups.get();
-    let samples_per_frame = decoder_contract.samples_per_frame;
-    let mut result = Vec::with_capacity((end - start) * samples_per_frame);
-    while start < end {
-        let block = start / CODEC_BLOCK_FRAMES * CODEC_BLOCK_FRAMES;
-        let context_start = codec_context_start(start);
-        let stop = end.min(block + CODEC_BLOCK_FRAMES);
-        let frames = waveform.waveform_frames(stop - context_start, capacity);
-        let mut packed = vec![0i32; groups * frames];
-        for (frame, values) in codes.values[context_start * groups..stop * groups]
-            .chunks_exact(groups)
-            .enumerate()
-        {
-            for (group, &value) in values.iter().enumerate() {
-                packed[group * frames + frame] =
-                    i32::try_from(value).map_err(|_| Error::Contract("code exceeds int32"))?;
-            }
-        }
-        let output = waveform.waveform(packed, groups, frames).await?;
-        let valid = (stop - context_start) * samples_per_frame;
-        if output.as_slice().len() < valid {
+/// One ordered PCM delivery, potentially straddling an official codec block.
+pub(crate) struct DecodePlan {
+    sample_rate: u32,
+    start_sample: usize,
+    capacity: usize,
+    groups: usize,
+    samples_per_frame: usize,
+    blocks: Vec<DecodeBlock>,
+}
+struct DecodeBlock {
+    codes: Vec<u32>,
+    discard_frames: usize,
+}
+impl DecodePlan {
+    fn new(
+        contract: &AudioContract,
+        codes: &AcousticCodes,
+        mut start: usize,
+        end: usize,
+    ) -> Result<Self, Error> {
+        let groups = codes.groups.get();
+        if groups != contract.code_groups {
             return Err(Error::Contract(
-                "decoder waveform is shorter than its code frames",
+                "code group count differs from waveform decoder",
             ));
         }
-        result.extend_from_slice(
-            &output.as_slice()[(start - context_start) * samples_per_frame..valid],
-        );
-        start = stop;
+        if contract.capacity < CODEC_CAPACITY {
+            return Err(Error::Contract(
+                "waveform decoder capacity must cover 300 frames and 25 context frames",
+            ));
+        }
+        let start_sample = (start - codes.reference_frames) * contract.samples_per_frame;
+        let mut blocks = Vec::new();
+        while start < end {
+            let context = codec_context_start(start);
+            let stop = end.min((start / CODEC_BLOCK_FRAMES + 1) * CODEC_BLOCK_FRAMES);
+            blocks.push(DecodeBlock {
+                codes: codes.values[context * groups..stop * groups].to_vec(),
+                discard_frames: start - context,
+            });
+            start = stop;
+        }
+        Ok(Self {
+            sample_rate: contract.sample_rate,
+            start_sample,
+            capacity: contract.capacity,
+            groups,
+            samples_per_frame: contract.samples_per_frame,
+            blocks,
+        })
     }
-    if result.iter().any(|v| !v.is_finite()) {
-        return Err(Error::Contract("waveform contains nonfinite values"));
+    pub(crate) async fn decode(self, codec: &mut impl Codec) -> Result<AudioChunk, Error> {
+        let mut samples = Vec::new();
+        for block in self.blocks {
+            let valid = block.codes.len() / self.groups;
+            let frames = codec.input_frames(valid, self.capacity);
+            let mut packed = vec![0; self.groups * frames];
+            for (frame, values) in block.codes.chunks_exact(self.groups).enumerate() {
+                for (group, &value) in values.iter().enumerate() {
+                    packed[group * frames + frame] =
+                        i32::try_from(value).map_err(|_| Error::Contract("code exceeds int32"))?;
+                }
+            }
+            let output = codec.decode_prefix(packed, self.groups, frames).await?;
+            let wanted =
+                block.discard_frames * self.samples_per_frame..valid * self.samples_per_frame;
+            let pcm = output.get(wanted).ok_or(Error::Contract(
+                "decoder waveform is shorter than its code frames",
+            ))?;
+            if pcm.iter().any(|value| !value.is_finite()) {
+                return Err(Error::Contract("waveform contains nonfinite values"));
+            }
+            samples.extend_from_slice(pcm);
+        }
+        Ok(AudioChunk {
+            samples,
+            sample_rate: self.sample_rate,
+            start_sample: self.start_sample,
+        })
     }
-    Ok(result)
 }
 
 /// Contiguous mono PCM with an absolute position in the whole output stream.
@@ -501,7 +539,7 @@ pub struct AudioChunk {
 }
 
 /// One text stream, one continuous codec timeline, and bounded generation contexts.
-pub struct Session<'a, B: Model, T, S> {
+pub(crate) struct CodeSession<'a, B: Model, T, S> {
     generator: &'a mut Generator<B, T, S>,
     config: &'a Config,
     tokenizer: &'a tokenizers::Tokenizer,
@@ -536,7 +574,7 @@ struct Active<H> {
     text_capacity: usize,
     input_finished: bool,
 }
-impl<B: Model, T: TokenSampler, S: TokenSampler> Session<'_, B, T, S> {
+impl<B: Model, T: TokenSampler, S: TokenSampler> CodeSession<'_, B, T, S> {
     pub fn push_text(&mut self, text: &str) -> Result<(), Error> {
         if self.input_finished {
             return Err(Error::Contract("text input is already finished"));
@@ -761,11 +799,11 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Session<'_, B, T, S> {
         }
         Ok(true)
     }
-    pub async fn next_chunk(
+    pub(crate) async fn next_plan(
         &mut self,
         frames: usize,
         cancelled: impl Fn() -> bool,
-    ) -> Result<Option<AudioChunk>, Error> {
+    ) -> Result<Option<DecodePlan>, Error> {
         if frames == 0 {
             return Err(Error::Contract("audio chunk frames must be nonzero"));
         }
@@ -788,22 +826,14 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Session<'_, B, T, S> {
         if self.codes.frames() == self.emitted {
             return Ok(None);
         }
-        let start_sample =
-            (self.emitted - self.codes.reference_frames) * self.decoder_contract.samples_per_frame;
-        let samples = decode_range(
-            &mut self.generator.networks,
+        let plan = DecodePlan::new(
             self.decoder_contract,
             &self.codes,
             self.emitted,
             self.codes.frames(),
-        )
-        .await?;
+        )?;
         self.emitted = self.codes.frames();
-        Ok(Some(AudioChunk {
-            samples,
-            sample_rate: self.decoder_contract.sample_rate,
-            start_sample,
-        }))
+        Ok(Some(plan))
     }
     pub fn into_generation(self) -> Result<Generation, Error> {
         if !self.finished {
@@ -821,6 +851,33 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Session<'_, B, T, S> {
     }
 }
 
+/// Synchronous ownership of a text/code session and its waveform decoder.
+pub struct Session<'a, B: Model, T, S> {
+    pub(crate) producer: CodeSession<'a, B, T, S>,
+    pub(crate) codec: &'a mut B::Codec,
+}
+impl<B: Model, T: TokenSampler, S: TokenSampler> Session<'_, B, T, S> {
+    pub fn push_text(&mut self, text: &str) -> Result<(), Error> {
+        self.producer.push_text(text)
+    }
+    pub fn finish_input(&mut self) -> Result<(), Error> {
+        self.producer.finish_input()
+    }
+    pub async fn next_chunk(
+        &mut self,
+        frames: usize,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Option<AudioChunk>, Error> {
+        match self.producer.next_plan(frames, cancelled).await? {
+            Some(plan) => Ok(Some(plan.decode(self.codec).await?)),
+            None => Ok(None),
+        }
+    }
+    pub fn into_generation(self) -> Result<Generation, Error> {
+        self.producer.into_generation()
+    }
+}
+
 /// Model metadata and text/audio frontend shared by every execution backend.
 pub struct Assets {
     pub weight_bits: u8,
@@ -832,4 +889,4 @@ pub struct Assets {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

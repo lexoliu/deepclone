@@ -1,4 +1,4 @@
-//! Text streams to continuous PCM, with a Tokio input task and an owned Core ML worker.
+//! Text streams to continuous PCM, with a Tokio input task and dedicated inference workers.
 //! SSE clients pass their decoded text deltas; this module does not parse HTTP.
 //!
 //! ```no_run
@@ -51,7 +51,7 @@ pub struct Load {
     pub reference: ReferenceAudio,
 }
 
-/// A reusable voice with one model owner. A stream borrows the voice exclusively,
+/// A reusable voice with dedicated inference workers. A stream borrows the voice exclusively,
 /// so requests cannot accidentally interleave their KV or decoder state.
 pub struct Voice {
     requests: Sender<Request>,
@@ -70,6 +70,21 @@ impl Voice {
     pub async fn load_with<B, T, S, F, Fut>(
         initialize: F,
         reference: ReferenceAudio,
+    ) -> Result<Self, Error>
+    where
+        B: crate::generation::Model + 'static,
+        T: TokenSampler + 'static,
+        S: TokenSampler + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Engine<B, T, S>, Error>>,
+    {
+        Self::load_with_driver(initialize, reference, serve).await
+    }
+
+    async fn load_with_driver<B, T, S, F, Fut>(
+        initialize: F,
+        reference: ReferenceAudio,
+        serve: impl FnOnce(Engine<B, T, S>, Reference<B::Hidden>, Receiver<Request>) + Send + 'static,
     ) -> Result<Self, Error>
     where
         B: crate::generation::Model + 'static,
@@ -120,16 +135,33 @@ impl Voice {
         load: Load,
         sampling: crate::inference::Sampling<T, S>,
     ) -> Result<Self, Error> {
-        Self::load_with(
+        let generation_units = load.compute_units;
+        Self::load_with_driver(
             move || async move {
-                Engine::open(
+                Engine::open_with_waveform(
                     &load.transformers,
                     &load.audio_models,
                     load.compute_units,
                     sampling,
+                    |size, units, batched| {
+                        if size == "0b6" && batched && units == ComputeUnits::CpuAndNeuralEngine {
+                            ComputeUnits::CpuAndGpu
+                        } else {
+                            units
+                        }
+                    },
                 )
             },
             load.reference,
+            move |engine, reference, requests| {
+                if generation_units == ComputeUnits::CpuAndNeuralEngine
+                    && engine.codec.units == ComputeUnits::CpuAndGpu
+                {
+                    serve_requests(engine, reference, requests, run_parallel);
+                } else {
+                    serve(engine, reference, requests);
+                }
+            },
         )
         .await
     }
@@ -195,42 +227,125 @@ impl Voice {
 }
 
 fn serve<B: crate::generation::Model, T: TokenSampler, S: TokenSampler>(
+    engine: Engine<B, T, S>,
+    reference: Reference<B::Hidden>,
+    requests: Receiver<Request>,
+) {
+    serve_requests(engine, reference, requests, |engine, reference, request| {
+        futures_lite::future::block_on(super::drive(
+            engine,
+            reference,
+            &request.text,
+            &request.language,
+            &request.options,
+            super::Execution {
+                clock: TokioClock(Instant::now()),
+                cancelled: || request.audio.is_closed(),
+            },
+            async |chunk| {
+                request
+                    .audio
+                    .send(Ok(chunk))
+                    .await
+                    .map_err(|_| Error::Cancelled)
+            },
+        ))
+    });
+}
+
+fn serve_requests<B: crate::generation::Model, T: TokenSampler, S: TokenSampler>(
     mut engine: Engine<B, T, S>,
     reference: Reference<B::Hidden>,
     requests: Receiver<Request>,
+    mut run: impl FnMut(
+        &mut Engine<B, T, S>,
+        &Reference<B::Hidden>,
+        &Request,
+    ) -> Result<Generation, Error>,
 ) {
     while let Ok(request) = requests.recv_blocking() {
         if request.audio.is_closed() {
             continue;
         }
         tracing::debug!("session started");
-        let result = futures_lite::future::block_on(async {
-            let generation = super::drive(
-                &mut engine,
-                &reference,
-                &request.text,
-                &request.language,
-                &request.options,
-                super::Execution {
-                    clock: TokioClock(Instant::now()),
-                    cancelled: || request.audio.is_closed(),
-                },
-                async |chunk| {
-                    request
-                        .audio
-                        .send(Ok(chunk))
-                        .await
-                        .map_err(|_| Error::Cancelled)
-                },
-            )
-            .await?;
-            let _ = request.completion.send(generation).await;
-            Ok::<_, Error>(())
-        });
-        if let Err(error) = result {
-            let _ = request.audio.send_blocking(Err(error));
+        match run(&mut engine, &reference, &request) {
+            Ok(generation) => {
+                let _ = request.completion.send_blocking(generation);
+            }
+            Err(error) => {
+                let _ = request.audio.send_blocking(Err(error));
+            }
         }
     }
+}
+
+#[cfg(any(test, all(feature = "coreml", target_vendor = "apple")))]
+fn run_parallel<B, T, S>(
+    engine: &mut Engine<B, T, S>,
+    reference: &Reference<B::Hidden>,
+    request: &Request,
+) -> Result<Generation, Error>
+where
+    B: crate::generation::Model,
+    B::Codec: Send,
+    T: TokenSampler,
+    S: TokenSampler,
+{
+    use crate::inference::DecodePlan;
+
+    // Closing the text input wakes the generator even when its upstream is idle.
+    struct CloseInput<'a>(&'a Receiver<Option<String>>);
+    impl Drop for CloseInput<'_> {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+    let crate::inference::Session {
+        producer: session,
+        codec,
+    } = engine.session(
+        reference,
+        &request.language,
+        request.options.generation.clone(),
+    )?;
+    let (pending, plans) = async_channel::bounded::<DecodePlan>(1);
+    let dispatcher = tracing::dispatcher::get_default(Clone::clone);
+    std::thread::scope(|scope| {
+        let waveform = std::thread::Builder::new()
+            .name("deepclone-waveform".into())
+            .spawn_scoped(scope, move || {
+                let _input = CloseInput(&request.text);
+                tracing::dispatcher::with_default(&dispatcher, || {
+                    futures_lite::future::block_on(async {
+                        while let Ok(plan) = plans.recv().await {
+                            if request.audio.is_closed() {
+                                return Err(Error::Cancelled);
+                            }
+                            let pcm = plan.decode(codec).await?;
+                            request
+                                .audio
+                                .send(Ok(pcm))
+                                .await
+                                .map_err(|_| Error::Cancelled)?;
+                        }
+                        Ok(())
+                    })
+                })
+            })?;
+        let generation = futures_lite::future::block_on(super::drive_codes(
+            session,
+            &request.text,
+            request.options.audio_chunk_frames,
+            super::Execution {
+                clock: TokioClock(Instant::now()),
+                cancelled: || request.audio.is_closed(),
+            },
+            async |plan| pending.send(plan).await.map_err(|_| Error::WorkerStopped),
+        ));
+        drop(pending);
+        waveform.join().map_err(|_| Error::WorkerStopped)??;
+        generation
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -536,6 +651,43 @@ mod tests {
             tokio::task::yield_now().await;
             assert!(dropped.load(Ordering::SeqCst));
             drop(audio);
+        });
+    }
+
+    #[test]
+    fn waveform_failure_closes_idle_input_and_prevents_completion() {
+        runtime().block_on(async {
+            let (requests, incoming) = async_channel::bounded(1);
+            let worker = std::thread::spawn(move || {
+                let (engine, reference) = crate::inference::tests::failing_waveform_fixture();
+                serve_requests(engine, reference, incoming, run_parallel);
+            });
+            let mut voice = Voice {
+                requests,
+                sample_rate: 25,
+            };
+            let dropped = Arc::new(AtomicBool::new(false));
+            let input = futures_lite::stream::once(Ok("Hello there. ".repeat(4)))
+                .chain(pending_input(dropped.clone()));
+            let mut options = options();
+            options.audio_chunk_frames = NonZeroUsize::MIN;
+            let mut audio = voice.synthesize(input, "auto", options).await.unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(2), audio.next())
+                .await
+                .unwrap();
+            assert!(matches!(
+                result,
+                Some(Err(StreamError::Inference(Error::Contract(
+                    "waveform fixture failure"
+                ))))
+            ));
+            assert!(audio.next().await.is_none());
+            assert!(audio.generation().is_none());
+            tokio::task::yield_now().await;
+            assert!(dropped.load(Ordering::SeqCst));
+            drop(audio);
+            drop(voice);
+            worker.join().unwrap();
         });
     }
 
