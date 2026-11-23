@@ -134,13 +134,10 @@ async function execute(command: Command): Promise<void> {
             const productionMs = ready - resumed;
             const audioSeconds = samples.length / sampleRate;
             const id = audioId++;
-            const copy = samples.slice();
             const acknowledged = new Promise<void>((resolve, reject) =>
               pending.set(id, { resolve, reject }),
             );
-            send({ kind: "audio", id, samples: copy, sampleRate }, [
-              copy.buffer,
-            ]);
+            send({ kind: "audio", id, samples, sampleRate }, [samples.buffer]);
             await acknowledged;
             resumed = performance.now();
             console.info("Speech chunk timing", {
