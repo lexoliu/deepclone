@@ -1,18 +1,171 @@
 use super::*;
 use crate::{generation::Model, sampling::Greedy};
 
+#[cfg(all(feature = "cli", target_vendor = "apple"))]
+#[test]
+#[ignore = "requires the staged Core ML model and a real recorded reference"]
+fn real_coreml_voice_delivery_is_sustained() {
+    use crate::{
+        sampling::{Multinomial, Parameters},
+        streaming::{Load, Options, ReferenceAudio, Voice},
+    };
+    use futures_lite::{StreamExt, stream};
+    use ondevice_coreml::ComputeUnits;
+    use rand::{SeedableRng, rngs::StdRng};
+    use std::{path::PathBuf, time::Instant};
+
+    #[derive(Deserialize)]
+    struct Prompt {
+        text: String,
+        language: String,
+    }
+
+    #[derive(serde::Serialize)]
+    struct Delivery {
+        load_and_condition_seconds: f64,
+        first_audio_seconds: f64,
+        steady_rtf: Option<f64>,
+        playback_gap_seconds: f64,
+        audio_seconds: f64,
+        generated_frames: usize,
+        arrivals: Vec<(f64, f64)>,
+    }
+
+    let directory = |key| PathBuf::from(std::env::var_os(key).expect(key));
+    let output = directory("DEEPCLONE_OUTPUT");
+    std::fs::create_dir_all(&output).unwrap();
+    let (samples, sample_rate, transcript) = recorded_reference(&directory("DEEPCLONE_REFERENCE"));
+    let prompts: Vec<Prompt> =
+        serde_json::from_slice(&std::fs::read(directory("DEEPCLONE_PROMPTS")).unwrap()).unwrap();
+    let (long, auditions) = prompts.split_first().unwrap();
+    let max_frames = NonZeroUsize::new(512).unwrap();
+    let parameters = Parameters::new(0.9, NonZeroUsize::new(50), 1.).unwrap();
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let load = Instant::now();
+            let mut voice = Voice::load(
+                Load {
+                    transformers: directory("DEEPCLONE_TRANSFORMERS"),
+                    audio_models: directory("DEEPCLONE_AUDIO_MODELS"),
+                    compute_units: ComputeUnits::CpuAndNeuralEngine,
+                    reference: ReferenceAudio {
+                        samples,
+                        sample_rate,
+                        transcript,
+                    },
+                },
+                Sampling {
+                    talker: Multinomial::new(StdRng::seed_from_u64(42), parameters),
+                    predictor: Multinomial::new(StdRng::seed_from_u64(42), parameters),
+                    repetition: RepetitionPenalty::new(1.05).unwrap(),
+                    minimum_frames: 2,
+                },
+            )
+            .await
+            .unwrap();
+            let load_and_condition_seconds = load.elapsed().as_secs_f64();
+
+            let mut measure = async |prompt: &Prompt, stem: &str| {
+                let started = Instant::now();
+                let input = stream::once(Ok::<_, std::convert::Infallible>(prompt.text.clone()));
+                let mut audio = voice
+                    .synthesize(input, &prompt.language, Options::new(max_frames))
+                    .await
+                    .unwrap();
+                let mut arrivals = Vec::new();
+                let mut samples = Vec::new();
+                while let Some(chunk) = audio.next().await {
+                    let chunk = chunk.unwrap();
+                    assert_eq!(chunk.start_sample, samples.len());
+                    assert_eq!(chunk.sample_rate, sample_rate);
+                    arrivals.push((
+                        started.elapsed().as_secs_f64(),
+                        chunk.samples.len() as f64 / f64::from(sample_rate),
+                    ));
+                    samples.extend(chunk.samples);
+                }
+                let generation = audio.take_generation().unwrap();
+                let first = arrivals.first().unwrap().0;
+                let last = arrivals.last().unwrap().0;
+                let audio_seconds = samples.len() as f64 / f64::from(sample_rate);
+                let mut playback = first;
+                let mut gaps = 0.0;
+                for &(arrival, duration) in &arrivals {
+                    gaps += (arrival - playback).max(0.0);
+                    playback = playback.max(arrival) + duration;
+                }
+                let steady_rtf =
+                    (arrivals.len() > 1).then(|| (last - first) / (audio_seconds - arrivals[0].1));
+                let report = Delivery {
+                    load_and_condition_seconds,
+                    first_audio_seconds: first,
+                    steady_rtf,
+                    playback_gap_seconds: gaps,
+                    audio_seconds,
+                    generated_frames: generation.generated_frames(),
+                    arrivals,
+                };
+                std::fs::write(
+                    output.join(format!("{stem}.json")),
+                    serde_json::to_vec_pretty(&report).unwrap(),
+                )
+                .unwrap();
+                std::fs::write(
+                    output.join(format!("{stem}.codes.json")),
+                    serde_json::to_vec(&generation).unwrap(),
+                )
+                .unwrap();
+                let mut writer = hound::WavWriter::create(
+                    output.join(format!("{stem}.wav")),
+                    hound::WavSpec {
+                        channels: 2,
+                        sample_rate,
+                        bits_per_sample: 32,
+                        sample_format: hound::SampleFormat::Float,
+                    },
+                )
+                .unwrap();
+                for sample in samples {
+                    writer.write_sample(sample).unwrap();
+                    writer.write_sample(sample).unwrap();
+                }
+                writer.finalize().unwrap();
+                (report, generation)
+            };
+            let (report, generation) = measure(long, "native-pipeline").await;
+            for (index, prompt) in auditions.iter().enumerate() {
+                measure(
+                    prompt,
+                    &format!("audition-{}-{}", index + 1, prompt.language),
+                )
+                .await;
+            }
+            assert!(generation.generated_frames() > max_frames.get());
+            assert!(generation.segments.len() > 1);
+            let rtf = report.steady_rtf.unwrap();
+            let gaps = report.playback_gap_seconds;
+            assert!(
+                rtf < 1.0 && gaps == 0.0,
+                "RTF {rtf:.4}, playback gaps {gaps:.4} s"
+            );
+        });
+}
+
 struct TestModel {
     eos: bool,
     ignore_eos: bool,
     generation_resets: usize,
-    waveform_resets: usize,
     frame_inputs: Vec<Vec<(Vec<u32>, u32)>>,
-    waveform_inputs: Vec<Vec<i32>>,
 }
 impl Model for TestModel {
     type Hidden = u32;
     type Token = u32;
     type Logits = Vec<f32>;
+    type Codec = TestCodec;
     fn code_token(&mut self, _: usize, token: &u32) -> Result<u32, Error> {
         Ok(*token)
     }
@@ -29,9 +182,6 @@ impl Model for TestModel {
         self.eos = false;
         self.generation_resets += 1;
         self.frame_inputs.push(Vec::new());
-    }
-    fn reset_waveform(&mut self) {
-        self.waveform_resets += 1;
     }
     fn reset_predictor(&mut self) {}
     fn text(&mut self, token: u32) -> Result<u32, Error> {
@@ -79,12 +229,29 @@ impl Model for TestModel {
     ) -> Result<(u32, Vec<Vec<u32>>), Error> {
         Err(Error::Contract("test supplies a conditioned reference"))
     }
-    async fn waveform(
+}
+#[derive(Default)]
+struct TestCodec {
+    waveform_resets: usize,
+    waveform_inputs: Vec<Vec<i32>>,
+    fail: bool,
+}
+impl Codec for TestCodec {
+    fn reset(&mut self) {
+        self.waveform_resets += 1;
+    }
+    fn input_frames(&self, _valid: usize, capacity: usize) -> usize {
+        capacity
+    }
+    async fn decode_prefix(
         &mut self,
         codes: Vec<i32>,
         _: usize,
         frames: usize,
     ) -> Result<Vec<f32>, Error> {
+        if self.fail {
+            return Err(Error::Contract("waveform fixture failure"));
+        }
         self.waveform_inputs.push(codes);
         // An absolute index within the supplied causal prefix exposes decoding
         // that restarts at a generation boundary instead of a codec boundary.
@@ -98,10 +265,9 @@ fn engine() -> Engine<TestModel, Greedy, Greedy> {
             eos: false,
             ignore_eos: false,
             generation_resets: 0,
-            waveform_resets: 0,
             frame_inputs: Vec::new(),
-            waveform_inputs: Vec::new(),
         },
+        TestCodec::default(),
         Assets {
             weight_bits: 16,
             config: Config {
@@ -159,6 +325,17 @@ fn reference() -> Reference<u32> {
         text: vec![0],
     }
 }
+
+#[cfg(all(feature = "streaming", not(target_arch = "wasm32")))]
+pub(crate) fn failing_waveform_fixture() -> (
+    Engine<impl Model<Hidden = u32, Codec: Send>, Greedy, Greedy>,
+    Reference<u32>,
+) {
+    let mut engine = engine();
+    engine.codec.fail = true;
+    (engine, reference())
+}
+
 fn options() -> SynthesisOptions {
     SynthesisOptions::new(NonZeroUsize::new(48).unwrap())
 }
@@ -181,7 +358,7 @@ fn long_text_exceeds_one_frame_budget_and_decodes_every_segment() {
             result.generation.generated_frames() * 2
         );
         assert_eq!(result.generation.codes.reference_frames(), 2);
-        assert_eq!(engine.generator.networks.waveform_resets, 1);
+        assert_eq!(engine.codec.waveform_resets, 1);
         assert_eq!(
             engine.generator.networks.generation_resets,
             result.generation.segments.len()
@@ -332,7 +509,7 @@ fn sentences_share_context_and_paragraphs_roll_over_without_resetting_codec() {
             .unwrap();
         assert_eq!(result.generation.segments.len(), 2);
         assert_eq!(engine.generator.networks.generation_resets, 2);
-        assert_eq!(engine.generator.networks.waveform_resets, 1);
+        assert_eq!(engine.codec.waveform_resets, 1);
         let first = &result.generation.segments[0];
         assert_eq!(
             first.text_tokens,
@@ -470,14 +647,13 @@ fn real_coreml_waveform_replays_prediction_inputs() {
         let mut context = None;
         for (index, call) in calls.into_iter().enumerate() {
             if context != Some(call.context) {
-                engine.generator.networks.reset_waveform();
+                engine.codec.reset();
                 context = Some(call.context);
             }
             let start = std::time::Instant::now();
             let result = engine
-                .generator
-                .networks
-                .waveform(call.values, contract.code_groups, call.frames)
+                .codec
+                .decode_prefix(call.values, contract.code_groups, call.frames)
                 .await;
             reports.push(serde_json::json!({
                 "index": index,
@@ -576,20 +752,25 @@ fn real_coreml_long_stream_preserves_codes_and_contiguous_pcm() {
             .unwrap();
         session.finish_input().unwrap();
         let mut samples = Vec::new();
-        progress("synthesis", session.codes.frames(), 0);
+        progress("synthesis", session.producer.codes.frames(), 0);
         let mut chunks = Vec::new();
         let mut playback_end = 0.0f64;
         let mut gaps = 0.0;
         let mut first_audio_seconds = None;
-        while !session.finished {
-            let before = session.generator.networks.profile.clone();
+        while !session.producer.finished {
+            let before = session
+                .producer
+                .generator
+                .networks
+                .profile
+                .with(&session.codec.profile);
             let chunk_started = std::time::Instant::now();
             match session.next_chunk(12, || false).await {
                 Ok(Some(chunk)) => {
                     let production_seconds = chunk_started.elapsed().as_secs_f64();
                     let delivered = synthesis_started.elapsed().as_secs_f64();
-                    let duration =
-                        chunk.samples.len() as f64 / session.decoder_contract.sample_rate as f64;
+                    let duration = chunk.samples.len() as f64
+                        / session.producer.decoder_contract.sample_rate as f64;
                     if first_audio_seconds.is_none() {
                         first_audio_seconds = Some(delivered);
                         playback_end = delivered;
@@ -601,19 +782,19 @@ fn real_coreml_long_stream_preserves_codes_and_contiguous_pcm() {
                         "start_sample":chunk.start_sample, "samples":chunk.samples.len(),
                         "production_seconds":production_seconds, "delivered_seconds":delivered,
                         "audio_seconds":duration,
-                        "stages":session.generator.networks.profile.since(&before),
+                        "stages":session.producer.generator.networks.profile.with(&session.codec.profile).since(&before),
                     }));
                     assert_eq!(chunk.start_sample, samples.len());
                     samples.extend(chunk.samples);
-                    progress("pcm", session.codes.frames(), samples.len());
+                    progress("pcm", session.producer.codes.frames(), samples.len());
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    progress("error", session.codes.frames(), samples.len());
+                    progress("error", session.producer.codes.frames(), samples.len());
                     std::fs::write(
                         output.join("failure.codes.json"),
                         serde_json::to_vec(
-                            &serde_json::json!({"codes":session.codes,"segments":session.segments}),
+                            &serde_json::json!({"codes":session.producer.codes,"segments":session.producer.segments}),
                         )
                         .unwrap(),
                     )
@@ -624,7 +805,11 @@ fn real_coreml_long_stream_preserves_codes_and_contiguous_pcm() {
         }
         let generation = session.into_generation().unwrap();
         let synthesis_seconds = synthesis_started.elapsed().as_secs_f64();
-        let stages = engine.generator.networks.profile.clone();
+        let stages = engine
+            .generator
+            .networks
+            .profile
+            .with(&engine.codec.profile);
         let rate = engine.sample_rate();
         let samples_per_frame = engine.decoder_contract.samples_per_frame;
         drop(engine);

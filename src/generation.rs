@@ -9,18 +9,13 @@ pub trait Model {
     type Hidden: Clone;
     type Token: Clone;
     type Logits: Logits<Token = Self::Token>;
+    type Codec: Codec;
     fn code_token(&mut self, group: usize, token: &Self::Token) -> Result<Self::Hidden, Error>;
     async fn read_tokens(&self, tokens: &[Self::Token]) -> Result<Vec<u32>, Error>;
     fn groups(&self) -> usize;
     /// Available Talker KV positions in this backend's loaded model.
     fn context_capacity(&self) -> usize;
-    /// Fixed-shape backends can retain their model capacity; dynamic backends use the valid span.
-    fn waveform_frames(&self, valid: usize, capacity: usize) -> usize {
-        let _ = valid;
-        capacity
-    }
     fn reset_generation(&mut self);
-    fn reset_waveform(&mut self);
     fn reset_predictor(&mut self);
     fn text(&mut self, token: u32) -> Result<Self::Hidden, Error>;
     fn code(&mut self, group: usize, token: u32) -> Result<Self::Hidden, Error>;
@@ -56,7 +51,19 @@ pub trait Model {
         mel: &[f32],
         channels: usize,
     ) -> Result<(Self::Hidden, Vec<Vec<u32>>), Error>;
-    async fn waveform(
+}
+
+/// Stateful waveform reconstruction, owned independently of code generation.
+#[allow(async_fn_in_trait)]
+pub trait Codec {
+    fn reset(&mut self);
+    fn input_frames(&self, valid: usize, _capacity: usize) -> usize {
+        valid
+    }
+    async fn prepare_reference(&mut self, _codes: &[Vec<u32>]) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn decode_prefix(
         &mut self,
         packed: Vec<i32>,
         groups: usize,

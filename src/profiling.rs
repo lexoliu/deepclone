@@ -1,7 +1,10 @@
 //! Test-only measurements of model work and caller-owned sampling.
 use crate::sampling::{Error, Logits, TokenSampler};
 use serde::Serialize;
-use std::{collections::BTreeMap, time::Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Copy, Default, Serialize)]
 pub(crate) struct Counter {
@@ -33,6 +36,20 @@ pub(crate) struct Profile(BTreeMap<&'static str, Counter>);
 impl Profile {
     pub fn measure(&mut self, stage: &'static str) -> Measurement<'_> {
         self.0.entry(stage).or_default().measure()
+    }
+    pub fn record(&mut self, stage: &'static str, duration: Duration) {
+        let counter = self.0.entry(stage).or_default();
+        counter.calls += 1;
+        counter.seconds += duration.as_secs_f64();
+    }
+    pub fn with(&self, other: &Self) -> Self {
+        Self(
+            self.0
+                .iter()
+                .chain(&other.0)
+                .map(|(&name, &counter)| (name, counter))
+                .collect(),
+        )
     }
     pub fn since(&self, previous: &Self) -> Self {
         Self(

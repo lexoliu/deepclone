@@ -116,7 +116,7 @@ pub async fn read<const D: usize>(tensor: Tensor<D>) -> Result<Vec<f32>, Error> 
 }
 
 mod model;
-pub use model::{AudioConfig, Burn, SpeechConfig};
+pub use model::{AudioConfig, Burn, BurnCodec, SpeechConfig};
 
 /// Weight providers separate model construction from file or network storage.
 pub trait WeightSource {
