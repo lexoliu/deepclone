@@ -8,6 +8,8 @@ import subprocess
 # are disabled. These packages must never be part of deepclone's build graph.
 EXCLUDED = {"burn-tch", "tch", "torch-sys"}
 DORMANT = {
+    # The optional CubeCL Turso cache is not enabled on any target.
+    ("chrono", "0.4.45"): {"RUSTSEC-2026-0543"},
     ("zip", "0.6.6"): {
         "RUSTSEC-2026-0429",
         "RUSTSEC-2026-0367",
