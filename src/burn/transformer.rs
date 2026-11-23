@@ -113,27 +113,34 @@ impl Layer {
                 0..position + tokens,
                 0..c.head_dim,
             ];
-            let heads = c.num_attention_heads;
-            let kv_heads = c.num_key_value_heads;
-            let length = position + tokens;
-            // Queries sharing K/V occupy consecutive rows of one matrix.
-            let rows = (heads / kv_heads) * tokens;
-            let q = q.reshape([1, kv_heads, rows, c.head_dim]);
-            let keys = self.keys.clone().slice(selection.clone());
-            let values = self.values.clone().slice(selection);
+            let groups = c.num_attention_heads / c.num_key_value_heads;
+            // Broadcast shared K/V over query groups instead of materializing repeated heads.
+            let q = q.reshape([1, c.num_key_value_heads, groups, tokens, c.head_dim]);
+            let keys = self.keys.clone().slice(selection.clone()).reshape([
+                1,
+                c.num_key_value_heads,
+                1,
+                position + tokens,
+                c.head_dim,
+            ]);
+            let values = self.values.clone().slice(selection).reshape([
+                1,
+                c.num_key_value_heads,
+                1,
+                position + tokens,
+                c.head_dim,
+            ]);
             let scores = (q * (c.head_dim as f32).sqrt().recip())
-                .matmul(keys.swap_dims(2, 3))
-                .cast(burn::tensor::DType::F32)
-                .reshape([1, heads, tokens, length]);
+                .matmul(keys.swap_dims(3, 4))
+                .cast(burn::tensor::DType::F32);
             let scores = match mask {
-                Some(mask) => scores.mask_fill(mask.clone(), f32::NEG_INFINITY),
+                Some(mask) => scores.mask_fill(mask.clone().unsqueeze(), f32::NEG_INFINITY),
                 None => scores,
             };
-            activation::softmax(scores, 3)
+            activation::softmax(scores, 4)
                 .cast(x.dtype())
-                .reshape([1, kv_heads, rows, length])
                 .matmul(values)
-                .reshape([1, heads, tokens, c.head_dim])
+                .reshape([1, c.num_attention_heads, tokens, c.head_dim])
         };
         let mixed = mixed
             .swap_dims(1, 2)
