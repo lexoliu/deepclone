@@ -1,4 +1,4 @@
-"""Stateful, causal waveform reconstruction with one codec frame per call."""
+"""Stateful, causal waveform reconstruction over newly arrived codec frames."""
 
 import copy
 
@@ -15,13 +15,17 @@ from torch.nn import functional as F
 from audio_models import CausalTranspose
 
 
-def metadata(frequencies, scaling, window, position, dtype=torch.float32):
-    phase = torch.as_tensor(frequencies, dtype=torch.float32) * position
-    phase = torch.cat((phase, phase)).reshape(1, 1, 1, -1)
+def metadata(frequencies, scaling, window, position, dtype=torch.float32, frames=1):
+    position_ids = torch.arange(position, position + frames, dtype=torch.float32)
+    phase = position_ids[:, None] * torch.as_tensor(frequencies, dtype=torch.float32)
+    phase = torch.cat((phase, phase), dim=-1)[None, None, :, :]
     cosine = (phase.cos() * scaling).to(dtype)
     sine = (phase.sin() * scaling).to(dtype)
-    mask = torch.full((1, 1, 1, window), torch.finfo(dtype).min, dtype=dtype)
-    mask[..., -min(position + 1, window) :] = 0
+    mask = torch.full(
+        (1, 1, frames, window + frames - 1), torch.finfo(dtype).min, dtype=dtype
+    )
+    for index in range(frames):
+        mask[..., index, max(window - 1 - position, index) : window + index] = 0
     return cosine, sine, mask
 
 
@@ -166,12 +170,10 @@ class StreamingQuantizer(nn.Module):
 
     def forward(self, codes):
         # A single indexed lookup retains every group's independent codebook.
-        indices = codes.reshape(1, len(self.offsets)) + torch.tensor(
-            self.offsets, dtype=codes.dtype
-        )
+        indices = codes.transpose(1, 2) + torch.tensor(self.offsets, dtype=codes.dtype)
         decoded = F.embedding(indices, self.embedding)
         groups = [
-            projection(decoded[:, index : index + 1, :]).transpose(1, 2)
+            projection(decoded[:, :, index, :]).transpose(1, 2)
             for index, projection in enumerate(self.projections)
         ]
         semantic = groups[0]
@@ -212,21 +214,27 @@ class StreamingLayer(nn.Module):
         self.head_dim = attention.head_dim
         self.groups = attention.num_key_value_groups
         self.scaling = attention.scaling
+        self.window = window
         for name in ["keys", "values"]:
             self.register_buffer(
                 name, torch.zeros(1, self.kv_heads, window, self.head_dim)
             )
 
     def forward(self, hidden, cosine, sine, mask):
+        length = hidden.shape[1]
         attention = self.layer.self_attn
         normalized = self.layer.input_layernorm(hidden)
         query = attention.q_norm(
-            attention.q_proj(normalized).reshape(1, 1, self.heads, self.head_dim)
+            attention.q_proj(normalized).reshape(1, length, self.heads, self.head_dim)
         ).transpose(1, 2)
         key = attention.k_norm(
-            attention.k_proj(normalized).reshape(1, 1, self.kv_heads, self.head_dim)
+            attention.k_proj(normalized).reshape(
+                1, length, self.kv_heads, self.head_dim
+            )
         ).transpose(1, 2)
-        value = attention.v_proj(normalized).reshape(1, 1, self.kv_heads, self.head_dim)
+        value = attention.v_proj(normalized).reshape(
+            1, length, self.kv_heads, self.head_dim
+        )
         value = value.transpose(1, 2)
         query = rotate(query, cosine, sine)
         key = rotate(key, cosine, sine)
@@ -245,14 +253,14 @@ class StreamingLayer(nn.Module):
         mixed = (
             torch.matmul(probabilities, values.repeat_interleave(self.groups, dim=1))
             .transpose(1, 2)
-            .reshape(1, 1, self.heads * self.head_dim)
+            .reshape(1, length, self.heads * self.head_dim)
         )
         hidden = hidden + self.layer.self_attn_layer_scale(attention.o_proj(mixed))
         hidden = hidden + self.layer.mlp_layer_scale(
             self.layer.mlp(self.layer.post_attention_layernorm(hidden))
         )
-        self.keys[:, :, :, :] = keys
-        self.values[:, :, :, :] = values
+        self.keys[:, :, :, :] = keys[:, :, -self.window :, :]
+        self.values[:, :, :, :] = values[:, :, -self.window :, :]
         return hidden
 
 

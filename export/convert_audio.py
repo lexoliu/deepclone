@@ -10,7 +10,7 @@ import torch
 from coremltools.converters.mil.mil.scope import ScopeSource
 from qwen_tts import Qwen3TTSModel
 
-from artifact import save
+from artifact import enumerated_axis, save
 from audio_models import AudioEncoder
 from streaming_audio import StreamingAudioDecoder
 
@@ -29,6 +29,7 @@ def main():
         help="Mel frames, audio samples, or codec frames",
     )
     parser.add_argument("--weight-bits", type=int, choices=[4, 8, 16, 32])
+    parser.add_argument("--batch-frames", nargs="+", type=int, default=[1])
     parser.add_argument(
         "--compute-precision",
         choices=["fp16", "fp32"],
@@ -37,6 +38,12 @@ def main():
     args = parser.parse_args()
     if args.capacity <= 0:
         parser.error("capacity must be positive")
+    if args.batch_frames != sorted(set(args.batch_frames)) or args.batch_frames[0] != 1:
+        parser.error("batch-frames must increase from one")
+    if args.batch_frames[-1] > args.capacity or (
+        len(args.batch_frames) > 1 and args.component != "decoder"
+    ):
+        parser.error("batch-frames must fit the waveform decoder capacity")
     compute_precision = args.compute_precision or (
         "fp16" if args.component == "decoder" else "fp32"
     )
@@ -102,7 +109,7 @@ def main():
         sample = torch.zeros(
             1, codec.decoder.config.num_quantizers, 1, dtype=torch.int32
         )
-        input_shape = tuple(sample.shape)
+        input_shape = enumerated_axis(sample, (2,), args.batch_frames)
         input_name, output_name = "codes", "audio"
         input_dtype, output_dtype = np.int32, np.float32
     module.eval()
@@ -119,8 +126,14 @@ def main():
         mask[..., -1] = 0
         samples = (sample, cosine, sine, mask)
         inputs.extend(
-            ct.TensorType(name=name, shape=tuple(value.shape), dtype=np.float16)
-            for name, value in zip(["cosine", "sine", "mask"], samples[1:])
+            ct.TensorType(
+                name=name,
+                shape=enumerated_axis(value, axes, args.batch_frames),
+                dtype=np.float16,
+            )
+            for name, value, axes in zip(
+                ["cosine", "sine", "mask"], samples[1:], [(2,), (2,), (2, 3)]
+            )
         )
         states = [
             ct.StateType(
@@ -163,6 +176,7 @@ def main():
                 **(
                     {
                         "execution": "stateful_frame",
+                        "batch_frames": args.batch_frames,
                         "attention_window": codec.decoder.config.sliding_window,
                         "rotary_frequencies": codec.decoder.pre_transformer.rotary_emb.inv_freq.tolist(),
                         "rotary_scaling": codec.decoder.pre_transformer.rotary_emb.attention_scaling,

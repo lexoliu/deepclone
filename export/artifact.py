@@ -16,6 +16,21 @@ from coremltools.optimize.coreml import (
 )
 
 
+def enumerated_axis(value, axes, lengths):
+    default = tuple(value.shape)
+    if len(lengths) == 1:
+        return default
+    # Examples use a single frame or token. In a sliding attention mask,
+    # the key axis incorporates each additional query as well.
+    shapes = []
+    for length in lengths:
+        shape = list(default)
+        for dimension in axes:
+            shape[dimension] += length - 1
+        shapes.append(shape)
+    return ct.EnumeratedShapes(shapes, default=default)
+
+
 def save(model, output, weight_bits):
     if output.exists():
         raise FileExistsError(output)
@@ -78,7 +93,9 @@ def placement(path):
     }
 
 
-def convert(module, inputs, names, outputs, output, weight_bits, states=()):
+def convert(
+    module, inputs, names, outputs, output, weight_bits, states=(), shapes=None
+):
     module.eval()
     with torch.inference_mode():
         traced = torch.jit.trace(module, inputs, check_trace=False)
@@ -90,7 +107,7 @@ def convert(module, inputs, names, outputs, output, weight_bits, states=()):
         inputs=[
             ct.TensorType(
                 name=name,
-                shape=tuple(value.shape),
+                shape=(shapes or {}).get(name, tuple(value.shape)),
                 dtype=np.int32 if value.dtype == torch.int32 else np.float16,
             )
             for name, value in zip(names, inputs)

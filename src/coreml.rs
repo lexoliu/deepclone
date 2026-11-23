@@ -1,5 +1,6 @@
 //! Core ML model loading and native tensor execution.
 use crate::{
+    coreml_batch::BatchSizes,
     decoder::Decoder,
     generation::Model as Backend,
     inference::{Assets, AudioContract, Config, Engine, Error, Sampling},
@@ -7,7 +8,7 @@ use crate::{
 };
 use ondevice_coreml::{ComputeUnits, DataType, Function, Inputs, Model, Session, Tensor, f16};
 use serde::Deserialize;
-use std::{fs::File, io::BufReader, path::Path};
+use std::{fs::File, io::BufReader, num::NonZeroUsize, path::Path};
 #[derive(Deserialize)]
 struct Manifest {
     weight_bits: u8,
@@ -27,6 +28,8 @@ struct DecoderFiles {
     chunks: Vec<String>,
     heads: Vec<String>,
     rope_theta: f32,
+    #[serde(default)]
+    sequence_lengths: BatchSizes,
 }
 
 pub struct CoreMl {
@@ -53,6 +56,7 @@ struct Waveform {
     window: usize,
     groups: usize,
     samples_per_frame: usize,
+    batch_frames: BatchSizes,
     packed: Vec<i32>,
     samples: Vec<f32>,
     frames: usize,
@@ -67,11 +71,15 @@ impl Waveform {
             rotary_frequencies: Vec<f32>,
             rotary_scaling: f32,
             code_groups: usize,
+            capacity: usize,
+            #[serde(default)]
+            batch_frames: BatchSizes,
         }
         let contract: Contract = json(path.with_extension("contract.json"))?;
-        if contract.execution != "stateful_frame" {
+        if contract.execution != "stateful_frame" || !contract.batch_frames.fits(contract.capacity)
+        {
             return Err(Error::Contract(
-                "waveform decoder requires stateful_frame execution",
+                "invalid stateful waveform execution contract",
             ));
         }
         let function = open(path, units)?;
@@ -110,12 +118,13 @@ impl Waveform {
         }
         if description.states.is_empty()
             || !description.outputs.get("audio").is_some_and(|output| {
-                output.default_shape == [1, 1, samples_per_frame]
-                    && output.data_type == DataType::Float32
+                output.data_type == DataType::Float32
+                    && (output.default_shape == [1, 1, samples_per_frame]
+                        || (contract.batch_frames.flexible() && output.default_shape.is_empty()))
             })
         {
             return Err(Error::Contract(
-                "waveform decoder requires state and one frame of PCM",
+                "waveform decoder requires state and PCM output",
             ));
         }
         Ok(Self {
@@ -125,6 +134,7 @@ impl Waveform {
             window: contract.attention_window,
             groups: contract.code_groups,
             samples_per_frame,
+            batch_frames: contract.batch_frames,
             packed: Vec::new(),
             samples: Vec::new(),
             frames: 0,
@@ -155,8 +165,10 @@ impl Waveform {
         if !extends {
             self.reset();
         }
-        for index in self.frames..frames {
-            let result = self.step(&packed, frames, index);
+        let mut index = self.frames;
+        while let Some(remaining) = NonZeroUsize::new(frames - index) {
+            let length = self.batch_frames.batch(remaining);
+            let result = self.step(&packed, frames, index, length);
             match result {
                 Ok(samples) => self.samples.extend(samples),
                 Err(error) => {
@@ -164,31 +176,52 @@ impl Waveform {
                     return Err(error);
                 }
             }
+            index += length;
         }
         self.frames = frames;
         self.packed = packed;
         Ok(self.samples.clone())
     }
 
-    fn step(&mut self, packed: &[i32], frames: usize, index: usize) -> Result<Vec<f32>, Error> {
+    fn step(
+        &mut self,
+        packed: &[i32],
+        frames: usize,
+        index: usize,
+        length: usize,
+    ) -> Result<Vec<f32>, Error> {
         let codes: Vec<_> = (0..self.groups)
-            .map(|group| packed[group * frames + index])
+            .flat_map(|group| {
+                packed[group * frames + index..group * frames + index + length]
+                    .iter()
+                    .copied()
+            })
             .collect();
-        let codes = Tensor::from_slice(&[1, self.groups, 1], &codes)?;
-        let mut cosines = Vec::with_capacity(self.frequencies.len() * 2);
-        let mut sines = Vec::with_capacity(self.frequencies.len() * 2);
-        for frequency in &self.frequencies {
-            let (sine, cosine) = (frequency * index as f32).sin_cos();
-            cosines.push(f16::from_f32(cosine * self.rotary_scaling));
-            sines.push(f16::from_f32(sine * self.rotary_scaling));
+        let codes = Tensor::from_slice(&[1, self.groups, length], &codes)?;
+        let head_dim = self.frequencies.len() * 2;
+        let mut cosines = Vec::with_capacity(head_dim * length);
+        let mut sines = Vec::with_capacity(head_dim * length);
+        for position in index..index + length {
+            let start = cosines.len();
+            for frequency in &self.frequencies {
+                let (sine, cosine) = (frequency * position as f32).sin_cos();
+                cosines.push(f16::from_f32(cosine * self.rotary_scaling));
+                sines.push(f16::from_f32(sine * self.rotary_scaling));
+            }
+            cosines.extend_from_within(start..);
+            sines.extend_from_within(start..);
         }
-        cosines.extend_from_within(..);
-        sines.extend_from_within(..);
-        let cosine = Tensor::from_slice(&[1, 1, 1, cosines.len()], &cosines)?;
-        let sine = Tensor::from_slice(&[1, 1, 1, sines.len()], &sines)?;
-        let mut mask = vec![f16::MIN; self.window];
-        mask[self.window - (index + 1).min(self.window)..].fill(f16::ZERO);
-        let mask = Tensor::from_slice(&[1, 1, 1, self.window], &mask)?;
+        let cosine = Tensor::from_slice(&[1, 1, length, head_dim], &cosines)?;
+        let sine = Tensor::from_slice(&[1, 1, length, head_dim], &sines)?;
+        let columns = self.window + length - 1;
+        let mut mask = vec![f16::MIN; length * columns];
+        // The graph joins the previous window minus its oldest frame with this batch.
+        let first_present = (self.window - 1).saturating_sub(index);
+        for frame in 0..length {
+            let offset = frame * columns;
+            mask[offset + first_present.max(frame)..offset + self.window + frame].fill(f16::ZERO);
+        }
+        let mask = Tensor::from_slice(&[1, 1, length, columns], &mask)?;
         let mut inputs = Inputs::new();
         inputs.insert("codes", &codes)?;
         inputs.insert("cosine", &cosine)?;
@@ -201,14 +234,13 @@ impl Waveform {
                 operation: "waveform decoder",
                 source,
             })?
-            .tensor::<f32>("audio")?
-            .read();
-        if audio.data().len() != self.samples_per_frame {
+            .tensor::<f32>("audio")?;
+        if audio.shape() != [1, 1, length * self.samples_per_frame] {
             return Err(Error::Contract(
-                "waveform decoder returned an incomplete frame",
+                "waveform decoder returned an unexpected PCM span",
             ));
         }
-        Ok(audio.into_data())
+        Ok(audio.read().into_data())
     }
 }
 fn json<T: serde::de::DeserializeOwned>(path: impl AsRef<Path>) -> Result<T, Error> {
@@ -239,9 +271,10 @@ impl<T: TokenSampler, S: TokenSampler> Engine<CoreMl, T, S> {
         let tokenizer = tokenizers::Tokenizer::from_file(transformers.join("tokenizer.json"))
             .map_err(|e| Error::Tokenizer(e.to_string()))?;
         let load_decoder = |files: &DecoderFiles| {
-            Decoder::open(
+            Decoder::open_with_lengths(
                 files.chunks.iter().map(|p| transformers.join(p)),
                 files.rope_theta,
+                files.sequence_lengths.clone(),
                 units,
             )
         };
@@ -350,18 +383,14 @@ impl Backend for CoreMl {
         let _measurement = self.profile.measure("talker");
         Ok(self.talker.step(hidden)?)
     }
-    #[cfg(all(test, feature = "cli"))]
     fn prefill(
         &mut self,
         first: Self::Hidden,
         remaining: impl IntoIterator<Item = Self::Hidden>,
     ) -> Result<Self::Hidden, Error> {
+        #[cfg(all(test, feature = "cli"))]
         let _measurement = self.profile.measure("prefill");
-        let mut hidden = self.talker.step(first)?;
-        for value in remaining {
-            hidden = self.talker.step(value)?;
-        }
-        Ok(hidden)
+        Ok(self.talker.prefill(first, remaining)?)
     }
     async fn talker_head(
         &mut self,
@@ -547,7 +576,12 @@ fn add(a: &Tensor<f16>, b: &Tensor<f16>) -> Result<Tensor<f16>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{env, fs, io::Write, path::PathBuf, time::Instant};
+    use std::{
+        env, fs,
+        io::{BufWriter, Write},
+        path::PathBuf,
+        time::Instant,
+    };
 
     #[test]
     #[ignore = "requires a compiled incremental decoder and recorded real acoustic codes"]
@@ -614,10 +648,11 @@ mod tests {
         let relative_error = (difference / energy).sqrt();
         let output = path("DEEPCLONE_OUTPUT");
         fs::create_dir_all(&output).unwrap();
-        let mut samples = File::create(output.join("audio.f32le")).unwrap();
+        let mut samples = BufWriter::new(File::create(output.join("audio.f32le")).unwrap());
         for value in &actual {
             samples.write_all(&value.to_le_bytes()).unwrap();
         }
+        samples.flush().unwrap();
         serde_json::to_writer(
             File::create(output.join("report.json")).unwrap(),
             &serde_json::json!({
