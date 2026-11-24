@@ -42,7 +42,6 @@ impl Linear {
 /// Independent projections sharing one input execute as one matrix multiplication.
 pub(crate) struct JoinedLinear<const N: usize> {
     projection: Linear,
-    widths: [usize; N],
 }
 impl<const N: usize> JoinedLinear<N> {
     pub fn load(weights: &impl WeightSource, prefixes: [String; N]) -> Result<Self, Error> {
@@ -50,7 +49,6 @@ impl<const N: usize> JoinedLinear<N> {
             .iter()
             .map(|p| Linear::load(weights, p))
             .collect::<Result<Vec<_>, _>>()?;
-        let widths = std::array::from_fn(|i| layers[i].weight.dims()[1]);
         let bias = if layers.iter().any(|layer| layer.bias.is_some()) {
             Some(Tensor::cat(
                 layers
@@ -79,19 +77,10 @@ impl<const N: usize> JoinedLinear<N> {
         .transpose();
         Ok(Self {
             projection: Linear { weight, bias },
-            widths,
         })
     }
-    pub fn forward(&self, input: Tensor<3>) -> [Tensor<3>; N] {
-        let output = self.projection.forward(input);
-        let [batch, tokens, _] = output.dims();
-        let mut offset = 0;
-        std::array::from_fn(|i| {
-            let end = offset + self.widths[i];
-            let part = output.clone().slice([0..batch, 0..tokens, offset..end]);
-            offset = end;
-            part
-        })
+    pub fn raw(&self, input: Tensor<3>) -> Tensor<3> {
+        self.projection.forward(input)
     }
 }
 
@@ -106,13 +95,14 @@ impl RmsNorm {
             epsilon,
         })
     }
+    pub fn weight(&self) -> &Tensor<1> {
+        &self.weight
+    }
     pub fn forward<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {
-        // Qwen accumulates normalization statistics in FP32, then restores
-        // the activation dtype before applying its learned scale.
-        let dtype = x.dtype();
-        let x = x.cast(DType::F32);
-        let variance = (x.clone() * x.clone()).mean_dim(D - 1);
-        (x * (variance + self.epsilon).sqrt().recip()).cast(dtype) * self.weight.clone().unsqueeze()
+        super::fused::rms_norm(x, self.weight.clone(), self.epsilon)
+    }
+    pub fn add_forward(&self, residual: Tensor<3>, delta: Tensor<3>) -> (Tensor<3>, Tensor<3>) {
+        super::fused::add_rms_norm(residual, delta, self.weight.clone(), self.epsilon)
     }
 }
 
