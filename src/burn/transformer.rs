@@ -20,14 +20,12 @@ pub struct DecoderConfig {
 struct Layer {
     input: RmsNorm,
     post: RmsNorm,
-    query_norm: RmsNorm,
-    key_norm: RmsNorm,
+    qk_norm: Tensor<2>,
     qkv: JoinedLinear<3>,
     output: Linear,
     gate_up: JoinedLinear<2>,
     down: Linear,
-    keys: Tensor<4>,
-    values: Tensor<4>,
+    kv: Option<(Tensor<4>, Tensor<4>)>,
 }
 impl Layer {
     fn load(
@@ -37,6 +35,15 @@ impl Layer {
         capacity: usize,
     ) -> Result<Self, Error> {
         let shape = [1, c.num_key_value_heads, capacity, c.head_dim];
+        let query_norm = RmsNorm::load(w, &format!("{prefix}.self_attn.q_norm"), c.rms_norm_eps)?;
+        let key_norm = RmsNorm::load(w, &format!("{prefix}.self_attn.k_norm"), c.rms_norm_eps)?;
+        let qk_norm = Tensor::cat(
+            vec![
+                query_norm.weight().clone().unsqueeze_dim(0),
+                key_norm.weight().clone().unsqueeze_dim(0),
+            ],
+            0,
+        );
         Ok(Self {
             input: RmsNorm::load(w, &format!("{prefix}.input_layernorm"), c.rms_norm_eps)?,
             post: RmsNorm::load(
@@ -44,8 +51,7 @@ impl Layer {
                 &format!("{prefix}.post_attention_layernorm"),
                 c.rms_norm_eps,
             )?,
-            query_norm: RmsNorm::load(w, &format!("{prefix}.self_attn.q_norm"), c.rms_norm_eps)?,
-            key_norm: RmsNorm::load(w, &format!("{prefix}.self_attn.k_norm"), c.rms_norm_eps)?,
+            qk_norm,
             qkv: JoinedLinear::load(
                 w,
                 ["q", "k", "v"].map(|name| format!("{prefix}.self_attn.{name}_proj")),
@@ -58,54 +64,46 @@ impl Layer {
             // The gated activation accumulates in FP32 while projection weights
             // retain model storage; GEMV converts each weight as it is read.
             down: Linear::load(w, &format!("{prefix}.mlp.down_proj"))?,
-            keys: Tensor::<4>::zeros(shape, w.device()).cast(w.dtype()),
-            values: Tensor::<4>::zeros(shape, w.device()).cast(w.dtype()),
+            kv: Some((
+                Tensor::<4>::zeros(shape, w.device()).cast(w.dtype()),
+                Tensor::<4>::zeros(shape, w.device()).cast(w.dtype()),
+            )),
         })
     }
+    /// Run one layer given the residual stream `x` and its already-normalized
+    /// input `normalized`. Returns the updated residual stream before adding
+    /// `down` (still in FP32) so the next layer can fuse the cast, residual
+    /// addition, and input normalization into one dispatch.
     fn forward(
         &mut self,
         x: Tensor<3>,
+        normalized: Tensor<3>,
         position: usize,
         c: &DecoderConfig,
-        cosine: &Tensor<4>,
-        sine: &Tensor<4>,
+        rotary: &Tensor<3>,
         mask: Option<&Tensor<4, Bool>>,
-    ) -> Tensor<3> {
+    ) -> (Tensor<3>, Tensor<3>) {
         let tokens = x.dims()[1];
-        let normalized = self.input.forward(x.clone());
-        let [q, k, v] = self.qkv.forward(normalized);
-        let q = self.query_norm.forward(
-            q.reshape([1, tokens, c.num_attention_heads, c.head_dim])
-                .swap_dims(1, 2),
+        let scale = (c.head_dim as f32).sqrt().recip();
+        let qkv = self.qkv.raw(normalized);
+        // Moving both caches into the fused kernel permits in-place updates;
+        // no alias of the full allocation survives between steps.
+        let (keys, values) = self.kv.take().expect("KV cache present");
+        let (q, keys, values) = super::fused::qkv_rope_cache(
+            qkv,
+            self.qk_norm.clone(),
+            rotary.clone(),
+            keys,
+            values,
+            position,
+            c.num_attention_heads,
+            c.num_key_value_heads,
+            c.head_dim,
+            c.rms_norm_eps,
+            scale,
         );
-        let k = self.key_norm.forward(
-            k.reshape([1, tokens, c.num_key_value_heads, c.head_dim])
-                .swap_dims(1, 2),
-        );
-        let v = v
-            .reshape([1, tokens, c.num_key_value_heads, c.head_dim])
-            .swap_dims(1, 2);
-        let q = rotary(q, cosine, sine);
-        let k = rotary(k, cosine, sine);
-        let selection = [
-            0..1,
-            0..c.num_key_value_heads,
-            position..position + tokens,
-            0..c.head_dim,
-        ];
-        // Moving the cache into slice_assign permits device-side in-place
-        // updates. No alias of the full allocation survives between steps.
-        self.keys
-            .inplace(|cache| cache.slice_assign(selection.clone(), k));
-        self.values
-            .inplace(|cache| cache.slice_assign(selection, v));
         let mixed = if tokens == 1 {
-            super::attention::decode(
-                q * (c.head_dim as f32).sqrt().recip(),
-                self.keys.clone(),
-                self.values.clone(),
-                position + tokens,
-            )
+            super::attention::decode(q, keys.clone(), values.clone(), position + tokens)
         } else {
             let selection = [
                 0..1,
@@ -116,22 +114,22 @@ impl Layer {
             let groups = c.num_attention_heads / c.num_key_value_heads;
             // Broadcast shared K/V over query groups instead of materializing repeated heads.
             let q = q.reshape([1, c.num_key_value_heads, groups, tokens, c.head_dim]);
-            let keys = self.keys.clone().slice(selection.clone()).reshape([
+            let keys_view = keys.clone().slice(selection.clone()).reshape([
                 1,
                 c.num_key_value_heads,
                 1,
                 position + tokens,
                 c.head_dim,
             ]);
-            let values = self.values.clone().slice(selection).reshape([
+            let values_view = values.clone().slice(selection).reshape([
                 1,
                 c.num_key_value_heads,
                 1,
                 position + tokens,
                 c.head_dim,
             ]);
-            let scores = (q * (c.head_dim as f32).sqrt().recip())
-                .matmul(keys.swap_dims(3, 4))
+            let scores = q
+                .matmul(keys_view.swap_dims(3, 4))
                 .cast(burn::tensor::DType::F32);
             let scores = match mask {
                 Some(mask) => scores.mask_fill(mask.clone().unsqueeze(), f32::NEG_INFINITY),
@@ -139,23 +137,22 @@ impl Layer {
             };
             activation::softmax(scores, 4)
                 .cast(x.dtype())
-                .matmul(values)
+                .matmul(values_view)
                 .reshape([1, c.num_attention_heads, tokens, c.head_dim])
         };
+        self.kv = Some((keys, values));
         let mixed = mixed
             .swap_dims(1, 2)
             .reshape([1, tokens, c.num_attention_heads * c.head_dim]);
-        let x = x + self.output.forward(mixed);
-        let normalized = self.post.forward(x.clone());
-        let [gate, up] = self.gate_up.forward(normalized);
-        x + self.down.gated(gate, up)
+        let projected = self.output.forward(mixed);
+        let (x, normalized) = self.post.add_forward(x, projected);
+        let gate_up = self.gate_up.raw(normalized);
+        let down = self.down.forward(super::fused::gated_silu(gate_up));
+        (x, down)
     }
 }
 pub(crate) fn rotary(x: Tensor<4>, cosine: &Tensor<4>, sine: &Tensor<4>) -> Tensor<4> {
-    let [b, h, t, d] = x.dims();
-    let first = x.clone().slice([0..b, 0..h, 0..t, 0..d / 2]);
-    let second = x.clone().slice([0..b, 0..h, 0..t, d / 2..d]);
-    x * cosine.clone() + Tensor::cat(vec![-second, first], 3) * sine.clone()
+    super::fused::rotary(x, cosine.clone(), sine.clone())
 }
 /// One decoder's weights and independently owned KV cache. Resetting invalidates
 /// the old prefix without reading or clearing unused device storage.
@@ -165,8 +162,7 @@ pub struct Decoder {
     config: DecoderConfig,
     capacity: usize,
     position: usize,
-    cosine: Tensor<4>,
-    sine: Tensor<4>,
+    rotary: Tensor<3>,
 }
 impl Decoder {
     pub fn load(
@@ -196,13 +192,19 @@ impl Decoder {
             config.head_dim,
             config.rope_theta,
         );
+        let rotary = Tensor::cat(
+            vec![
+                cosine.reshape([1, capacity, config.head_dim]),
+                sine.reshape([1, capacity, config.head_dim]),
+            ],
+            0,
+        );
         Ok(Self {
             layers: (0..config.num_hidden_layers)
                 .map(|i| Layer::load(weights, &format!("{prefix}.layers.{i}"), &config, capacity))
                 .collect::<Result<_, _>>()?,
             norm: RmsNorm::load(weights, &format!("{prefix}.norm"), config.rms_norm_eps)?,
-            cosine,
-            sine,
+            rotary,
             config,
             capacity,
             position: 0,
@@ -226,14 +228,6 @@ impl Decoder {
                     .into(),
             });
         }
-        let slice = [
-            0..1,
-            0..1,
-            self.position..self.position + tokens,
-            0..self.config.head_dim,
-        ];
-        let cosine = self.cosine.clone().slice(slice.clone());
-        let sine = self.sine.clone().slice(slice);
         let mask = if tokens > 1 {
             let device = hidden.device();
             let queries = Tensor::<1, Int>::arange(
@@ -251,15 +245,25 @@ impl Decoder {
         } else {
             None
         };
-        for layer in &mut self.layers {
-            hidden = layer.forward(
-                hidden,
-                self.position,
-                &self.config,
-                &cosine,
-                &sine,
-                mask.as_ref(),
-            );
+        if !self.layers.is_empty() {
+            let dtype = hidden.dtype();
+            let mut normalized = self.layers[0].input.forward(hidden.clone());
+            for index in 0..self.layers.len() {
+                let (residual, down) = self.layers[index].forward(
+                    hidden,
+                    normalized,
+                    self.position,
+                    &self.config,
+                    &self.rotary,
+                    mask.as_ref(),
+                );
+                if index + 1 < self.layers.len() {
+                    (hidden, normalized) = self.layers[index + 1].input.add_forward(residual, down);
+                } else {
+                    hidden = residual + down.cast(dtype);
+                    break;
+                }
+            }
         }
         // Submit each autoregressive step without waiting for GPU completion.
         // This keeps a long reference prefix from accumulating one fusion queue.
