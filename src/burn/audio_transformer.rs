@@ -1,6 +1,6 @@
 use super::{
     Error, WeightSource,
-    layers::{LayerNorm, Linear, RmsNorm},
+    layers::{JoinedLinear, LayerNorm, Linear, RmsNorm},
 };
 use burn::tensor::{DType, Device, Int, Tensor, TensorData, activation};
 use serde::Deserialize;
@@ -39,21 +39,21 @@ pub(crate) trait FeedForward: Sized {
     fn apply(&self, x: Tensor<3>) -> Tensor<3>;
 }
 pub(crate) struct Gated {
-    gate: Linear,
-    up: Linear,
+    gate_up: JoinedLinear<2>,
     down: Linear,
 }
 impl FeedForward for Gated {
     fn load(w: &impl WeightSource, p: &str) -> Result<Self, Error> {
         Ok(Self {
-            gate: Linear::load(w, &format!("{p}.gate_proj"))?,
-            up: Linear::load(w, &format!("{p}.up_proj"))?,
+            gate_up: JoinedLinear::load(w, ["gate", "up"].map(|name| format!("{p}.{name}_proj")))?,
             down: Linear::load(w, &format!("{p}.down_proj"))?.cast(DType::F32),
         })
     }
     fn apply(&self, x: Tensor<3>) -> Tensor<3> {
+        let dtype = x.dtype();
         self.down
-            .gated(self.gate.forward(x.clone()), self.up.forward(x))
+            .forward(super::fused::gated_silu(self.gate_up.raw(x)))
+            .cast(dtype)
     }
 }
 pub(crate) struct Gelu {
@@ -75,9 +75,7 @@ struct Layer<N, F> {
     input: N,
     post: N,
     mlp: F,
-    query: Linear,
-    key: Linear,
-    value: Linear,
+    qkv: JoinedLinear<3>,
     output: Linear,
     attention_scale: Tensor<1>,
     mlp_scale: Tensor<1>,
@@ -88,9 +86,10 @@ impl<N: Norm, F: FeedForward> Layer<N, F> {
             input: N::load(w, &format!("{p}.input_layernorm"), e)?,
             post: N::load(w, &format!("{p}.post_attention_layernorm"), e)?,
             mlp: F::load(w, &format!("{p}.mlp"))?,
-            query: Linear::load(w, &format!("{p}.self_attn.q_proj"))?,
-            key: Linear::load(w, &format!("{p}.self_attn.k_proj"))?,
-            value: Linear::load(w, &format!("{p}.self_attn.v_proj"))?,
+            qkv: JoinedLinear::load(
+                w,
+                ["q", "k", "v"].map(|name| format!("{p}.self_attn.{name}_proj")),
+            )?,
             output: Linear::load(w, &format!("{p}.self_attn.o_proj"))?,
             attention_scale: w.tensor(&format!("{p}.self_attn_layer_scale.scale"))?,
             mlp_scale: w.tensor(&format!("{p}.mlp_layer_scale.scale"))?,
@@ -107,19 +106,21 @@ impl<N: Norm, F: FeedForward> Layer<N, F> {
     ) -> Tensor<3> {
         let [b, t, _] = x.dims();
         let n = self.input.apply(x.clone());
-        let q = self
-            .query
-            .forward(n.clone())
+        let qkv = self.qkv.raw(n);
+        let q_width = c.num_attention_heads * c.head_dim;
+        let kv_width = c.num_key_value_heads * c.head_dim;
+        let q = qkv
+            .clone()
+            .slice([0..b, 0..t, 0..q_width])
             .reshape([b, t, c.num_attention_heads, c.head_dim])
             .swap_dims(1, 2);
-        let k = self
-            .key
-            .forward(n.clone())
+        let k = qkv
+            .clone()
+            .slice([0..b, 0..t, q_width..q_width + kv_width])
             .reshape([b, t, c.num_key_value_heads, c.head_dim])
             .swap_dims(1, 2);
-        let v = self
-            .value
-            .forward(n)
+        let v = qkv
+            .slice([0..b, 0..t, q_width + kv_width..q_width + 2 * kv_width])
             .reshape([b, t, c.num_key_value_heads, c.head_dim])
             .swap_dims(1, 2);
         let q = super::transformer::rotary(q, cosine, sine);
@@ -134,9 +135,13 @@ impl<N: Norm, F: FeedForward> Layer<N, F> {
         *history = Some((k.clone(), v.clone()));
         let keys = k.dims()[2];
         let expand = |x: Tensor<4>| {
-            x.reshape([b, c.num_key_value_heads, 1, keys, c.head_dim])
-                .repeat_dim(2, c.num_attention_heads / c.num_key_value_heads)
-                .reshape([b, c.num_attention_heads, keys, c.head_dim])
+            if c.num_attention_heads == c.num_key_value_heads {
+                x
+            } else {
+                x.reshape([b, c.num_key_value_heads, 1, keys, c.head_dim])
+                    .repeat_dim(2, c.num_attention_heads / c.num_key_value_heads)
+                    .reshape([b, c.num_attention_heads, keys, c.head_dim])
+            }
         };
         let scores = (q * (c.head_dim as f32).sqrt().recip())
             .matmul(expand(k).swap_dims(2, 3))
