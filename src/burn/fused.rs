@@ -2,12 +2,39 @@
 use burn::cubecl;
 use burn::{
     backend::{
-        Backend, Dispatch, TensorMetadata, backend_extension, cubecl::dtype_to_storage_type,
-        fusion::custom::TensorSpec, ops::FloatTensorOps, tensor::FloatTensor, wgpu::CubeBackend,
+        Backend, Dispatch, TensorMetadata, backend_extension,
+        cubecl::dtype_to_storage_type,
+        fusion::custom::TensorSpec,
+        ops::FloatTensorOps,
+        tensor::FloatTensor,
+        wgpu::{CubeBackend, CubeTensor},
     },
     cubecl::{ir::ElemType, prelude::*},
     tensor::{DType, FloatDType, Shape, Tensor as BurnTensor},
 };
+
+fn into_contiguous(tensor: CubeTensor) -> CubeTensor {
+    if tensor.is_contiguous() {
+        return tensor;
+    }
+    let (client, device, dtype) = (tensor.client.clone(), tensor.device.clone(), tensor.dtype);
+    let output = burn::cubecl::std::tensor::into_contiguous(
+        &client,
+        tensor.binding(),
+        dtype_to_storage_type(dtype),
+    );
+    CubeTensor::new(client, output.handle, *output.metadata, device, dtype)
+}
+
+fn into_mut_contiguous(tensor: CubeTensor) -> CubeTensor {
+    if tensor.can_mut() && tensor.is_contiguous() && tensor.is_nonoverlapping() {
+        tensor
+    } else if tensor.is_contiguous() {
+        tensor.copy()
+    } else {
+        into_contiguous(tensor)
+    }
+}
 
 #[backend_extension(Cube, Fusion)]
 trait FusedTransformer: Backend {
@@ -159,16 +186,8 @@ impl FusedTransformer for CubeBackend {
         weight: FloatTensor<Self>,
         epsilon: f32,
     ) -> FloatTensor<Self> {
-        let input = if input.is_contiguous() {
-            input
-        } else {
-            input.copy()
-        };
-        let weight = if weight.is_contiguous() {
-            weight
-        } else {
-            weight.copy()
-        };
+        let input = into_contiguous(input);
+        let weight = into_contiguous(weight);
         let shape = input.shape();
         let width = weight.shape()[0];
         let rows = shape.num_elements() / width;
@@ -197,22 +216,9 @@ impl FusedTransformer for CubeBackend {
         weight: FloatTensor<Self>,
         epsilon: f32,
     ) -> (FloatTensor<Self>, FloatTensor<Self>) {
-        let sum = if residual.can_mut() && residual.is_contiguous() && residual.is_nonoverlapping()
-        {
-            residual
-        } else {
-            residual.copy()
-        };
-        let delta = if delta.is_contiguous() {
-            delta
-        } else {
-            delta.copy()
-        };
-        let weight = if weight.is_contiguous() {
-            weight
-        } else {
-            weight.copy()
-        };
+        let sum = into_mut_contiguous(residual);
+        let delta = into_contiguous(delta);
+        let weight = into_contiguous(weight);
         let shape = sum.shape();
         let width = weight.shape()[0];
         let rows = shape.num_elements() / width;
@@ -252,27 +258,11 @@ impl FusedTransformer for CubeBackend {
         epsilon: f32,
         scale: f32,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
-        let qkv = if qkv.is_contiguous() { qkv } else { qkv.copy() };
-        let qk_norm = if qk_norm.is_contiguous() {
-            qk_norm
-        } else {
-            qk_norm.copy()
-        };
-        let rotary = if rotary.is_contiguous() {
-            rotary
-        } else {
-            rotary.copy()
-        };
-        let keys = if keys.can_mut() && keys.is_contiguous() && keys.is_nonoverlapping() {
-            keys
-        } else {
-            keys.copy()
-        };
-        let values = if values.can_mut() && values.is_contiguous() && values.is_nonoverlapping() {
-            values
-        } else {
-            values.copy()
-        };
+        let qkv = into_contiguous(qkv);
+        let qk_norm = into_contiguous(qk_norm);
+        let rotary = into_contiguous(rotary);
+        let keys = into_mut_contiguous(keys);
+        let values = into_mut_contiguous(values);
         let tokens = qkv.shape()[1];
         let capacity = keys.shape()[2];
         let query = Self::float_empty(
@@ -308,11 +298,7 @@ impl FusedTransformer for CubeBackend {
     }
 
     fn gated_silu(gate_up: FloatTensor<Self>) -> FloatTensor<Self> {
-        let gate_up = if gate_up.is_contiguous() {
-            gate_up
-        } else {
-            gate_up.copy()
-        };
+        let gate_up = into_contiguous(gate_up);
         let shape = gate_up.shape();
         let batch = shape[0];
         let tokens = shape[1];
@@ -344,21 +330,9 @@ impl FusedTransformer for CubeBackend {
         cosine: FloatTensor<Self>,
         sine: FloatTensor<Self>,
     ) -> FloatTensor<Self> {
-        let input = if input.is_contiguous() {
-            input
-        } else {
-            input.copy()
-        };
-        let cosine = if cosine.is_contiguous() {
-            cosine
-        } else {
-            cosine.copy()
-        };
-        let sine = if sine.is_contiguous() {
-            sine
-        } else {
-            sine.copy()
-        };
+        let input = into_contiguous(input);
+        let cosine = into_contiguous(cosine);
+        let sine = into_contiguous(sine);
         let shape = input.shape();
         let [batch, heads, tokens, width] = [shape[0], shape[1], shape[2], shape[3]];
         let output = Self::float_empty(shape, &input.device, input.dtype.into());
@@ -574,7 +548,10 @@ fn gated_silu_kernel<F: Float>(
     let base = row * (inter * 2);
     let g = f32::cast_from(gate_up[base + col]);
     let u = f32::cast_from(gate_up[base + inter + col]);
-    output[idx] = (g / (1f32 + (0f32 - g).exp())) * u;
+    // Match burn::tensor::activation::silu's sigmoid expression so FP16
+    // attention-sink rounding boundaries stay aligned between single-token
+    // and batched steps.
+    output[idx] = g * (0f32 - (1f32 + (0f32 - g).exp()).ln()).exp() * u;
 }
 
 #[cube(launch)]
@@ -882,7 +859,8 @@ mod tests {
                     }
                 }
 
-                // Gated SiLU including values exceeding FP16 range when multiplied.
+                // Gated SiLU including values exceeding FP16 range when multiplied,
+                // plus multi-token model dimensions matching [1, 2, 6144].
                 let gate_up = BurnTensor::<3>::from_data(
                     TensorData::new(
                         vec![400.0, -2.5, 0.5, 1.25, 200.0, 3.0, -4.0, 2.0],
@@ -906,6 +884,73 @@ mod tests {
                     .map(|(a, b)| (a - b).abs())
                     .fold(0f32, f32::max);
                 assert!(max_err < 1e-2, "gated_silu {dtype:?}: {max_err}");
+
+                let inter = 3072usize;
+                let gu2_data: Vec<f32> = (0..2 * 2 * inter)
+                    .map(|i| ((i * 17 + 3) as f32).sin() * 8.0)
+                    .collect();
+                let gu2 = BurnTensor::<3>::from_data(
+                    TensorData::new(gu2_data.clone(), [1, 2, 2 * inter]),
+                    (&device, dtype),
+                );
+                let gu1 = BurnTensor::<3>::from_data(
+                    TensorData::new(gu2_data[..2 * inter].to_vec(), [1, 1, 2 * inter]),
+                    (&device, dtype),
+                );
+                let exp2 =
+                    activation::silu(gu2.clone().slice([0..1, 0..2, 0..inter]).cast(DType::F32))
+                        * gu2
+                            .clone()
+                            .slice([0..1, 0..2, inter..2 * inter])
+                            .cast(DType::F32);
+                let act2 = gated_silu(gu2);
+                let act1 = gated_silu(gu1);
+                let ((a2, e2), a1) = futures_lite::future::zip(
+                    futures_lite::future::zip(super::super::read(act2), super::super::read(exp2)),
+                    super::super::read(act1),
+                )
+                .await;
+                let (a2, e2, a1) = (a2.unwrap(), e2.unwrap(), a1.unwrap());
+                assert_eq!(
+                    &a2[..inter],
+                    &a1[..],
+                    "gated_silu row 0 differs between t=1 and t=2 ({dtype:?})"
+                );
+                let max_err2 = a2
+                    .iter()
+                    .zip(&e2)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(max_err2 < 1e-4, "gated_silu 2x3072 {dtype:?}: {max_err2}");
+
+                // Non-contiguous 4D rms_norm (swap_dims layout used by q_norm/k_norm).
+                let nc = BurnTensor::<4>::from_data(
+                    TensorData::new(
+                        (0..2 * 16 * 128)
+                            .map(|i| ((i * 29) as f32).sin() * 2.0)
+                            .collect(),
+                        [1, 2, 16, 128],
+                    ),
+                    (&device, dtype),
+                )
+                .swap_dims(1, 2);
+                let nc_exp = unfused_rms_norm(nc.clone(), q_norm_w.clone(), eps);
+                let nc_act = rms_norm(nc, q_norm_w.clone(), eps);
+                let (nc_a, nc_e) = futures_lite::future::zip(
+                    super::super::read(nc_act),
+                    super::super::read(nc_exp),
+                )
+                .await;
+                let nc_err = nc_a
+                    .unwrap()
+                    .into_iter()
+                    .zip(nc_e.unwrap())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    nc_err < if dtype == DType::F16 { 0.002 } else { 1e-5 },
+                    "noncontig rms_norm {dtype:?}: {nc_err}"
+                );
 
                 // Standalone rotary used by AudioTransformer.
                 let audio_x = BurnTensor::<4>::from_data(
