@@ -13,7 +13,7 @@ use burn::{
     tensor::{DType, FloatDType, Shape, Tensor as BurnTensor},
 };
 
-fn into_contiguous(tensor: CubeTensor) -> CubeTensor {
+pub(super) fn into_contiguous(tensor: CubeTensor) -> CubeTensor {
     if tensor.is_contiguous() {
         return tensor;
     }
@@ -26,7 +26,7 @@ fn into_contiguous(tensor: CubeTensor) -> CubeTensor {
     CubeTensor::new(client, output.handle, *output.metadata, device, dtype)
 }
 
-fn into_mut_contiguous(tensor: CubeTensor) -> CubeTensor {
+pub(super) fn into_mut_contiguous(tensor: CubeTensor) -> CubeTensor {
     if tensor.can_mut() && tensor.is_contiguous() && tensor.is_nonoverlapping() {
         tensor
     } else if tensor.is_contiguous() {
@@ -170,7 +170,7 @@ fn reduction_lanes(client: &burn::cubecl::client::Client, work: usize) -> usize 
     work.max(1).next_power_of_two().min(max_pow2)
 }
 
-fn row_grid(rows: usize, max_x: u32) -> CubeCount {
+pub(super) fn row_grid(rows: usize, max_x: u32) -> CubeCount {
     let max_x = max_x as usize;
     if rows <= max_x {
         CubeCount::Static(rows as u32, 1, 1)

@@ -1,5 +1,5 @@
 use super::{Error, WeightSource};
-use burn::tensor::{DType, Tensor, activation};
+use burn::tensor::{DType, Tensor};
 
 pub(crate) struct Linear {
     weight: Tensor<2>,
@@ -18,12 +18,6 @@ impl Linear {
         self.weight = self.weight.cast(dtype);
         self.bias = self.bias.map(|bias| bias.cast(dtype));
         self
-    }
-    pub fn gated(&self, gate: Tensor<3>, up: Tensor<3>) -> Tensor<3> {
-        // Qwen's gated intermediate can exceed FP16 while its projection fits.
-        let dtype = gate.dtype();
-        let product = activation::silu(gate.cast(DType::F32)) * up.cast(DType::F32);
-        self.forward(product).cast(dtype)
     }
     pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let dtype = x.dtype();
@@ -107,6 +101,7 @@ impl RmsNorm {
 }
 
 pub(crate) trait Padding {
+    const CAUSAL_ZERO: bool = false;
     fn apply(&self, x: Tensor<3>, kernel: usize, stride: usize) -> Tensor<3>;
 }
 pub(crate) struct Causal;
@@ -128,6 +123,7 @@ fn causal_pad(
     )
 }
 impl Padding for Causal {
+    const CAUSAL_ZERO: bool = true;
     fn apply(&self, x: Tensor<3>, kernel: usize, stride: usize) -> Tensor<3> {
         causal_pad(x, kernel, stride, burn::tensor::ops::PadMode::Constant(0.0))
     }
@@ -151,9 +147,35 @@ pub(crate) struct Conv<P> {
     weight: Tensor<3>,
     bias: Option<Tensor<1>>,
     options: burn::tensor::ops::ConvOptions<1>,
+    kernel: usize,
+    packed: bool,
     padding: P,
 }
 impl<P: Padding> Conv<P> {
+    fn from_parts(
+        weight: Tensor<3>,
+        bias: Option<Tensor<1>>,
+        options: burn::tensor::ops::ConvOptions<1>,
+        padding: P,
+    ) -> Self {
+        let kernel = weight.dims()[2];
+        let packed = P::CAUSAL_ZERO && options.stride == [1] && options.groups == 1;
+        // Pack `[C_out, C_in, K]` to contiguous `[K, C_out, C_in]` once at load
+        // so tiled channel-first causal convolutions read coalesced input channels.
+        let weight = if packed {
+            super::conv::contiguous(weight.permute([2, 0, 1]))
+        } else {
+            weight
+        };
+        Self {
+            weight,
+            bias,
+            options,
+            kernel,
+            packed,
+            padding,
+        }
+    }
     pub fn load(
         weights: &impl WeightSource,
         prefix: &str,
@@ -162,15 +184,42 @@ impl<P: Padding> Conv<P> {
         groups: usize,
         padding: P,
     ) -> Result<Self, Error> {
-        Ok(Self {
-            weight: weights.tensor(&format!("{prefix}.weight"))?,
-            bias: weights.optional(&format!("{prefix}.bias"))?,
-            options: burn::tensor::ops::ConvOptions::new([stride], [0], [dilation], groups),
+        Ok(Self::from_parts(
+            weights.tensor(&format!("{prefix}.weight"))?,
+            weights.optional(&format!("{prefix}.bias"))?,
+            burn::tensor::ops::ConvOptions::new([stride], [0], [dilation], groups),
             padding,
-        })
+        ))
+    }
+    fn is_causal_depthwise(&self) -> bool {
+        P::CAUSAL_ZERO
+            && !self.packed
+            && self.options.stride == [1]
+            && self.options.groups == self.weight.dims()[0]
+            && self.weight.dims()[1] == 1
     }
     pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
-        let kernel = (self.weight.dims()[2] - 1) * self.options.dilation[0] + 1;
+        if self.packed {
+            return super::conv::causal_conv1d(
+                x,
+                None,
+                self.weight.clone(),
+                self.bias.clone(),
+                self.options.dilation[0],
+            );
+        }
+        if self.is_causal_depthwise() {
+            return super::conv::depthwise_causal_conv1d(
+                x,
+                None,
+                self.weight
+                    .clone()
+                    .reshape([self.options.groups, self.kernel]),
+                self.bias.clone(),
+                self.options.dilation[0],
+            );
+        }
+        let kernel = (self.kernel - 1) * self.options.dilation[0] + 1;
         let x = self.padding.apply(x, kernel, self.options.stride[0]);
         self.convolve(x)
     }
@@ -206,8 +255,43 @@ impl Conv<Causal> {
     pub fn stream(&self, x: Tensor<3>, history: &mut ConvHistory) -> Tensor<3> {
         // Every convolution in Qwen's waveform decoder has unit stride.
         debug_assert_eq!(self.options.stride[0], 1);
-        let context = (self.weight.dims()[2] - 1) * self.options.dilation[0];
-        let x = match history.input.take() {
+        let context = (self.kernel - 1) * self.options.dilation[0];
+        let previous = history.input.take();
+        if self.packed || self.is_causal_depthwise() {
+            let [b, c, t] = x.dims();
+            if context > 0 {
+                history.input = Some(if t >= context {
+                    x.clone().slice([0..b, 0..c, t - context..t])
+                } else {
+                    let combined = match &previous {
+                        Some(prev) => Tensor::cat(vec![prev.clone(), x.clone()], 2),
+                        None => self.padding.apply(x.clone(), context + 1, 1),
+                    };
+                    let ct = combined.dims()[2];
+                    combined.slice([0..b, 0..c, ct - context..ct])
+                });
+            }
+            return if self.packed {
+                super::conv::causal_conv1d(
+                    x,
+                    previous,
+                    self.weight.clone(),
+                    self.bias.clone(),
+                    self.options.dilation[0],
+                )
+            } else {
+                super::conv::depthwise_causal_conv1d(
+                    x,
+                    previous,
+                    self.weight
+                        .clone()
+                        .reshape([self.options.groups, self.kernel]),
+                    self.bias.clone(),
+                    self.options.dilation[0],
+                )
+            };
+        }
+        let x = match previous {
             Some(previous) => Tensor::cat(vec![previous, x], 2),
             None => self.padding.apply(x, context + 1, 1),
         };
@@ -244,42 +328,38 @@ pub(crate) struct TransposeConv {
 }
 impl TransposeConv {
     pub fn load(weights: &impl WeightSource, prefix: &str, stride: usize) -> Result<Self, Error> {
+        let weight = weights.tensor::<3>(&format!("{prefix}.weight"))?;
+        // Pack `[C_in, C_out, K]` to contiguous `[K, C_out, C_in]` once at load
+        // so phase-grouped transposed convolutions read coalesced input channels.
         Ok(Self {
-            weight: weights.tensor(&format!("{prefix}.weight"))?,
+            weight: super::conv::contiguous(weight.permute([2, 1, 0])),
             bias: weights.optional(&format!("{prefix}.bias"))?,
             stride,
         })
     }
-    pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
-        let frames = x.dims()[2] * self.stride;
-        let y = burn::tensor::module::conv_transpose1d(
-            x,
-            self.weight.clone(),
-            self.bias.clone(),
-            burn::tensor::ops::ConvTransposeOptions::new([self.stride], [0], [0], [1], 1),
-        );
-        let [b, c, _] = y.dims();
-        y.slice([0..b, 0..c, 0..frames])
-    }
-}
-
-impl TransposeConv {
     pub fn stream(&self, x: Tensor<3>, history: &mut ConvHistory) -> Tensor<3> {
-        let context = (self.weight.dims()[2] - self.stride).div_ceil(self.stride);
-        let (x, previous) = match history.input.take() {
-            Some(previous) => {
-                let frames = previous.dims()[2];
-                (Tensor::cat(vec![previous, x], 2), frames)
-            }
-            None => (x, 0),
-        };
+        let context = (self.weight.dims()[0] - self.stride).div_ceil(self.stride);
+        let previous = history.input.take();
         let [b, c, t] = x.dims();
         if context > 0 {
-            history.input = Some(x.clone().slice([0..b, 0..c, t.saturating_sub(context)..t]));
+            history.input = Some(if t >= context {
+                x.clone().slice([0..b, 0..c, t - context..t])
+            } else {
+                let combined = match &previous {
+                    Some(prev) => Tensor::cat(vec![prev.clone(), x.clone()], 2),
+                    None => x.clone(),
+                };
+                let ct = combined.dims()[2];
+                combined.slice([0..b, 0..c, ct.saturating_sub(context)..ct])
+            });
         }
-        let y = self.forward(x);
-        let [b, c, t] = y.dims();
-        y.slice([0..b, 0..c, previous * self.stride..t])
+        super::conv::causal_conv_transpose1d(
+            x,
+            previous,
+            self.weight.clone(),
+            self.bias.clone(),
+            self.stride,
+        )
     }
 }
 
@@ -316,51 +396,53 @@ mod tests {
                             for [kernel, stride, dilation, groups] in
                                 [[1, 1, 1, 1], [3, 1, 2, 1], [1, 1, 1, 2], [3, 2, 1, 1]]
                             {
-                                let layer = Conv {
-                                    weight: Tensor::from_data(
+                                let raw_weight = Tensor::from_data(
+                                    TensorData::new(
+                                        (0..outputs * channels / groups * kernel)
+                                            .map(|i| (i as f32 * 0.031).cos() / 100.)
+                                            .collect::<Vec<_>>(),
+                                        [outputs, channels / groups, kernel],
+                                    ),
+                                    (&device, dtype),
+                                );
+                                let raw_bias = bias.then(|| {
+                                    Tensor::from_data(
                                         TensorData::new(
-                                            (0..outputs * channels / groups * kernel)
-                                                .map(|i| (i as f32 * 0.031).cos() / 100.)
+                                            (0..outputs)
+                                                .map(|i| i as f32 / 100.)
                                                 .collect::<Vec<_>>(),
-                                            [outputs, channels / groups, kernel],
+                                            [outputs],
                                         ),
                                         (&device, dtype),
-                                    ),
-                                    bias: bias.then(|| {
-                                        Tensor::from_data(
-                                            TensorData::new(
-                                                (0..outputs)
-                                                    .map(|i| i as f32 / 100.)
-                                                    .collect::<Vec<_>>(),
-                                                [outputs],
-                                            ),
-                                            (&device, dtype),
-                                        )
-                                    }),
-                                    options: burn::tensor::ops::ConvOptions::new(
+                                    )
+                                });
+                                let layer = Conv::from_parts(
+                                    raw_weight.clone(),
+                                    raw_bias.clone(),
+                                    burn::tensor::ops::ConvOptions::new(
                                         [stride],
                                         [0],
                                         [dilation],
                                         groups,
                                     ),
-                                    padding: Causal,
-                                };
+                                    Causal,
+                                );
                                 let padded = layer.padding.apply(
                                     input.clone(),
                                     (kernel - 1) * dilation + 1,
                                     stride,
                                 );
-                                let pointwise = kernel == 1 && groups == 1 && stride == 1;
-                                let reference_dtype = if pointwise { DType::F32 } else { dtype };
+                                let unit_causal = stride == 1 && groups == 1;
+                                let reference_dtype = if unit_causal { DType::F32 } else { dtype };
                                 let reference = burn::tensor::module::conv1d(
                                     padded.cast(reference_dtype),
-                                    layer.weight.clone().cast(reference_dtype),
-                                    layer.bias.clone().map(|v| v.cast(reference_dtype)),
+                                    raw_weight.cast(reference_dtype),
+                                    raw_bias.map(|v| v.cast(reference_dtype)),
                                     layer.options.clone(),
                                 )
                                 .cast(dtype);
                                 let mut actual = vec![layer.forward(input.clone())];
-                                if pointwise {
+                                if stride == 1 {
                                     let mut history = ConvHistory::default();
                                     let mut start = 0;
                                     let spans = [1, 8, time];
@@ -415,17 +497,17 @@ mod tests {
                 ),
                 bias: None,
             };
-            let gate = Tensor::from_data(
-                TensorData::new(vec![400f32], [1, 1, 1]),
+            let gate_up = Tensor::from_data(
+                TensorData::new(vec![400f32, 200f32], [1, 1, 2]),
                 (&device, DType::F16),
             );
-            let up = Tensor::from_data(
-                TensorData::new(vec![200f32], [1, 1, 1]),
-                (&device, DType::F16),
-            );
-            let result = super::super::read(projection.gated(gate, up))
-                .await
-                .unwrap();
+            let result = super::super::read(
+                projection
+                    .forward(super::super::fused::gated_silu(gate_up))
+                    .cast(DType::F16),
+            )
+            .await
+            .unwrap();
             assert_eq!(result, vec![10000.0]);
         });
     }

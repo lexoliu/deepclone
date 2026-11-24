@@ -58,23 +58,21 @@ impl Quantizer {
     }
 }
 struct Snake {
-    alpha: Tensor<3>,
-    inverse_beta: Tensor<3>,
+    alpha: Tensor<1>,
+    inverse_beta: Tensor<1>,
 }
 impl Snake {
     fn load(w: &impl WeightSource, p: &str) -> Result<Self, Error> {
         let alpha = w.tensor::<1>(&format!("{p}.alpha"))?.exp();
-        let channels = alpha.dims()[0];
         // SnakeBeta specifies a 1e-9 denominator stabilizer.
         let inverse_beta = (w.tensor::<1>(&format!("{p}.beta"))?.exp() + 1e-9).recip();
         Ok(Self {
-            alpha: alpha.reshape([1, channels, 1]),
-            inverse_beta: inverse_beta.reshape([1, channels, 1]),
+            alpha,
+            inverse_beta,
         })
     }
     fn forward(&self, x: Tensor<3>) -> Tensor<3> {
-        let periodic = (x.clone() * self.alpha.clone()).sin();
-        x + periodic.clone() * periodic * self.inverse_beta.clone()
+        super::conv::snake(x, self.alpha.clone(), self.inverse_beta.clone())
     }
 }
 struct Residual {
