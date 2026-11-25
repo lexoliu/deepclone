@@ -9,9 +9,11 @@ use burn::{
         tensor::FloatTensor,
         wgpu::{CubeBackend, CubeTensor},
     },
-    cubecl::{ir::ElemType, prelude::*},
+    cubecl::{ir::ElemType, prelude::*, tensor_vector_size_parallel},
     tensor::{DType, FloatDType, Shape, Tensor as BurnTensor},
 };
+
+use super::gemv::lane_sum;
 
 pub(super) fn into_contiguous(tensor: CubeTensor) -> CubeTensor {
     if tensor.is_contiguous() {
@@ -210,6 +212,16 @@ fn reduction_lanes(client: &burn::cubecl::client::Client, work: usize) -> usize 
     work.max(1).next_power_of_two().min(max_pow2)
 }
 
+fn last_dim_vec_size(tensor: &CubeTensor) -> usize {
+    let last = tensor.shape().num_dims() - 1;
+    tensor_vector_size_parallel(
+        tensor.client.io_optimized_vector_sizes(tensor.dtype.size()),
+        tensor.meta.shape(),
+        tensor.meta.strides(),
+        last,
+    )
+}
+
 pub(super) fn row_grid(rows: usize, max_x: u32) -> CubeCount {
     let max_x = max_x as usize;
     if rows <= max_x {
@@ -232,12 +244,17 @@ impl FusedTransformer for CubeBackend {
         let width = weight.shape()[0];
         let rows = shape.num_elements() / width;
         let output = Self::float_empty(shape, &input.device, input.dtype.into());
-        let lanes = reduction_lanes(&input.client, width);
+        let vec_w = last_dim_vec_size(&input)
+            .min(last_dim_vec_size(&weight))
+            .min(last_dim_vec_size(&output))
+            .min(4);
+        let lanes = reduction_lanes(&input.client, width / vec_w);
         let max_x = input.client.properties().hardware.max_cube_count.0;
         rms_norm_kernel::launch(
             &input.client,
             row_grid(rows, max_x),
             CubeDim::new_1d(lanes as u32),
+            vec_w,
             input.clone().into_tensor_arg(),
             weight.into_tensor_arg(),
             output.clone().into_tensor_arg(),
@@ -263,12 +280,18 @@ impl FusedTransformer for CubeBackend {
         let width = weight.shape()[0];
         let rows = shape.num_elements() / width;
         let normed = Self::float_empty(shape, &sum.device, sum.dtype.into());
-        let lanes = reduction_lanes(&sum.client, width);
+        let vec_w = last_dim_vec_size(&sum)
+            .min(last_dim_vec_size(&delta))
+            .min(last_dim_vec_size(&weight))
+            .min(last_dim_vec_size(&normed))
+            .min(4);
+        let lanes = reduction_lanes(&sum.client, width / vec_w);
         let max_x = sum.client.properties().hardware.max_cube_count.0;
         add_rms_norm_kernel::launch(
             &sum.client,
             row_grid(rows, max_x),
             CubeDim::new_1d(lanes as u32),
+            vec_w,
             sum.clone().into_tensor_arg(),
             delta.clone().into_tensor_arg(),
             weight.into_tensor_arg(),
@@ -318,12 +341,27 @@ impl FusedTransformer for CubeBackend {
             qkv.dtype.into(),
         );
         let half = head_dim / 2;
-        let lanes = reduction_lanes(&qkv.client, half);
+        let raw_vec_w = last_dim_vec_size(&qkv)
+            .min(last_dim_vec_size(&qk_norm))
+            .min(last_dim_vec_size(&rotary))
+            .min(last_dim_vec_size(&query))
+            .min(last_dim_vec_size(&keys))
+            .min(last_dim_vec_size(&values))
+            .min(4);
+        let vec_w = if half.is_multiple_of(raw_vec_w) {
+            raw_vec_w
+        } else if half.is_multiple_of(2) && raw_vec_w >= 2 {
+            2
+        } else {
+            1
+        };
+        let lanes = reduction_lanes(&qkv.client, half / vec_w);
         let total_heads = num_q_heads + 2 * num_kv_heads;
         qkv_rope_cache_kernel::launch(
             &qkv.client,
             CubeCount::Static(total_heads as u32, tokens as u32, 1),
             CubeDim::new_1d(lanes as u32),
+            vec_w,
             qkv.clone().into_tensor_arg(),
             qk_norm.into_tensor_arg(),
             rotary.into_tensor_arg(),
@@ -357,18 +395,27 @@ impl FusedTransformer for CubeBackend {
             &gate_up.device,
             FloatDType::F32,
         );
-        let total = batch * tokens * inter;
-        let dim = CubeDim::new(&gate_up.client, total);
-        let groups = total.div_ceil(dim.num_elems() as usize);
+        let vec_w = last_dim_vec_size(&gate_up)
+            .min(last_dim_vec_size(&output))
+            .min(4);
+        let inter_vecs = inter / vec_w;
+        let total_vecs = batch * tokens * inter_vecs;
+        let dim = if total_vecs >= 64 {
+            CubeDim::new_1d(64)
+        } else {
+            CubeDim::new(&gate_up.client, total_vecs)
+        };
+        let groups = total_vecs.div_ceil(dim.num_elems() as usize);
         let max_x = gate_up.client.properties().hardware.max_cube_count.0;
         gated_silu_kernel::launch(
             &gate_up.client,
             row_grid(groups, max_x),
             dim,
+            vec_w,
             gate_up.clone().into_tensor_arg(),
             output.clone().into_tensor_arg(),
-            total,
-            inter,
+            total_vecs,
+            inter_vecs,
             dtype_to_storage_type(gate_up.dtype),
         );
         output
@@ -386,11 +433,24 @@ impl FusedTransformer for CubeBackend {
         let [batch, heads, tokens, width] = [shape[0], shape[1], shape[2], shape[3]];
         let output = Self::float_empty(shape, &input.device, input.dtype.into());
         let half = width / 2;
-        let lanes = reduction_lanes(&input.client, half);
+        let raw_vec_w = last_dim_vec_size(&input)
+            .min(last_dim_vec_size(&cosine))
+            .min(last_dim_vec_size(&sine))
+            .min(last_dim_vec_size(&output))
+            .min(4);
+        let vec_w = if half.is_multiple_of(raw_vec_w) {
+            raw_vec_w
+        } else if half.is_multiple_of(2) && raw_vec_w >= 2 {
+            2
+        } else {
+            1
+        };
+        let lanes = reduction_lanes(&input.client, half / vec_w);
         rotary_kernel::launch(
             &input.client,
             CubeCount::Static(heads as u32, tokens as u32, batch as u32),
             CubeDim::new_1d(lanes as u32),
+            vec_w,
             input.clone().into_tensor_arg(),
             cosine.into_tensor_arg(),
             sine.into_tensor_arg(),
@@ -405,10 +465,10 @@ impl FusedTransformer for CubeBackend {
 }
 
 #[cube(launch)]
-fn rms_norm_kernel<F: Float>(
-    input: &Tensor<F>,
-    weight: &Tensor<F>,
-    output: &mut Tensor<F>,
+fn rms_norm_kernel<F: Float, N: Size>(
+    input: &Tensor<Vector<F, N>>,
+    weight: &Tensor<Vector<F, N>>,
+    output: &mut Tensor<Vector<F, N>>,
     rows: usize,
     width: usize,
     epsilon: f32,
@@ -419,12 +479,14 @@ fn rms_norm_kernel<F: Float>(
     if row >= rows {
         terminate!();
     }
-    let base = row * width;
+    let vec_size = input.vector_size();
+    let width_vecs = width / vec_size;
+    let base = row * width_vecs;
     let sum = RuntimeCell::<f32>::new(0f32);
     let mut col = UNIT_POS as usize;
-    while col < width {
-        let v = f32::cast_from(input[base + col]);
-        sum.store(sum.read() + v * v);
+    while col < width_vecs {
+        let v = Vector::<f32, N>::cast_from(input[base + col]);
+        sum.store(sum.read() + lane_sum(v * v));
         col += lanes;
     }
     let mut partial = Shared::<[f32]>::new_slice(lanes);
@@ -438,21 +500,21 @@ fn rms_norm_kernel<F: Float>(
         }
         sync_cube();
     }
-    let inv = (partial[0] / (width as f32) + epsilon).sqrt().recip();
+    let inv = Vector::<f32, N>::new((partial[0] / (width as f32) + epsilon).sqrt().recip());
     let mut col = UNIT_POS as usize;
-    while col < width {
-        let v = f32::cast_from(input[base + col]);
-        output[base + col] = F::cast_from(v * inv) * weight[col];
+    while col < width_vecs {
+        let v = Vector::<f32, N>::cast_from(input[base + col]);
+        output[base + col] = Vector::<F, N>::cast_from(v * inv) * weight[col];
         col += lanes;
     }
 }
 
 #[cube(launch)]
-fn add_rms_norm_kernel<F: Float, D: Float>(
-    sum: &mut Tensor<F>,
-    delta: &Tensor<D>,
-    weight: &Tensor<F>,
-    normed: &mut Tensor<F>,
+fn add_rms_norm_kernel<F: Float, D: Float, N: Size>(
+    sum: &mut Tensor<Vector<F, N>>,
+    delta: &Tensor<Vector<D, N>>,
+    weight: &Tensor<Vector<F, N>>,
+    normed: &mut Tensor<Vector<F, N>>,
     rows: usize,
     width: usize,
     epsilon: f32,
@@ -463,14 +525,16 @@ fn add_rms_norm_kernel<F: Float, D: Float>(
     if row >= rows {
         terminate!();
     }
-    let base = row * width;
+    let vec_size = sum.vector_size();
+    let width_vecs = width / vec_size;
+    let base = row * width_vecs;
     let sq = RuntimeCell::<f32>::new(0f32);
     let mut col = UNIT_POS as usize;
-    while col < width {
-        let s = sum[base + col] + F::cast_from(delta[base + col]);
+    while col < width_vecs {
+        let s = sum[base + col] + Vector::<F, N>::cast_from(delta[base + col]);
         sum[base + col] = s;
-        let v = f32::cast_from(s);
-        sq.store(sq.read() + v * v);
+        let v = Vector::<f32, N>::cast_from(s);
+        sq.store(sq.read() + lane_sum(v * v));
         col += lanes;
     }
     let mut partial = Shared::<[f32]>::new_slice(lanes);
@@ -484,24 +548,24 @@ fn add_rms_norm_kernel<F: Float, D: Float>(
         }
         sync_cube();
     }
-    let inv = (partial[0] / (width as f32) + epsilon).sqrt().recip();
+    let inv = Vector::<f32, N>::new((partial[0] / (width as f32) + epsilon).sqrt().recip());
     let mut col = UNIT_POS as usize;
-    while col < width {
-        let v = f32::cast_from(sum[base + col]);
-        normed[base + col] = F::cast_from(v * inv) * weight[col];
+    while col < width_vecs {
+        let v = Vector::<f32, N>::cast_from(sum[base + col]);
+        normed[base + col] = Vector::<F, N>::cast_from(v * inv) * weight[col];
         col += lanes;
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 #[cube(launch)]
-fn qkv_rope_cache_kernel<F: Float>(
-    qkv: &Tensor<F>,
-    qk_norm: &Tensor<F>,
-    rotary: &Tensor<F>,
-    query: &mut Tensor<F>,
-    keys: &mut Tensor<F>,
-    values: &mut Tensor<F>,
+fn qkv_rope_cache_kernel<F: Float, N: Size>(
+    qkv: &Tensor<Vector<F, N>>,
+    qk_norm: &Tensor<Vector<F, N>>,
+    rotary: &Tensor<Vector<F, N>>,
+    query: &mut Tensor<Vector<F, N>>,
+    keys: &mut Tensor<Vector<F, N>>,
+    values: &mut Tensor<Vector<F, N>>,
     position: usize,
     rotary_position: usize,
     tokens: usize,
@@ -517,10 +581,12 @@ fn qkv_rope_cache_kernel<F: Float>(
 ) {
     let head = CUBE_POS_X as usize;
     let token = CUBE_POS_Y as usize;
-    let half = comptime!(head_dim / 2);
+    let vec_size = qkv.vector_size();
+    let head_vecs = comptime!(head_dim / vec_size);
+    let half_vecs = comptime!((head_dim / 2) / vec_size);
     let total_heads = comptime!(num_q_heads + 2 * num_kv_heads);
-    let qkv_stride = comptime!(total_heads * head_dim);
-    let src_base = token * qkv_stride + head * head_dim;
+    let qkv_stride = comptime!(total_heads * head_vecs);
+    let src_base = token * qkv_stride + head * head_vecs;
     let abs_pos = position + token;
     let rot_pos = rotary_position + token;
 
@@ -529,10 +595,10 @@ fn qkv_rope_cache_kernel<F: Float>(
         if comptime!(has_qk_norm) {
             let sq = RuntimeCell::<f32>::new(0f32);
             let mut d = UNIT_POS as usize;
-            while d < half {
-                let a = f32::cast_from(qkv[src_base + d]);
-                let b = f32::cast_from(qkv[src_base + d + half]);
-                sq.store(sq.read() + a * a + b * b);
+            while d < half_vecs {
+                let a = Vector::<f32, N>::cast_from(qkv[src_base + d]);
+                let b = Vector::<f32, N>::cast_from(qkv[src_base + d + half_vecs]);
+                sq.store(sq.read() + lane_sum(a * a + b * b));
                 d += lanes;
             }
             let mut partial = Shared::<[f32]>::new_slice(lanes);
@@ -549,80 +615,84 @@ fn qkv_rope_cache_kernel<F: Float>(
             inv = (partial[0] / (head_dim as f32) + epsilon).sqrt().recip();
         }
         let is_q = head < num_q_heads;
-        let norm_base = if is_q { 0usize } else { head_dim };
-        let cos_base = rot_pos * head_dim;
-        let sin_base = rotary.stride(0) + rot_pos * head_dim;
-        let scale_f = F::cast_from(scale);
+        let norm_base = if is_q { 0usize } else { head_vecs };
+        let cos_base = rot_pos * head_vecs;
+        let sin_base = rotary.stride(0) / vec_size + rot_pos * head_vecs;
+        let inv_vec = Vector::<f32, N>::new(inv);
+        let scale_f = Vector::<F, N>::new(F::cast_from(scale));
+        let zero_f = Vector::<F, N>::new(F::new(0_f32));
         let mut d = UNIT_POS as usize;
-        while d < half {
+        while d < half_vecs {
             let na = if comptime!(has_qk_norm) {
-                let a = f32::cast_from(qkv[src_base + d]);
-                F::cast_from(a * inv) * qk_norm[norm_base + d]
+                let a = Vector::<f32, N>::cast_from(qkv[src_base + d]);
+                Vector::<F, N>::cast_from(a * inv_vec) * qk_norm[norm_base + d]
             } else {
                 qkv[src_base + d]
             };
             let nb = if comptime!(has_qk_norm) {
-                let b = f32::cast_from(qkv[src_base + d + half]);
-                F::cast_from(b * inv) * qk_norm[norm_base + d + half]
+                let b = Vector::<f32, N>::cast_from(qkv[src_base + d + half_vecs]);
+                Vector::<F, N>::cast_from(b * inv_vec) * qk_norm[norm_base + d + half_vecs]
             } else {
-                qkv[src_base + d + half]
+                qkv[src_base + d + half_vecs]
             };
-            let ra = na * rotary[cos_base + d] + (F::new(0_f32) - nb) * rotary[sin_base + d];
-            let rb = nb * rotary[cos_base + d + half] + na * rotary[sin_base + d + half];
+            let ra = na * rotary[cos_base + d] + (zero_f - nb) * rotary[sin_base + d];
+            let rb = nb * rotary[cos_base + d + half_vecs] + na * rotary[sin_base + d + half_vecs];
             if is_q {
-                let dst_base = (head * tokens + token) * head_dim;
+                let dst_base = (head * tokens + token) * head_vecs;
                 query[dst_base + d] = ra * scale_f;
-                query[dst_base + d + half] = rb * scale_f;
+                query[dst_base + d + half_vecs] = rb * scale_f;
             } else {
                 let kv_head = head - num_q_heads;
-                let dst_base = (kv_head * capacity + abs_pos) * head_dim;
+                let dst_base = (kv_head * capacity + abs_pos) * head_vecs;
                 keys[dst_base + d] = ra;
-                keys[dst_base + d + half] = rb;
+                keys[dst_base + d + half_vecs] = rb;
             }
             d += lanes;
         }
     } else {
         let kv_head = head - comptime!(num_q_heads + num_kv_heads);
-        let dst_base = (kv_head * capacity + abs_pos) * head_dim;
+        let dst_base = (kv_head * capacity + abs_pos) * head_vecs;
         let mut d = UNIT_POS as usize;
-        while d < half {
+        while d < half_vecs {
             values[dst_base + d] = qkv[src_base + d];
-            values[dst_base + d + half] = qkv[src_base + d + half];
+            values[dst_base + d + half_vecs] = qkv[src_base + d + half_vecs];
             d += lanes;
         }
     }
 }
 
 #[cube(launch)]
-fn gated_silu_kernel<F: Float>(
-    gate_up: &Tensor<F>,
-    output: &mut Tensor<f32>,
-    total: usize,
-    inter: usize,
+fn gated_silu_kernel<F: Float, N: Size>(
+    gate_up: &Tensor<Vector<F, N>>,
+    output: &mut Tensor<Vector<f32, N>>,
+    total_vecs: usize,
+    inter_vecs: usize,
     #[define(F)] _dtype: ElemType,
 ) {
     let cube = (CUBE_POS_X as usize) + (CUBE_POS_Y as usize) * (CUBE_COUNT_X as usize);
     let idx = cube * (CUBE_DIM as usize) + (UNIT_POS as usize);
-    if idx >= total {
+    if idx >= total_vecs {
         terminate!();
     }
-    let row = idx / inter;
-    let col = idx - row * inter;
-    let base = row * (inter * 2);
-    let g = f32::cast_from(gate_up[base + col]);
-    let u = f32::cast_from(gate_up[base + inter + col]);
+    let row = idx / inter_vecs;
+    let col = idx - row * inter_vecs;
+    let base = row * (inter_vecs * 2usize);
+    let g = Vector::<f32, N>::cast_from(gate_up[base + col]);
+    let u = Vector::<f32, N>::cast_from(gate_up[base + inter_vecs + col]);
     // Match burn::tensor::activation::silu's sigmoid expression so FP16
     // attention-sink rounding boundaries stay aligned between single-token
     // and batched steps.
-    output[idx] = g * (0f32 - (1f32 + (0f32 - g).exp()).ln()).exp() * u;
+    let zero = Vector::<f32, N>::new(0f32);
+    let one = Vector::<f32, N>::new(1f32);
+    output[idx] = g * (zero - (one + (zero - g).exp()).ln()).exp() * u;
 }
 
 #[cube(launch)]
-fn rotary_kernel<F: Float>(
-    input: &Tensor<F>,
-    cosine: &Tensor<F>,
-    sine: &Tensor<F>,
-    output: &mut Tensor<F>,
+fn rotary_kernel<F: Float, N: Size>(
+    input: &Tensor<Vector<F, N>>,
+    cosine: &Tensor<Vector<F, N>>,
+    sine: &Tensor<Vector<F, N>>,
+    output: &mut Tensor<Vector<F, N>>,
     heads: usize,
     tokens: usize,
     width: usize,
@@ -631,17 +701,19 @@ fn rotary_kernel<F: Float>(
     let head = CUBE_POS_X as usize;
     let token = CUBE_POS_Y as usize;
     let batch = CUBE_POS_Z as usize;
-    let half = width / 2;
-    let x_base = ((batch * heads + head) * tokens + token) * width;
-    let cs_base = token * width;
+    let vec_size = input.vector_size();
+    let width_vecs = width / vec_size;
+    let half_vecs = width_vecs / 2usize;
+    let x_base = ((batch * heads + head) * tokens + token) * width_vecs;
+    let cs_base = token * width_vecs;
+    let zero = Vector::<F, N>::new(F::new(0_f32));
     let mut col = UNIT_POS as usize;
-    while col < half {
+    while col < half_vecs {
         let a = input[x_base + col];
-        let b = input[x_base + col + half];
-        output[x_base + col] =
-            a * cosine[cs_base + col] + (F::new(0_f32) - b) * sine[cs_base + col];
-        output[x_base + col + half] =
-            b * cosine[cs_base + col + half] + a * sine[cs_base + col + half];
+        let b = input[x_base + col + half_vecs];
+        output[x_base + col] = a * cosine[cs_base + col] + (zero - b) * sine[cs_base + col];
+        output[x_base + col + half_vecs] =
+            b * cosine[cs_base + col + half_vecs] + a * sine[cs_base + col + half_vecs];
         col += CUBE_DIM as usize;
     }
 }
