@@ -218,7 +218,13 @@ impl Decoder {
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
-    pub fn step(&mut self, mut hidden: Tensor<3>) -> Result<Tensor<3>, Error> {
+    pub fn step(&mut self, hidden: Tensor<3>) -> Result<Tensor<3>, Error> {
+        self.step_inner(hidden, true)
+    }
+    pub(crate) fn step_unflushed(&mut self, hidden: Tensor<3>) -> Result<Tensor<3>, Error> {
+        self.step_inner(hidden, false)
+    }
+    fn step_inner(&mut self, mut hidden: Tensor<3>, flush: bool) -> Result<Tensor<3>, Error> {
         let [batch, tokens, width] = hidden.dims();
         if tokens > self.capacity - self.position {
             return Err(Error::Context(self.capacity));
@@ -269,12 +275,15 @@ impl Decoder {
                 }
             }
         }
-        // Submit each autoregressive step without waiting for GPU completion.
-        // This keeps a long reference prefix from accumulating one fusion queue.
-        hidden
-            .device()
-            .flush()
-            .map_err(|error| Error::Execution(error.to_string()))?;
+        // Submit each Talker step without waiting for GPU completion so long
+        // reference prefixes never accumulate one fusion queue. Short Predictor
+        // bursts defer flushing until the frame's token readback.
+        if flush {
+            hidden
+                .device()
+                .flush()
+                .map_err(|error| Error::Execution(error.to_string()))?;
+        }
         self.position += tokens;
         Ok(hidden)
     }

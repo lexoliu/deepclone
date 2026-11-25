@@ -125,36 +125,53 @@ fn gemv_cooperative_kernel<F: Float, W: Float, N: Size>(
     let s2 = RuntimeCell::<f32>::new(0f32);
     let s3 = RuntimeCell::<f32>::new(0f32);
 
-    // Preserve the weight-to-activation cast at each load while reusing each
-    // vectorized activation read across four adjacent output columns.
+    let w0 = col0 * w_stride;
+    let w1 = col1 * w_stride;
+    let w2 = col2 * w_stride;
+    let w3 = col3 * w_stride;
+
+    // Preserve the weight-to-activation cast and eager 4-lane reduction at each
+    // step so single-token GEMV matches batched prefill's FP16 rounding boundaries,
+    // while hoisting full-tile bounds checks and row offsets outside the K-loop.
     let mut i = tx;
-    while i < k_vecs {
-        let x = if comptime!(vec_size > 1) {
-            Vector::<f32, N>::cast_from(input[i])
-        } else {
-            Vector::<f32, N>::cast_from(input[i * in_stride])
-        };
-        if has0 {
-            let w =
-                Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(weight[col0 * w_stride + i]));
-            s0.store(s0.read() + lane_sum(x * w));
+    if has3 {
+        while i < k_vecs {
+            let x = if comptime!(vec_size > 1) {
+                Vector::<f32, N>::cast_from(input[i])
+            } else {
+                Vector::<f32, N>::cast_from(input[i * in_stride])
+            };
+            let v0 = Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(weight[w0 + i]));
+            let v1 = Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(weight[w1 + i]));
+            let v2 = Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(weight[w2 + i]));
+            let v3 = Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(weight[w3 + i]));
+            s0.store(s0.read() + lane_sum(x * v0));
+            s1.store(s1.read() + lane_sum(x * v1));
+            s2.store(s2.read() + lane_sum(x * v2));
+            s3.store(s3.read() + lane_sum(x * v3));
+            i += COOP_LANES_X;
         }
-        if has1 {
-            let w =
-                Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(weight[col1 * w_stride + i]));
-            s1.store(s1.read() + lane_sum(x * w));
+    } else {
+        while i < k_vecs {
+            let x = if comptime!(vec_size > 1) {
+                Vector::<f32, N>::cast_from(input[i])
+            } else {
+                Vector::<f32, N>::cast_from(input[i * in_stride])
+            };
+            if has0 {
+                let v0 = Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(weight[w0 + i]));
+                s0.store(s0.read() + lane_sum(x * v0));
+            }
+            if has1 {
+                let v1 = Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(weight[w1 + i]));
+                s1.store(s1.read() + lane_sum(x * v1));
+            }
+            if has2 {
+                let v2 = Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(weight[w2 + i]));
+                s2.store(s2.read() + lane_sum(x * v2));
+            }
+            i += COOP_LANES_X;
         }
-        if has2 {
-            let w =
-                Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(weight[col2 * w_stride + i]));
-            s2.store(s2.read() + lane_sum(x * w));
-        }
-        if has3 {
-            let w =
-                Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(weight[col3 * w_stride + i]));
-            s3.store(s3.read() + lane_sum(x * w));
-        }
-        i += COOP_LANES_X;
     }
 
     let mut partial = Shared::<[f32]>::new_slice(COOP_OUTPUTS_PER_CUBE * COOP_LANES_X);
