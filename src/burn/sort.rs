@@ -1,5 +1,8 @@
 //! Stable device sorting for the small vocabularies used during autoregression.
 use burn::cubecl;
+use burn::cubecl::prelude::*;
+
+#[cfg(test)]
 use burn::{
     backend::{
         Backend, Dispatch, TensorMetadata, backend_extension,
@@ -7,10 +10,10 @@ use burn::{
         tensor::{FloatTensor, IntTensor},
         wgpu::CubeBackend,
     },
-    cubecl::prelude::*,
     tensor::{DType, FloatDType, Int, IntDType, Tensor as BurnTensor},
 };
 
+#[cfg(test)]
 #[backend_extension(Cube, Fusion)]
 trait VocabularySort: Backend {
     #[fusion(meta = |input| (
@@ -20,6 +23,7 @@ trait VocabularySort: Backend {
     fn vocabulary_sort(input: FloatTensor<Self>) -> (FloatTensor<Self>, IntTensor<Self>);
 }
 
+#[cfg(test)]
 pub(super) fn descending(input: BurnTensor<1>) -> (BurnTensor<1>, BurnTensor<1, Int>) {
     let (values, indices) = Dispatch::vocabulary_sort(input.into_dispatch());
     (
@@ -27,6 +31,8 @@ pub(super) fn descending(input: BurnTensor<1>) -> (BurnTensor<1>, BurnTensor<1, 
         BurnTensor::from_dispatch(indices),
     )
 }
+
+#[cfg(test)]
 impl VocabularySort for CubeBackend {
     fn vocabulary_sort(input: FloatTensor<Self>) -> (FloatTensor<Self>, IntTensor<Self>) {
         let shape = input.shape();
@@ -52,24 +58,17 @@ impl VocabularySort for CubeBackend {
     }
 }
 
-#[cube(launch)]
-fn stable_sort(
-    input: &Tensor<f32>,
-    values: &mut Tensor<f32>,
-    indices: &mut Tensor<i32>,
+#[cube]
+pub(super) fn bitonic_sort_indices<F: Float>(
+    input: &Tensor<F>,
+    data: &mut Shared<[u32]>,
     #[comptime] padded: usize,
     #[comptime] cached_scores: usize,
 ) {
-    // The first padded slots hold indices. If space permits, the remaining
-    // slots cache the original scores without duplicating the padded values.
-    let mut data = Shared::<[u32]>::new_slice(padded + cached_scores);
     let n = input.shape(0);
     let mut i = UNIT_POS as usize;
     while i < padded {
         data[i] = i as u32;
-        if cached_scores > 0 && i < n {
-            data[padded + i] = u32::reinterpret(input[i * input.stride(0)]);
-        }
         i += CUBE_DIM as usize;
     }
     sync_cube();
@@ -91,12 +90,12 @@ fn stable_sort(
                         let av = if cached_scores > 0 {
                             f32::reinterpret(data[padded + a])
                         } else {
-                            input[a * input.stride(0)]
+                            f32::cast_from(input[a * input.stride(0)])
                         };
                         let bv = if cached_scores > 0 {
                             f32::reinterpret(data[padded + b])
                         } else {
-                            input[b * input.stride(0)]
+                            f32::cast_from(input[b * input.stride(0)])
                         };
                         av > bv || (av == bv && a < b)
                     } else {
@@ -117,6 +116,29 @@ fn stable_sort(
         }
         size *= 2;
     }
+}
+
+#[cfg(test)]
+#[cube(launch)]
+fn stable_sort(
+    input: &Tensor<f32>,
+    values: &mut Tensor<f32>,
+    indices: &mut Tensor<i32>,
+    #[comptime] padded: usize,
+    #[comptime] cached_scores: usize,
+) {
+    // The first padded slots hold indices. If space permits, the remaining
+    // slots cache the original scores without duplicating the padded values.
+    let mut data = Shared::<[u32]>::new_slice(padded + cached_scores);
+    let n = input.shape(0);
+    if cached_scores > 0 {
+        let mut i = UNIT_POS as usize;
+        while i < n {
+            data[padded + i] = u32::reinterpret(input[i * input.stride(0)]);
+            i += CUBE_DIM as usize;
+        }
+    }
+    bitonic_sort_indices(input, &mut data, padded, cached_scores);
     let mut i = UNIT_POS as usize;
     while i < n {
         let original = data[i] as usize;
