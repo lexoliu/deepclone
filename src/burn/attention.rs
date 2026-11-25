@@ -22,6 +22,7 @@ trait DecodeAttention: Backend {
         keys: FloatTensor<Self>,
         values: FloatTensor<Self>,
         start_position: usize,
+        window: usize,
     ) -> FloatTensor<Self>;
 
     #[fusion(dtype = query, shape = Shape::from([1, query[1], 1, *length]))]
@@ -55,6 +56,7 @@ pub(super) fn decode(
             keys.into_dispatch(),
             values.into_dispatch(),
             length - 1,
+            0,
         ));
     }
     decode_unfused(query, keys, values, length)
@@ -66,11 +68,22 @@ pub(super) fn prefill(
     values: BurnTensor<4>,
     start_position: usize,
 ) -> BurnTensor<4> {
+    prefill_windowed(query, keys, values, start_position, 0)
+}
+
+pub(super) fn prefill_windowed(
+    query: BurnTensor<4>,
+    keys: BurnTensor<4>,
+    values: BurnTensor<4>,
+    start_position: usize,
+    window: usize,
+) -> BurnTensor<4> {
     BurnTensor::from_dispatch(Dispatch::causal_attention_fused(
         query.into_dispatch(),
         keys.into_dispatch(),
         values.into_dispatch(),
         start_position,
+        window,
     ))
 }
 
@@ -106,17 +119,23 @@ impl DecodeAttention for CubeBackend {
         keys: FloatTensor<Self>,
         values: FloatTensor<Self>,
         start_position: usize,
+        window: usize,
     ) -> FloatTensor<Self> {
         let heads = query.shape()[1];
         let tokens = query.shape()[2];
         let width = values.shape()[3];
         let total_length = start_position + tokens;
+        let max_span = if window > 0 {
+            total_length.min(window)
+        } else {
+            total_length
+        };
         let output = Self::float_empty(
             Shape::from([1, heads, tokens, width]),
             &query.device,
             query.dtype.into(),
         );
-        let score_cap = if total_length <= SHORT_SCORE_CAP {
+        let score_cap = if max_span <= SHORT_SCORE_CAP {
             SHORT_SCORE_CAP
         } else {
             LONG_SCORE_CAP
@@ -130,6 +149,7 @@ impl DecodeAttention for CubeBackend {
             values.into_tensor_arg(),
             output.clone().into_tensor_arg(),
             start_position,
+            window,
             score_cap,
             FUSED_LANES,
             dtype_to_storage_type(query.dtype),
@@ -186,6 +206,7 @@ impl DecodeAttention for CubeBackend {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[cube(launch)]
 fn causal_attention_fused_kernel<F: Float>(
     query: &Tensor<F>,
@@ -193,6 +214,7 @@ fn causal_attention_fused_kernel<F: Float>(
     values: &Tensor<F>,
     output: &mut Tensor<F>,
     start_position: usize,
+    window: usize,
     #[comptime] score_cap: usize,
     #[comptime] lanes: usize,
     #[define(F)] _dtype: ElemType,
@@ -200,6 +222,12 @@ fn causal_attention_fused_kernel<F: Float>(
     let head = CUBE_POS_X as usize;
     let q_row = CUBE_POS_Y as usize;
     let length = start_position + q_row + 1usize;
+    let min_token = if window > 0usize && length > window {
+        length - window
+    } else {
+        0usize
+    };
+    let span = length - min_token;
     let kv_head = head / (query.shape(1) / keys.shape(1));
     let width = query.shape(3);
     let tid = UNIT_POS as usize;
@@ -222,9 +250,9 @@ fn causal_attention_fused_kernel<F: Float>(
     let k_tok_stride = keys.stride(2);
     let k_col_stride = keys.stride(3);
     let mut token = tid;
-    while token < length {
+    while token < span {
         let dot = RuntimeCell::<f32>::new(0f32);
-        let k_row = k_base + token * k_tok_stride;
+        let k_row = k_base + (min_token + token) * k_tok_stride;
         for column in 0..width {
             dot.store(
                 dot.read() + q_shared[column] * f32::cast_from(keys[k_row + column * k_col_stride]),
@@ -235,11 +263,11 @@ fn causal_attention_fused_kernel<F: Float>(
     }
     sync_cube();
 
-    let active = if length < lanes { length } else { lanes };
+    let active = if span < lanes { span } else { lanes };
     if tid < active {
         let mut m = scores[tid];
         let mut tok = tid + lanes;
-        while tok < length {
+        while tok < span {
             let s = scores[tok];
             if s > m {
                 m = s;
@@ -266,7 +294,7 @@ fn causal_attention_fused_kernel<F: Float>(
 
     let local_sum = RuntimeCell::<f32>::new(0f32);
     let mut tok = tid;
-    while tok < length {
+    while tok < span {
         let e = (scores[tok] - max_val).exp();
         scores[tok] = e;
         local_sum.store(local_sum.read() + e);
@@ -287,7 +315,7 @@ fn causal_attention_fused_kernel<F: Float>(
 
     // Preserve the exact probability cast rounding boundary before value mixing.
     let mut tok = tid;
-    while tok < length {
+    while tok < span {
         scores[tok] = f32::cast_from(F::cast_from(scores[tok] / sum_val));
         tok += lanes;
     }
@@ -300,12 +328,13 @@ fn causal_attention_fused_kernel<F: Float>(
     let mut column = tid;
     while column < width {
         let mixed = RuntimeCell::<f32>::new(0f32);
-        for tok in 0..length {
+        for tok in 0..span {
             mixed.store(
                 mixed.read()
                     + scores[tok]
                         * f32::cast_from(
-                            values[v_base + tok * v_tok_stride + column * v_col_stride],
+                            values
+                                [v_base + (min_token + tok) * v_tok_stride + column * v_col_stride],
                         ),
             );
         }
@@ -567,12 +596,14 @@ mod tests {
         futures_lite::future::block_on(async {
             let device = Device::wgpu_options().init_async().await.unwrap();
             for dtype in [DType::F16, DType::F32] {
-                for (heads, kv_heads, width, start_pos, tokens, capacity) in [
-                    (4, 2, 16, 0, 7, 16),
-                    (16, 8, 128, 0, 19, 32),
-                    (16, 8, 128, 12, 19, 64),
-                    (16, 8, 128, 0, 151, 256),
-                    (16, 8, 128, 120, 140, 512),
+                for (heads, kv_heads, width, start_pos, tokens, capacity, window) in [
+                    (4, 2, 16, 0, 7, 16, 0usize),
+                    (16, 8, 128, 0, 19, 32, 0),
+                    (16, 8, 128, 12, 19, 64, 0),
+                    (16, 8, 128, 0, 151, 256, 0),
+                    (16, 8, 128, 120, 140, 512, 0),
+                    (8, 8, 64, 151, 12, 256, 64),
+                    (8, 2, 64, 245, 12, 300, 250),
                 ] {
                     let tensor = |shape: [usize; 4], salt: usize| {
                         let n = shape.iter().product::<usize>();
@@ -600,9 +631,12 @@ mod tests {
                     let k_idx =
                         BurnTensor::<1, burn::tensor::Int>::arange(0..total as i64, &device)
                             .reshape([1, total]);
-                    let mask = (queries - k_idx)
-                        .lower_elem(0)
-                        .reshape([1, 1, 1, tokens, total]);
+                    let distance = queries - k_idx;
+                    let mut mask = distance.clone().lower_elem(0);
+                    if window > 0 {
+                        mask = mask.bool_or(distance.greater_equal_elem(window as i64));
+                    }
+                    let mask = mask.reshape([1, 1, 1, tokens, total]);
                     let groups = heads / kv_heads;
                     let sel = [0..1, 0..kv_heads, 0..total, 0..width];
                     let k_view = keys
@@ -625,7 +659,9 @@ mod tests {
                         .reshape([1, heads, tokens, width]);
 
                     let (actual, expected) = futures_lite::future::zip(
-                        super::super::read(prefill(query, keys, values, start_pos)),
+                        super::super::read(prefill_windowed(
+                            query, keys, values, start_pos, window,
+                        )),
                         super::super::read(expected),
                     )
                     .await;
@@ -638,7 +674,7 @@ mod tests {
                     let tolerance = if dtype == DType::F16 { 0.002 } else { 1e-5 };
                     assert!(
                         maximum < tolerance,
-                        "prefill {dtype:?} start={start_pos} tokens={tokens}: {maximum}"
+                        "prefill {dtype:?} start={start_pos} tokens={tokens} window={window}: {maximum}"
                     );
                 }
             }

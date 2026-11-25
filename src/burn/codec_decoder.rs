@@ -94,7 +94,8 @@ impl Residual {
         let y = self
             .conv1
             .stream(self.act1.forward(x.clone()), &mut history.first);
-        x + self.conv2.stream(self.act2.forward(y), &mut history.last)
+        self.conv2
+            .stream_add(self.act2.forward(y), &mut history.last, x)
     }
 }
 #[derive(Clone, Default)]

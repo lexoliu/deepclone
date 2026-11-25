@@ -54,7 +54,7 @@ trait FusedTransformer: Backend {
     ) -> (FloatTensor<Self>, FloatTensor<Self>);
 
     #[allow(clippy::too_many_arguments)]
-    #[fusion(meta = |qkv, _qk_norm, _rotary, keys, values, _position, num_q_heads, _num_kv_heads, head_dim, _epsilon, _scale| (
+    #[fusion(meta = |qkv, _qk_norm, _rotary, keys, values, _position, _rotary_position, num_q_heads, _num_kv_heads, head_dim, _epsilon, _scale, _has_qk_norm| (
         TensorSpec::new(Shape::from([1, *num_q_heads, qkv.shape[1], *head_dim]), qkv.dtype),
         keys.clone(),
         values.clone(),
@@ -66,11 +66,13 @@ trait FusedTransformer: Backend {
         keys: FloatTensor<Self>,
         values: FloatTensor<Self>,
         position: usize,
+        rotary_position: usize,
         num_q_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
         epsilon: f32,
         scale: f32,
+        has_qk_norm: bool,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>);
 
     #[fusion(dtype = DType::F32, shape = Shape::from([gate_up[0], gate_up[1], gate_up[2] / 2]))]
@@ -135,11 +137,49 @@ pub(super) fn qkv_rope_cache(
         keys.into_dispatch(),
         values.into_dispatch(),
         position,
+        position,
         num_q_heads,
         num_kv_heads,
         head_dim,
         epsilon,
         scale,
+        true,
+    );
+    (
+        BurnTensor::from_dispatch(query),
+        BurnTensor::from_dispatch(keys),
+        BurnTensor::from_dispatch(values),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn qkv_rope_cache_no_norm(
+    qkv: BurnTensor<3>,
+    rotary: BurnTensor<3>,
+    keys: BurnTensor<4>,
+    values: BurnTensor<4>,
+    cache_position: usize,
+    rotary_position: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+) -> (BurnTensor<4>, BurnTensor<4>, BurnTensor<4>) {
+    let qkv_dispatch = qkv.into_dispatch();
+    let (query, keys, values) = Dispatch::qkv_rope_cache(
+        qkv_dispatch.clone(),
+        qkv_dispatch,
+        rotary.into_dispatch(),
+        keys.into_dispatch(),
+        values.into_dispatch(),
+        cache_position,
+        rotary_position,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        0.0,
+        scale,
+        false,
     );
     (
         BurnTensor::from_dispatch(query),
@@ -245,6 +285,7 @@ impl FusedTransformer for CubeBackend {
         (sum, normed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn qkv_rope_cache(
         qkv: FloatTensor<Self>,
         qk_norm: FloatTensor<Self>,
@@ -252,14 +293,20 @@ impl FusedTransformer for CubeBackend {
         keys: FloatTensor<Self>,
         values: FloatTensor<Self>,
         position: usize,
+        rotary_position: usize,
         num_q_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
         epsilon: f32,
         scale: f32,
+        has_qk_norm: bool,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
         let qkv = into_contiguous(qkv);
-        let qk_norm = into_contiguous(qk_norm);
+        let qk_norm = if has_qk_norm {
+            into_contiguous(qk_norm)
+        } else {
+            qkv.clone()
+        };
         let rotary = into_contiguous(rotary);
         let keys = into_mut_contiguous(keys);
         let values = into_mut_contiguous(values);
@@ -284,6 +331,7 @@ impl FusedTransformer for CubeBackend {
             keys.clone().into_tensor_arg(),
             values.clone().into_tensor_arg(),
             position,
+            rotary_position,
             tokens,
             capacity,
             epsilon,
@@ -292,6 +340,7 @@ impl FusedTransformer for CubeBackend {
             num_kv_heads,
             head_dim,
             lanes,
+            has_qk_norm,
             dtype_to_storage_type(qkv.dtype),
         );
         (query, keys, values)
@@ -454,6 +503,7 @@ fn qkv_rope_cache_kernel<F: Float>(
     keys: &mut Tensor<F>,
     values: &mut Tensor<F>,
     position: usize,
+    rotary_position: usize,
     tokens: usize,
     capacity: usize,
     epsilon: f32,
@@ -462,6 +512,7 @@ fn qkv_rope_cache_kernel<F: Float>(
     #[comptime] num_kv_heads: usize,
     #[comptime] head_dim: usize,
     #[comptime] lanes: usize,
+    #[comptime] has_qk_norm: bool,
     #[define(F)] _dtype: ElemType,
 ) {
     let head = CUBE_POS_X as usize;
@@ -471,39 +522,51 @@ fn qkv_rope_cache_kernel<F: Float>(
     let qkv_stride = comptime!(total_heads * head_dim);
     let src_base = token * qkv_stride + head * head_dim;
     let abs_pos = position + token;
+    let rot_pos = rotary_position + token;
 
     if head < comptime!(num_q_heads + num_kv_heads) {
-        let sq = RuntimeCell::<f32>::new(0f32);
-        let mut d = UNIT_POS as usize;
-        while d < half {
-            let a = f32::cast_from(qkv[src_base + d]);
-            let b = f32::cast_from(qkv[src_base + d + half]);
-            sq.store(sq.read() + a * a + b * b);
-            d += lanes;
-        }
-        let mut partial = Shared::<[f32]>::new_slice(lanes);
-        partial[UNIT_POS as usize] = sq.consume();
-        sync_cube();
-        #[unroll]
-        for stage in 0..lanes.ilog2() as usize {
-            let distance = comptime!(lanes >> (stage + 1));
-            if (UNIT_POS as usize) < distance {
-                partial[UNIT_POS as usize] += partial[UNIT_POS as usize + distance];
+        let mut inv = 1f32;
+        if comptime!(has_qk_norm) {
+            let sq = RuntimeCell::<f32>::new(0f32);
+            let mut d = UNIT_POS as usize;
+            while d < half {
+                let a = f32::cast_from(qkv[src_base + d]);
+                let b = f32::cast_from(qkv[src_base + d + half]);
+                sq.store(sq.read() + a * a + b * b);
+                d += lanes;
             }
+            let mut partial = Shared::<[f32]>::new_slice(lanes);
+            partial[UNIT_POS as usize] = sq.consume();
             sync_cube();
+            #[unroll]
+            for stage in 0..lanes.ilog2() as usize {
+                let distance = comptime!(lanes >> (stage + 1));
+                if (UNIT_POS as usize) < distance {
+                    partial[UNIT_POS as usize] += partial[UNIT_POS as usize + distance];
+                }
+                sync_cube();
+            }
+            inv = (partial[0] / (head_dim as f32) + epsilon).sqrt().recip();
         }
-        let inv = (partial[0] / (head_dim as f32) + epsilon).sqrt().recip();
         let is_q = head < num_q_heads;
         let norm_base = if is_q { 0usize } else { head_dim };
-        let cos_base = abs_pos * head_dim;
-        let sin_base = (capacity + abs_pos) * head_dim;
+        let cos_base = rot_pos * head_dim;
+        let sin_base = rotary.stride(0) + rot_pos * head_dim;
         let scale_f = F::cast_from(scale);
         let mut d = UNIT_POS as usize;
         while d < half {
-            let a = f32::cast_from(qkv[src_base + d]);
-            let b = f32::cast_from(qkv[src_base + d + half]);
-            let na = F::cast_from(a * inv) * qk_norm[norm_base + d];
-            let nb = F::cast_from(b * inv) * qk_norm[norm_base + d + half];
+            let na = if comptime!(has_qk_norm) {
+                let a = f32::cast_from(qkv[src_base + d]);
+                F::cast_from(a * inv) * qk_norm[norm_base + d]
+            } else {
+                qkv[src_base + d]
+            };
+            let nb = if comptime!(has_qk_norm) {
+                let b = f32::cast_from(qkv[src_base + d + half]);
+                F::cast_from(b * inv) * qk_norm[norm_base + d + half]
+            } else {
+                qkv[src_base + d + half]
+            };
             let ra = na * rotary[cos_base + d] + (F::new(0_f32) - nb) * rotary[sin_base + d];
             let rb = nb * rotary[cos_base + d + half] + na * rotary[sin_base + d + half];
             if is_q {
@@ -977,6 +1040,83 @@ mod tests {
                     .fold(0f32, f32::max);
                 let tol = if dtype == DType::F16 { 0.002 } else { 1e-5 };
                 assert!(max_err < tol, "rotary {dtype:?}: {max_err}");
+
+                // Standalone qkv_rope_cache_no_norm used by AudioTransformer.
+                let (h_q, h_kv, d_head, cap) = (8usize, 8usize, 64usize, 32usize);
+                let mut kf = BurnTensor::<4>::zeros([1, h_kv, cap, d_head], (&device, dtype));
+                let mut vf = BurnTensor::<4>::zeros([1, h_kv, cap, d_head], (&device, dtype));
+                let scale = (d_head as f32).sqrt().recip();
+                let t = 5usize;
+                let w_tot = (h_q + 2 * h_kv) * d_head;
+                let qkv_a = BurnTensor::<3>::from_data(
+                    TensorData::new(
+                        (0..t * w_tot)
+                            .map(|i| ((i * 17 + 3) as f32).sin() * 0.7)
+                            .collect(),
+                        [1, t, w_tot],
+                    ),
+                    (&device, dtype),
+                );
+                let (ac, asn) = super::super::audio_transformer::rotary_tables(
+                    &device, dtype, 16, d_head, 10000.0,
+                );
+                let rot_packed = BurnTensor::cat(
+                    vec![
+                        ac.clone().reshape([1, 16, d_head]),
+                        asn.clone().reshape([1, 16, d_head]),
+                    ],
+                    0,
+                );
+                let cache_pos = 7usize;
+                let rot_pos = 11usize;
+                let q_r = unfused_rotary(
+                    qkv_a
+                        .clone()
+                        .slice([0..1, 0..t, 0..h_q * d_head])
+                        .reshape([1, t, h_q, d_head])
+                        .swap_dims(1, 2),
+                    &ac.clone()
+                        .slice([0..1, 0..1, rot_pos..rot_pos + t, 0..d_head]),
+                    &asn.clone()
+                        .slice([0..1, 0..1, rot_pos..rot_pos + t, 0..d_head]),
+                ) * scale;
+                let k_r = unfused_rotary(
+                    qkv_a
+                        .clone()
+                        .slice([0..1, 0..t, h_q * d_head..(h_q + h_kv) * d_head])
+                        .reshape([1, t, h_kv, d_head])
+                        .swap_dims(1, 2),
+                    &ac.slice([0..1, 0..1, rot_pos..rot_pos + t, 0..d_head]),
+                    &asn.slice([0..1, 0..1, rot_pos..rot_pos + t, 0..d_head]),
+                );
+                let (q_a, k_out, _v_out) = qkv_rope_cache_no_norm(
+                    qkv_a, rot_packed, kf, vf, cache_pos, rot_pos, h_q, h_kv, d_head, scale,
+                );
+                kf = k_out;
+                let ((qa, qr), (ka, kr)) = futures_lite::future::zip(
+                    futures_lite::future::zip(super::super::read(q_a), super::super::read(q_r)),
+                    futures_lite::future::zip(
+                        super::super::read(kf.slice([
+                            0..1,
+                            0..h_kv,
+                            cache_pos..cache_pos + t,
+                            0..d_head,
+                        ])),
+                        super::super::read(k_r),
+                    ),
+                )
+                .await;
+                for (lbl, a, b) in [
+                    ("q_no_norm", qa.unwrap(), qr.unwrap()),
+                    ("k_no_norm", ka.unwrap(), kr.unwrap()),
+                ] {
+                    let e = a
+                        .into_iter()
+                        .zip(b)
+                        .map(|(x, y)| (x - y).abs())
+                        .fold(0f32, f32::max);
+                    assert!(e < tol, "{lbl} {dtype:?}: {e}");
+                }
             }
         });
     }

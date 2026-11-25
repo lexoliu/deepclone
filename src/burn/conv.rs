@@ -29,9 +29,11 @@ trait CodecConv: Backend {
         history: FloatTensor<Self>,
         weight: FloatTensor<Self>,
         bias: FloatTensor<Self>,
+        residual: FloatTensor<Self>,
         dilation: usize,
         has_history: bool,
         has_bias: bool,
+        has_residual: bool,
     ) -> FloatTensor<Self>;
 
     #[allow(clippy::too_many_arguments)]
@@ -82,6 +84,28 @@ pub(super) fn causal_conv1d(
     bias: Option<BurnTensor<1>>,
     dilation: usize,
 ) -> BurnTensor<3> {
+    causal_conv1d_inner(x, history, weight, bias, dilation, None)
+}
+
+pub(super) fn causal_conv1d_add(
+    x: BurnTensor<3>,
+    history: Option<BurnTensor<3>>,
+    weight: BurnTensor<3>,
+    bias: Option<BurnTensor<1>>,
+    dilation: usize,
+    residual: BurnTensor<3>,
+) -> BurnTensor<3> {
+    causal_conv1d_inner(x, history, weight, bias, dilation, Some(residual))
+}
+
+fn causal_conv1d_inner(
+    x: BurnTensor<3>,
+    history: Option<BurnTensor<3>>,
+    weight: BurnTensor<3>,
+    bias: Option<BurnTensor<1>>,
+    dilation: usize,
+    residual: Option<BurnTensor<3>>,
+) -> BurnTensor<3> {
     let has_history = history.is_some();
     let history = history.unwrap_or_else(|| x.clone());
     let has_bias = bias.is_some();
@@ -89,14 +113,21 @@ pub(super) fn causal_conv1d(
         Some(bias) => bias.into_dispatch(),
         None => x.clone().into_dispatch(),
     };
+    let has_residual = residual.is_some();
+    let residual_dispatch = match residual {
+        Some(residual) => residual.into_dispatch(),
+        None => x.clone().into_dispatch(),
+    };
     BurnTensor::from_dispatch(Dispatch::causal_conv1d(
         x.into_dispatch(),
         history.into_dispatch(),
         weight.into_dispatch(),
         bias_dispatch,
+        residual_dispatch,
         dilation,
         has_history,
         has_bias,
+        has_residual,
     ))
 }
 
@@ -162,17 +193,72 @@ impl CodecConv for CubeBackend {
     ) -> FloatTensor<Self> {
         let alpha = into_contiguous(alpha);
         let inverse_beta = into_contiguous(inverse_beta);
+        let can_mutate = x.can_mut() && x.is_contiguous() && x.is_nonoverlapping();
+        let x = if can_mutate {
+            into_mut_contiguous(x)
+        } else {
+            into_contiguous(x)
+        };
         let shape = x.shape();
         let [batch, channels, time] = [shape[0], shape[1], shape[2]];
+        let par_vec = cubecl::tensor_vector_size_parallel(
+            x.client.io_optimized_vector_sizes(x.dtype.size()),
+            x.meta.shape(),
+            x.meta.strides(),
+            2,
+        );
+        let vec_t = if par_vec >= 4 && time.is_multiple_of(4) {
+            4
+        } else {
+            1
+        };
+        let t_vecs = time / vec_t;
+        let dim = CubeDim::new(&x.client, t_vecs);
+        let max_count = x.client.properties().hardware.max_cube_count;
+        let t_groups = t_vecs
+            .div_ceil(dim.num_elems() as usize)
+            .max(1)
+            .min(max_count.0 as usize);
+        if channels <= max_count.1 as usize && batch <= max_count.2 as usize {
+            let count = CubeCount::Static(t_groups as u32, channels as u32, batch as u32);
+            if can_mutate {
+                snake_inplace_kernel::launch(
+                    &x.client,
+                    count,
+                    dim,
+                    vec_t,
+                    x.clone().into_tensor_arg(),
+                    alpha.into_tensor_arg(),
+                    inverse_beta.into_tensor_arg(),
+                    channels,
+                    t_vecs,
+                    dtype_to_storage_type(x.dtype),
+                );
+                return x;
+            }
+            let output = Self::float_empty(shape, &x.device, x.dtype.into());
+            snake_out_kernel::launch(
+                &x.client,
+                count,
+                dim,
+                vec_t,
+                x.clone().into_tensor_arg(),
+                alpha.into_tensor_arg(),
+                inverse_beta.into_tensor_arg(),
+                output.clone().into_tensor_arg(),
+                channels,
+                t_vecs,
+                dtype_to_storage_type(x.dtype),
+            );
+            return output;
+        }
         let total = batch * channels * time;
         let dim = CubeDim::new(&x.client, total);
         let groups = total.div_ceil(dim.num_elems() as usize);
-        let max_x = x.client.properties().hardware.max_cube_count.0;
-        if x.can_mut() && x.is_contiguous() && x.is_nonoverlapping() {
-            let x = into_mut_contiguous(x);
-            snake_inplace_kernel::launch(
+        if can_mutate {
+            snake_inplace_fallback_kernel::launch(
                 &x.client,
-                row_grid(groups, max_x),
+                row_grid(groups, max_count.0),
                 dim,
                 x.clone().into_tensor_arg(),
                 alpha.into_tensor_arg(),
@@ -184,11 +270,10 @@ impl CodecConv for CubeBackend {
             );
             x
         } else {
-            let x = into_contiguous(x);
             let output = Self::float_empty(shape, &x.device, x.dtype.into());
-            snake_out_kernel::launch(
+            snake_out_fallback_kernel::launch(
                 &x.client,
-                row_grid(groups, max_x),
+                row_grid(groups, max_count.0),
                 dim,
                 x.clone().into_tensor_arg(),
                 alpha.into_tensor_arg(),
@@ -203,14 +288,17 @@ impl CodecConv for CubeBackend {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn causal_conv1d(
         x: FloatTensor<Self>,
         history: FloatTensor<Self>,
         weight: FloatTensor<Self>,
         bias: FloatTensor<Self>,
+        residual: FloatTensor<Self>,
         dilation: usize,
         has_history: bool,
         has_bias: bool,
+        has_residual: bool,
     ) -> FloatTensor<Self> {
         let x = into_contiguous(x);
         let history = if has_history {
@@ -224,10 +312,14 @@ impl CodecConv for CubeBackend {
         } else {
             x.clone()
         };
+        let residual = if has_residual {
+            into_contiguous(residual)
+        } else {
+            x.clone()
+        };
         let [batch, c_in, t_out] = [x.shape()[0], x.shape()[1], x.shape()[2]];
         let [kernel, c_out, _] = [weight.shape()[0], weight.shape()[1], weight.shape()[2]];
         let hist_len = if has_history { history.shape()[2] } else { 0 };
-        let bias_flag = u32::from(has_bias);
         let output = Self::float_empty(
             Shape::from([batch, c_out, t_out]),
             &x.device,
@@ -246,6 +338,7 @@ impl CodecConv for CubeBackend {
                 history.into_tensor_arg(),
                 weight.into_tensor_arg(),
                 bias.into_tensor_arg(),
+                residual.into_tensor_arg(),
                 output.clone().into_tensor_arg(),
                 total,
                 c_in,
@@ -254,32 +347,79 @@ impl CodecConv for CubeBackend {
                 hist_len,
                 kernel,
                 dilation,
-                bias_flag,
+                u32::from(has_bias),
+                u32::from(has_residual),
                 dtype_to_storage_type(x.dtype),
             );
         } else {
-            causal_conv1d_tiled_kernel::launch(
-                &x.client,
-                CubeCount::Static(
-                    t_out.div_ceil(32) as u32,
-                    c_out.div_ceil(32) as u32,
-                    batch as u32,
-                ),
-                CubeDim::new_2d(16, 16),
-                x.clone().into_tensor_arg(),
-                history.into_tensor_arg(),
-                weight.into_tensor_arg(),
-                bias.into_tensor_arg(),
-                output.clone().into_tensor_arg(),
-                c_in,
-                c_out,
-                t_out,
-                hist_len,
-                kernel,
-                dilation,
-                bias_flag,
-                dtype_to_storage_type(x.dtype),
-            );
+            let span = (kernel - 1) * dilation;
+            if span <= 64 && kernel <= 8 {
+                let out_vec = cubecl::tensor_vector_size_parallel(
+                    x.client.io_optimized_vector_sizes(x.dtype.size()),
+                    output.meta.shape(),
+                    output.meta.strides(),
+                    2,
+                );
+                let vec_t = if out_vec >= 4 && t_out.is_multiple_of(4) {
+                    4
+                } else {
+                    1
+                };
+                let strip_stride = (64 + span).next_multiple_of(4);
+                causal_conv1d_cached_kernel::launch(
+                    &x.client,
+                    CubeCount::Static(
+                        t_out.div_ceil(64) as u32,
+                        c_out.div_ceil(32) as u32,
+                        batch as u32,
+                    ),
+                    CubeDim::new_2d(16, 16),
+                    vec_t,
+                    x.clone().into_tensor_arg(),
+                    history.into_tensor_arg(),
+                    weight.into_tensor_arg(),
+                    bias.into_tensor_arg(),
+                    residual.into_tensor_arg(),
+                    output.clone().into_tensor_arg(),
+                    c_in,
+                    c_out,
+                    t_out,
+                    hist_len,
+                    kernel,
+                    dilation,
+                    span,
+                    strip_stride,
+                    has_bias,
+                    has_residual,
+                    vec_t,
+                    dtype_to_storage_type(x.dtype),
+                );
+            } else {
+                causal_conv1d_tiled_kernel::launch(
+                    &x.client,
+                    CubeCount::Static(
+                        t_out.div_ceil(32) as u32,
+                        c_out.div_ceil(32) as u32,
+                        batch as u32,
+                    ),
+                    CubeDim::new_2d(16, 16),
+                    x.clone().into_tensor_arg(),
+                    history.into_tensor_arg(),
+                    weight.into_tensor_arg(),
+                    bias.into_tensor_arg(),
+                    residual.into_tensor_arg(),
+                    output.clone().into_tensor_arg(),
+                    c_in,
+                    c_out,
+                    t_out,
+                    hist_len,
+                    kernel,
+                    dilation,
+                    u32::from(has_bias),
+                    u32::from(has_residual),
+                    dtype_to_storage_type(x.dtype),
+                );
+            }
         }
         output
     }
@@ -392,8 +532,63 @@ impl CodecConv for CubeBackend {
     }
 }
 
+#[cube]
+fn snake_eval<N: Size>(v: Vector<f32, N>, alpha: f32, inv_beta: f32) -> Vector<f32, N> {
+    let a = Vector::<f32, N>::new(alpha);
+    let ib = Vector::<f32, N>::new(inv_beta);
+    let periodic = (v * a).sin();
+    v + periodic * periodic * ib
+}
+
 #[cube(launch)]
-fn snake_inplace_kernel<F: Float>(
+fn snake_inplace_kernel<F: Float, N: Size>(
+    x: &mut Tensor<Vector<F, N>>,
+    alpha: &Tensor<F>,
+    inverse_beta: &Tensor<F>,
+    channels: usize,
+    t_vecs: usize,
+    #[define(F)] _dtype: ElemType,
+) {
+    let c = CUBE_POS_Y as usize;
+    let row = ((CUBE_POS_Z as usize) * channels + c) * t_vecs;
+    let a = f32::cast_from(alpha[c]);
+    let ib = f32::cast_from(inverse_beta[c]);
+    let grid_stride = (CUBE_COUNT_X as usize) * (CUBE_DIM as usize);
+    let mut tv = (CUBE_POS_X as usize) * (CUBE_DIM as usize) + (UNIT_POS as usize);
+    while tv < t_vecs {
+        let idx = row + tv;
+        let v = Vector::<f32, N>::cast_from(x[idx]);
+        x[idx] = Vector::<F, N>::cast_from(snake_eval(v, a, ib));
+        tv += grid_stride;
+    }
+}
+
+#[cube(launch)]
+fn snake_out_kernel<F: Float, N: Size>(
+    x: &Tensor<Vector<F, N>>,
+    alpha: &Tensor<F>,
+    inverse_beta: &Tensor<F>,
+    output: &mut Tensor<Vector<F, N>>,
+    channels: usize,
+    t_vecs: usize,
+    #[define(F)] _dtype: ElemType,
+) {
+    let c = CUBE_POS_Y as usize;
+    let row = ((CUBE_POS_Z as usize) * channels + c) * t_vecs;
+    let a = f32::cast_from(alpha[c]);
+    let ib = f32::cast_from(inverse_beta[c]);
+    let grid_stride = (CUBE_COUNT_X as usize) * (CUBE_DIM as usize);
+    let mut tv = (CUBE_POS_X as usize) * (CUBE_DIM as usize) + (UNIT_POS as usize);
+    while tv < t_vecs {
+        let idx = row + tv;
+        let v = Vector::<f32, N>::cast_from(x[idx]);
+        output[idx] = Vector::<F, N>::cast_from(snake_eval(v, a, ib));
+        tv += grid_stride;
+    }
+}
+
+#[cube(launch)]
+fn snake_inplace_fallback_kernel<F: Float>(
     x: &mut Tensor<F>,
     alpha: &Tensor<F>,
     inverse_beta: &Tensor<F>,
@@ -415,7 +610,7 @@ fn snake_inplace_kernel<F: Float>(
 }
 
 #[cube(launch)]
-fn snake_out_kernel<F: Float>(
+fn snake_out_fallback_kernel<F: Float>(
     x: &Tensor<F>,
     alpha: &Tensor<F>,
     inverse_beta: &Tensor<F>,
@@ -437,8 +632,241 @@ fn snake_out_kernel<F: Float>(
     output[idx] = F::cast_from(v + periodic * periodic * f32::cast_from(inverse_beta[c]));
 }
 
-/// Register-tiled 32 × 32 causal 1D convolution over contiguous `[B, C, T]` tensors
-/// and packed `[K, C_out, C_in]` weights. Uses 4 KB shared memory per 16 × 16 workgroup.
+#[cube]
+fn store_scalar_lane<F: Float, N: Size>(
+    output: &mut Tensor<Vector<F, N>>,
+    residual: &Tensor<Vector<F, N>>,
+    idx: usize,
+    val: f32,
+    #[comptime] has_residual: bool,
+) {
+    let out = if comptime!(has_residual) {
+        val + f32::cast_from(residual[idx].extract(0usize))
+    } else {
+        val
+    };
+    output[idx] = Vector::<F, N>::new(F::cast_from(out));
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cube]
+fn store_conv_row<F: Float, N: Size>(
+    output: &mut Tensor<Vector<F, N>>,
+    residual: &Tensor<Vector<F, N>>,
+    batch: usize,
+    c_out: usize,
+    t_out: usize,
+    oc: usize,
+    t_base: usize,
+    tx: usize,
+    v0: f32,
+    v1: f32,
+    v2: f32,
+    v3: f32,
+    #[comptime] vec_t: usize,
+    #[comptime] has_residual: bool,
+) {
+    if comptime!(vec_t == 4usize) {
+        let t_vecs = t_out / 4usize;
+        let tv = t_base / 4usize + tx;
+        if tv < t_vecs {
+            let idx = (batch * c_out + oc) * t_vecs + tv;
+            let mut out_v = Vector::<f32, N>::empty();
+            out_v.insert(0usize, v0);
+            out_v.insert(1usize, v1);
+            out_v.insert(2usize, v2);
+            out_v.insert(3usize, v3);
+            if comptime!(has_residual) {
+                out_v = out_v + Vector::<f32, N>::cast_from(residual[idx]);
+            }
+            output[idx] = Vector::<F, N>::cast_from(out_v);
+        }
+    } else {
+        let row = (batch * c_out + oc) * t_out;
+        let t0 = t_base + tx * 4usize;
+        if t0 < t_out {
+            store_scalar_lane(output, residual, row + t0, v0, has_residual);
+        }
+        if t0 + 1usize < t_out {
+            store_scalar_lane(output, residual, row + t0 + 1usize, v1, has_residual);
+        }
+        if t0 + 2usize < t_out {
+            store_scalar_lane(output, residual, row + t0 + 2usize, v2, has_residual);
+        }
+        if t0 + 3usize < t_out {
+            store_scalar_lane(output, residual, row + t0 + 3usize, v3, has_residual);
+        }
+    }
+}
+
+/// Register-tiled 32 × 64 causal 1D convolution caching each 8-channel input strip once
+/// across all taps in shared memory (`<= 11 KB` for `kernel <= 7, dilation <= 9`).
+#[allow(clippy::too_many_arguments)]
+#[cube(launch)]
+fn causal_conv1d_cached_kernel<F: Float, N: Size>(
+    x: &Tensor<F>,
+    history: &Tensor<F>,
+    weight: &Tensor<F>,
+    bias: &Tensor<F>,
+    residual: &Tensor<Vector<F, N>>,
+    output: &mut Tensor<Vector<F, N>>,
+    c_in: usize,
+    c_out: usize,
+    t_out: usize,
+    hist_len: usize,
+    #[comptime] kernel: usize,
+    #[comptime] dilation: usize,
+    #[comptime] span: usize,
+    #[comptime] strip_stride: usize,
+    #[comptime] has_bias: bool,
+    #[comptime] has_residual: bool,
+    #[comptime] vec_t: usize,
+    #[define(F)] _dtype: ElemType,
+) {
+    let tx = UNIT_POS_X as usize;
+    let ty = UNIT_POS_Y as usize;
+    let tid = ty * 16usize + tx;
+    let t_base = (CUBE_POS_X as usize) * 64usize;
+    let oc_base = (CUBE_POS_Y as usize) * 32usize;
+    let batch = CUBE_POS_Z as usize;
+
+    let mut x_strip = Shared::<[f32]>::new_slice(8usize * strip_stride);
+    let mut w_tile = Shared::<[f32]>::new_slice(kernel * 32usize * 8usize);
+
+    let acc00 = RuntimeCell::<f32>::new(0f32);
+    let acc01 = RuntimeCell::<f32>::new(0f32);
+    let acc02 = RuntimeCell::<f32>::new(0f32);
+    let acc03 = RuntimeCell::<f32>::new(0f32);
+    let acc10 = RuntimeCell::<f32>::new(0f32);
+    let acc11 = RuntimeCell::<f32>::new(0f32);
+    let acc12 = RuntimeCell::<f32>::new(0f32);
+    let acc13 = RuntimeCell::<f32>::new(0f32);
+
+    let ic_blocks = c_in.div_ceil(8usize);
+    let ic_l = tid / 32usize;
+    let strip_row = ic_l * strip_stride;
+    let slot_start = tid % 32usize;
+    let w_oc_l = tid / 8usize;
+    let w_ic_l = tid % 8usize;
+    let w_oc = oc_base + w_oc_l;
+    let local_t = tx * 4usize;
+
+    for ic_block in 0..ic_blocks {
+        let ic_base = ic_block * 8usize;
+        let ic_x = ic_base + ic_l;
+        let x_row = (batch * c_in + ic_x) * t_out;
+        let h_row = (batch * c_in + ic_x) * hist_len;
+        let mut slot = slot_start;
+        while slot < comptime!(64usize + span) {
+            let mut val = 0f32;
+            if ic_x < c_in {
+                if t_base + slot >= span {
+                    let src_t = t_base + slot - span;
+                    if src_t < t_out {
+                        val = f32::cast_from(x[x_row + src_t]);
+                    }
+                } else if hist_len > 0usize {
+                    let deficit = span - (t_base + slot);
+                    if deficit <= hist_len {
+                        val = f32::cast_from(history[h_row + (hist_len - deficit)]);
+                    }
+                }
+            }
+            x_strip[strip_row + slot] = val;
+            slot += 32usize;
+        }
+
+        let w_ic = ic_base + w_ic_l;
+        #[unroll]
+        for tap in 0..kernel {
+            let mut wv = 0f32;
+            if w_oc < c_out && w_ic < c_in {
+                wv = f32::cast_from(weight[(tap * c_out + w_oc) * c_in + w_ic]);
+            }
+            w_tile[(tap * 32usize + w_oc_l) * 8usize + w_ic_l] = wv;
+        }
+        sync_cube();
+
+        #[unroll]
+        for tap in 0..kernel {
+            let lag = comptime!((kernel - 1 - tap) * dilation);
+            let x_off = comptime!(span - lag) + local_t;
+            let w_row0 = (tap * 32usize + ty) * 8usize;
+            let w_row1 = (tap * 32usize + ty + 16usize) * 8usize;
+            #[unroll]
+            for k in 0..8usize {
+                let wk0 = w_tile[w_row0 + k];
+                let wk1 = w_tile[w_row1 + k];
+                let xk_base = k * strip_stride + x_off;
+                let x0 = x_strip[xk_base];
+                let x1 = x_strip[xk_base + 1usize];
+                let x2 = x_strip[xk_base + 2usize];
+                let x3 = x_strip[xk_base + 3usize];
+                acc00.store(acc00.read() + wk0 * x0);
+                acc01.store(acc01.read() + wk0 * x1);
+                acc02.store(acc02.read() + wk0 * x2);
+                acc03.store(acc03.read() + wk0 * x3);
+                acc10.store(acc10.read() + wk1 * x0);
+                acc11.store(acc11.read() + wk1 * x1);
+                acc12.store(acc12.read() + wk1 * x2);
+                acc13.store(acc13.read() + wk1 * x3);
+            }
+        }
+        sync_cube();
+    }
+
+    let oc0 = oc_base + ty;
+    let oc1 = oc0 + 16usize;
+    let b0 = if comptime!(has_bias) && oc0 < c_out {
+        f32::cast_from(bias[oc0])
+    } else {
+        0f32
+    };
+    let b1 = if comptime!(has_bias) && oc1 < c_out {
+        f32::cast_from(bias[oc1])
+    } else {
+        0f32
+    };
+    if oc0 < c_out {
+        store_conv_row(
+            output,
+            residual,
+            batch,
+            c_out,
+            t_out,
+            oc0,
+            t_base,
+            tx,
+            acc00.consume() + b0,
+            acc01.consume() + b0,
+            acc02.consume() + b0,
+            acc03.consume() + b0,
+            vec_t,
+            has_residual,
+        );
+    }
+    if oc1 < c_out {
+        store_conv_row(
+            output,
+            residual,
+            batch,
+            c_out,
+            t_out,
+            oc1,
+            t_base,
+            tx,
+            acc10.consume() + b1,
+            acc11.consume() + b1,
+            acc12.consume() + b1,
+            acc13.consume() + b1,
+            vec_t,
+            has_residual,
+        );
+    }
+}
+
+/// Register-tiled 32 × 32 causal 1D convolution fallback for receptive spans above 64
+/// or kernels wider than 8 taps.
 #[allow(clippy::too_many_arguments)]
 #[cube(launch)]
 fn causal_conv1d_tiled_kernel<F: Float>(
@@ -446,6 +874,7 @@ fn causal_conv1d_tiled_kernel<F: Float>(
     history: &Tensor<F>,
     weight: &Tensor<F>,
     bias: &Tensor<F>,
+    residual: &Tensor<F>,
     output: &mut Tensor<F>,
     c_in: usize,
     c_out: usize,
@@ -454,6 +883,7 @@ fn causal_conv1d_tiled_kernel<F: Float>(
     kernel: usize,
     dilation: usize,
     has_bias: u32,
+    has_residual: u32,
     #[define(F)] _dtype: ElemType,
 ) {
     let tx = UNIT_POS_X as usize;
@@ -557,19 +987,35 @@ fn causal_conv1d_tiled_kernel<F: Float>(
     if oc0 < c_out {
         let out_row = (batch * c_out + oc0) * t_out;
         if t0 < t_out {
-            output[out_row + t0] = F::cast_from(acc00.consume() + b0);
+            let mut v = acc00.consume() + b0;
+            if has_residual != 0 {
+                v += f32::cast_from(residual[out_row + t0]);
+            }
+            output[out_row + t0] = F::cast_from(v);
         }
         if t1 < t_out {
-            output[out_row + t1] = F::cast_from(acc01.consume() + b0);
+            let mut v = acc01.consume() + b0;
+            if has_residual != 0 {
+                v += f32::cast_from(residual[out_row + t1]);
+            }
+            output[out_row + t1] = F::cast_from(v);
         }
     }
     if oc1 < c_out {
         let out_row = (batch * c_out + oc1) * t_out;
         if t0 < t_out {
-            output[out_row + t0] = F::cast_from(acc10.consume() + b1);
+            let mut v = acc10.consume() + b1;
+            if has_residual != 0 {
+                v += f32::cast_from(residual[out_row + t0]);
+            }
+            output[out_row + t0] = F::cast_from(v);
         }
         if t1 < t_out {
-            output[out_row + t1] = F::cast_from(acc11.consume() + b1);
+            let mut v = acc11.consume() + b1;
+            if has_residual != 0 {
+                v += f32::cast_from(residual[out_row + t1]);
+            }
+            output[out_row + t1] = F::cast_from(v);
         }
     }
 }
@@ -582,6 +1028,7 @@ fn causal_conv1d_small_out_kernel<F: Float>(
     history: &Tensor<F>,
     weight: &Tensor<F>,
     bias: &Tensor<F>,
+    residual: &Tensor<F>,
     output: &mut Tensor<F>,
     total: usize,
     c_in: usize,
@@ -591,6 +1038,7 @@ fn causal_conv1d_small_out_kernel<F: Float>(
     kernel: usize,
     dilation: usize,
     has_bias: u32,
+    has_residual: u32,
     #[define(F)] _dtype: ElemType,
 ) {
     let cube = (CUBE_POS_X as usize) + (CUBE_POS_Y as usize) * (CUBE_COUNT_X as usize);
@@ -630,7 +1078,11 @@ fn causal_conv1d_small_out_kernel<F: Float>(
             }
         }
     }
-    output[idx] = F::cast_from(acc.consume());
+    let mut sum = acc.consume();
+    if has_residual != 0 {
+        sum += f32::cast_from(residual[idx]);
+    }
+    output[idx] = F::cast_from(sum);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -836,7 +1288,8 @@ mod tests {
         futures_lite::future::block_on(async {
             let device = Device::wgpu_options().init_async().await.unwrap();
             for dtype in [DType::F32, DType::F16] {
-                for [batch, channels, time] in [[2, 7, 19], [1, 96, 385]] {
+                for [batch, channels, time] in [[2, 7, 19], [1, 96, 385], [1, 96, 384], [2, 8, 96]]
+                {
                     let x = BurnTensor::<3>::from_data(
                         TensorData::new(
                             (0..batch * channels * time)
@@ -902,12 +1355,15 @@ mod tests {
             let device = Device::wgpu_options().init_async().await.unwrap();
             for dtype in [DType::F32, DType::F16] {
                 let tol = if dtype == DType::F16 { 0.005 } else { 1e-4 };
-                // Full causal conv1d: covers small-out (c_out=1), tiled (c_out=37), pointwise (k=1), dilated (d=9).
+                // Full causal conv1d: covers small-out (c_out=1), tiled cached (c_out=37, c_out=96),
+                // pointwise (k=1), dilated (d=9), and uncached span fallback (span > 64).
                 for [batch, c_in, c_out, time, kernel, dilation] in [
                     [1, 96, 1, 73, 7, 1],
                     [2, 19, 37, 41, 7, 3],
                     [1, 48, 35, 65, 1, 1],
                     [1, 32, 32, 80, 7, 9],
+                    [1, 96, 96, 128, 7, 9],
+                    [1, 16, 32, 72, 7, 11],
                 ] {
                     let input = BurnTensor::<3>::from_data(
                         TensorData::new(
@@ -991,19 +1447,48 @@ mod tests {
                             start = end;
                         }
                         let streamed = BurnTensor::cat(parts, 2);
-                        let ((f, s), e) = futures_lite::future::zip(
+                        let residual = BurnTensor::<3>::from_data(
+                            TensorData::new(
+                                (0..batch * c_out * time)
+                                    .map(|i| ((i * 11 + 5) as f32).cos() * 0.25)
+                                    .collect::<Vec<_>>(),
+                                [batch, c_out, time],
+                            ),
+                            (&device, dtype),
+                        );
+                        let with_res = causal_conv1d_add(
+                            input.clone(),
+                            None,
+                            packed.clone(),
+                            bias.clone(),
+                            dilation,
+                            residual.clone(),
+                        );
+                        let ref_res = (reference.clone().cast(DType::F32)
+                            + residual.cast(DType::F32))
+                        .cast(dtype);
+                        let ((f, s), (e, (wr, er))) = futures_lite::future::zip(
                             futures_lite::future::zip(
                                 super::super::read(full),
                                 super::super::read(streamed),
                             ),
-                            super::super::read(reference),
+                            futures_lite::future::zip(
+                                super::super::read(reference),
+                                futures_lite::future::zip(
+                                    super::super::read(with_res),
+                                    super::super::read(ref_res),
+                                ),
+                            ),
                         )
                         .await;
-                        let (f, s, e) = (f.unwrap(), s.unwrap(), e.unwrap());
-                        for (kind, out) in [("full", f), ("stream", s)] {
+                        let (f, s, e, wr, er) =
+                            (f.unwrap(), s.unwrap(), e.unwrap(), wr.unwrap(), er.unwrap());
+                        for (kind, out, exp) in
+                            [("full", f, &e), ("stream", s, &e), ("residual", wr, &er)]
+                        {
                             let err = out
                                 .iter()
-                                .zip(&e)
+                                .zip(exp)
                                 .map(|(a, b)| (a - b).abs())
                                 .fold(0f32, f32::max);
                             assert!(
