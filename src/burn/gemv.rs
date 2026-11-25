@@ -84,6 +84,16 @@ impl VectorProjection for CubeBackend {
     }
 }
 
+#[cube]
+fn lane_sum<N: Size>(p: Vector<f32, N>) -> f32 {
+    let mut d = 0f32;
+    #[unroll]
+    for lane in 0..p.vector_size() {
+        d += p.extract(lane);
+    }
+    d
+}
+
 #[cube(launch)]
 fn gemv_cooperative_kernel<F: Float, W: Float, N: Size>(
     input: &Tensor<Vector<F, N>>,
@@ -110,10 +120,10 @@ fn gemv_cooperative_kernel<F: Float, W: Float, N: Size>(
     let has2 = col2 < width;
     let has3 = col3 < width;
 
-    let mut acc0 = Vector::<f32, N>::new(0f32);
-    let mut acc1 = Vector::<f32, N>::new(0f32);
-    let mut acc2 = Vector::<f32, N>::new(0f32);
-    let mut acc3 = Vector::<f32, N>::new(0f32);
+    let s0 = RuntimeCell::<f32>::new(0f32);
+    let s1 = RuntimeCell::<f32>::new(0f32);
+    let s2 = RuntimeCell::<f32>::new(0f32);
+    let s3 = RuntimeCell::<f32>::new(0f32);
 
     // Preserve the weight-to-activation cast at each load while reusing each
     // vectorized activation read across four adjacent output columns.
@@ -127,44 +137,32 @@ fn gemv_cooperative_kernel<F: Float, W: Float, N: Size>(
         if has0 {
             let w =
                 Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(weight[col0 * w_stride + i]));
-            acc0 += x * w;
+            s0.store(s0.read() + lane_sum(x * w));
         }
         if has1 {
             let w =
                 Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(weight[col1 * w_stride + i]));
-            acc1 += x * w;
+            s1.store(s1.read() + lane_sum(x * w));
         }
         if has2 {
             let w =
                 Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(weight[col2 * w_stride + i]));
-            acc2 += x * w;
+            s2.store(s2.read() + lane_sum(x * w));
         }
         if has3 {
             let w =
                 Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(weight[col3 * w_stride + i]));
-            acc3 += x * w;
+            s3.store(s3.read() + lane_sum(x * w));
         }
         i += COOP_LANES_X;
     }
 
-    let mut s0 = 0f32;
-    let mut s1 = 0f32;
-    let mut s2 = 0f32;
-    let mut s3 = 0f32;
-    #[unroll]
-    for lane in 0..acc0.vector_size() {
-        s0 += acc0.extract(lane);
-        s1 += acc1.extract(lane);
-        s2 += acc2.extract(lane);
-        s3 += acc3.extract(lane);
-    }
-
     let mut partial = Shared::<[f32]>::new_slice(COOP_OUTPUTS_PER_CUBE * COOP_LANES_X);
     let row_s = ty * (COOP_ROWS_PER_LANE * COOP_LANES_X);
-    partial[row_s + tx] = s0;
-    partial[row_s + COOP_LANES_X + tx] = s1;
-    partial[row_s + COOP_LANES_X * 2usize + tx] = s2;
-    partial[row_s + COOP_LANES_X * 3usize + tx] = s3;
+    partial[row_s + tx] = s0.consume();
+    partial[row_s + COOP_LANES_X + tx] = s1.consume();
+    partial[row_s + COOP_LANES_X * 2usize + tx] = s2.consume();
+    partial[row_s + COOP_LANES_X * 3usize + tx] = s3.consume();
     sync_cube();
 
     #[unroll]
