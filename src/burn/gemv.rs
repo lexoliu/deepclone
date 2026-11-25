@@ -8,17 +8,25 @@ use burn::{
     cubecl::{ir::ElemType, prelude::*},
     tensor::{Shape, Tensor as BurnTensor},
 };
+
+const COOP_LANES_X: usize = 32;
+const COOP_LANES_Y: usize = 2;
+const COOP_ROWS_PER_LANE: usize = 4;
+const COOP_OUTPUTS_PER_CUBE: usize = COOP_LANES_Y * COOP_ROWS_PER_LANE;
+
 #[backend_extension(Cube, Fusion)]
 trait VectorProjection: Backend {
     #[fusion(dtype = input, shape = Shape::from([1, 1, weight[1]]))]
     fn vector_projection(input: FloatTensor<Self>, weight: FloatTensor<Self>) -> FloatTensor<Self>;
 }
+
 pub(super) fn project(input: BurnTensor<3>, weight: BurnTensor<2>) -> BurnTensor<3> {
     BurnTensor::from_dispatch(Dispatch::vector_projection(
         input.into_dispatch(),
         weight.into_dispatch(),
     ))
 }
+
 impl VectorProjection for CubeBackend {
     fn vector_projection(input: FloatTensor<Self>, weight: FloatTensor<Self>) -> FloatTensor<Self> {
         let width = weight.shape()[1];
@@ -27,93 +35,189 @@ impl VectorProjection for CubeBackend {
             &input.device,
             input.dtype.into(),
         );
-        let cooperative = weight.meta.strides()[0] == 1;
-        let dim = CubeDim::new(
-            &input.client,
-            if cooperative { input.shape()[2] } else { width },
-        );
-        let lanes = dim.num_elems() as usize;
-        let groups = if cooperative {
-            width
+        let dtypes = [
+            dtype_to_storage_type(input.dtype),
+            dtype_to_storage_type(weight.dtype),
+        ];
+        if weight.meta.strides()[0] == 1 {
+            // Cap at 4 (WebGPU vec4) so mixed-dtype and pre-cast weights choose
+            // the same vector width and keep bit-identical reduction order.
+            let in_vec = tensor_vector_size_parallel(
+                input.client.io_optimized_vector_sizes(input.dtype.size()),
+                input.meta.shape(),
+                input.meta.strides(),
+                2,
+            );
+            let w_vec = tensor_vector_size_parallel(
+                weight.client.io_optimized_vector_sizes(weight.dtype.size()),
+                weight.meta.shape(),
+                weight.meta.strides(),
+                0,
+            );
+            let vector_size = in_vec.min(w_vec).min(4);
+            let groups = width.div_ceil(COOP_OUTPUTS_PER_CUBE).max(1);
+            gemv_cooperative_kernel::launch(
+                &input.client,
+                CubeCount::Static(groups as u32, 1, 1),
+                CubeDim::new_2d(COOP_LANES_X as u32, COOP_LANES_Y as u32),
+                vector_size,
+                input.clone().into_tensor_arg(),
+                weight.into_tensor_arg(),
+                output.clone().into_tensor_arg(),
+                dtypes,
+            );
         } else {
-            width.div_ceil(lanes)
-        };
-        let weight_dtype = dtype_to_storage_type(weight.dtype);
-        vector_projection_kernel::launch(
-            &input.client,
-            CubeCount::Static(groups as u32, 1, 1),
-            dim,
-            input.clone().into_tensor_arg(),
-            weight.into_tensor_arg(),
-            output.clone().into_tensor_arg(),
-            cooperative,
-            lanes,
-            [dtype_to_storage_type(input.dtype), weight_dtype],
-        );
+            let dim = CubeDim::new(&input.client, width);
+            let lanes = dim.num_elems() as usize;
+            let groups = width.div_ceil(lanes).max(1);
+            vector_projection_rowmajor_kernel::launch(
+                &input.client,
+                CubeCount::Static(groups as u32, 1, 1),
+                dim,
+                input.clone().into_tensor_arg(),
+                weight.into_tensor_arg(),
+                output.clone().into_tensor_arg(),
+                dtypes,
+            );
+        }
         output
     }
 }
+
 #[cube(launch)]
-fn vector_projection_kernel<F: Float, W: Float>(
+fn gemv_cooperative_kernel<F: Float, W: Float, N: Size>(
+    input: &Tensor<Vector<F, N>>,
+    weight: &Tensor<Vector<W, N>>,
+    output: &mut Tensor<F>,
+    #[define(F, W)] _dtypes: [ElemType; 2],
+) {
+    let tx = UNIT_POS_X as usize;
+    let ty = UNIT_POS_Y as usize;
+    let col_base = (CUBE_POS_X as usize) * COOP_OUTPUTS_PER_CUBE + ty * COOP_ROWS_PER_LANE;
+    let width = output.shape(2);
+    let k = input.shape(2);
+    let vec_size = comptime!(input.vector_size());
+    let k_vecs = k / vec_size;
+    let w_stride = weight.stride(1) / vec_size;
+    let in_stride = input.stride(2);
+
+    let col0 = col_base;
+    let col1 = col_base + 1usize;
+    let col2 = col_base + 2usize;
+    let col3 = col_base + 3usize;
+    let has0 = col0 < width;
+    let has1 = col1 < width;
+    let has2 = col2 < width;
+    let has3 = col3 < width;
+
+    let mut acc0 = Vector::<f32, N>::new(0f32);
+    let mut acc1 = Vector::<f32, N>::new(0f32);
+    let mut acc2 = Vector::<f32, N>::new(0f32);
+    let mut acc3 = Vector::<f32, N>::new(0f32);
+
+    // Preserve the weight-to-activation cast at each load while reusing each
+    // vectorized activation read across four adjacent output columns.
+    let mut i = tx;
+    while i < k_vecs {
+        let x = if comptime!(vec_size > 1) {
+            Vector::<f32, N>::cast_from(input[i])
+        } else {
+            Vector::<f32, N>::cast_from(input[i * in_stride])
+        };
+        if has0 {
+            let w = Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(
+                weight[col0 * w_stride + i],
+            ));
+            acc0 += x * w;
+        }
+        if has1 {
+            let w = Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(
+                weight[col1 * w_stride + i],
+            ));
+            acc1 += x * w;
+        }
+        if has2 {
+            let w = Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(
+                weight[col2 * w_stride + i],
+            ));
+            acc2 += x * w;
+        }
+        if has3 {
+            let w = Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(
+                weight[col3 * w_stride + i],
+            ));
+            acc3 += x * w;
+        }
+        i += COOP_LANES_X;
+    }
+
+    let mut s0 = 0f32;
+    let mut s1 = 0f32;
+    let mut s2 = 0f32;
+    let mut s3 = 0f32;
+    #[unroll]
+    for lane in 0..vec_size {
+        s0 += acc0[lane];
+        s1 += acc1[lane];
+        s2 += acc2[lane];
+        s3 += acc3[lane];
+    }
+
+    let mut partial = Shared::<[f32]>::new_slice(COOP_OUTPUTS_PER_CUBE * COOP_LANES_X);
+    let row_s = ty * (COOP_ROWS_PER_LANE * COOP_LANES_X);
+    partial[row_s + tx] = s0;
+    partial[row_s + COOP_LANES_X + tx] = s1;
+    partial[row_s + COOP_LANES_X * 2usize + tx] = s2;
+    partial[row_s + COOP_LANES_X * 3usize + tx] = s3;
+    sync_cube();
+
+    #[unroll]
+    for stage in 0..COOP_LANES_X.ilog2() as usize {
+        let distance = comptime!(COOP_LANES_X >> (stage + 1));
+        if tx < distance {
+            partial[row_s + tx] += partial[row_s + tx + distance];
+            partial[row_s + COOP_LANES_X + tx] += partial[row_s + COOP_LANES_X + tx + distance];
+            partial[row_s + COOP_LANES_X * 2usize + tx] +=
+                partial[row_s + COOP_LANES_X * 2usize + tx + distance];
+            partial[row_s + COOP_LANES_X * 3usize + tx] +=
+                partial[row_s + COOP_LANES_X * 3usize + tx + distance];
+        }
+        sync_cube();
+    }
+
+    if tx < COOP_ROWS_PER_LANE {
+        let col = col_base + tx;
+        if col < width {
+            output[col] = F::cast_from(partial[row_s + tx * COOP_LANES_X]);
+        }
+    }
+}
+
+#[cube(launch)]
+fn vector_projection_rowmajor_kernel<F: Float, W: Float>(
     input: &Tensor<F>,
     weight: &Tensor<W>,
     output: &mut Tensor<F>,
-    #[comptime] cooperative: bool,
-    #[comptime] lanes: usize,
     #[define(F, W)] _dtypes: [ElemType; 2],
 ) {
-    let k = input.shape(2);
-    // Preserve the former weight-to-activation cast at each load, including
-    // FP32-to-FP16 rounding, without allocating a converted weight matrix.
-    if cooperative {
-        // A transposed row-major weight has contiguous reduction elements.
-        // Cooperating lanes read adjacent K elements for one output column.
-        let column = CUBE_POS;
-        let sum = RuntimeCell::<f32>::new(0f32);
-        let mut i = UNIT_POS as usize;
-        while i < k {
-            sum.store(
-                sum.read()
-                    + f32::cast_from(input[i * input.stride(2)])
-                        * f32::cast_from(F::cast_from(
-                            weight[i * weight.stride(0) + column * weight.stride(1)],
-                        )),
-            );
-            i += CUBE_DIM as usize;
-        }
-        let mut partial = Shared::<[f32]>::new_slice(lanes);
-        partial[UNIT_POS as usize] = sum.consume();
-        sync_cube();
-        #[unroll]
-        for stage in 0..lanes.ilog2() as usize {
-            let distance = comptime!(lanes >> (stage + 1));
-            if (UNIT_POS as usize) < distance {
-                partial[UNIT_POS as usize] += partial[UNIT_POS as usize + distance];
-            }
-            sync_cube();
-        }
-        if UNIT_POS == 0 {
-            output[column] = F::cast_from(partial[0]);
-        }
-    } else {
-        // Row-major projections have adjacent output columns. Neighboring lanes
-        // read adjacent weights, reusing the input vector through the GPU cache.
-        let column = ABSOLUTE_POS;
-        if column >= output.shape(2) {
-            terminate!();
-        }
-        let sum = RuntimeCell::<f32>::new(0f32);
-        for i in 0..k {
-            sum.store(
-                sum.read()
-                    + f32::cast_from(input[i * input.stride(2)])
-                        * f32::cast_from(F::cast_from(
-                            weight[i * weight.stride(0) + column * weight.stride(1)],
-                        )),
-            );
-        }
-        output[column] = F::cast_from(sum.consume());
+    // Row-major projections have adjacent output columns. Neighboring lanes
+    // read adjacent weights, reusing the input vector through the GPU cache.
+    let column = ABSOLUTE_POS;
+    if column >= output.shape(2) {
+        terminate!();
     }
+    let k = input.shape(2);
+    let sum = RuntimeCell::<f32>::new(0f32);
+    for i in 0..k {
+        sum.store(
+            sum.read()
+                + f32::cast_from(input[i * input.stride(2)])
+                    * f32::cast_from(F::cast_from(
+                        weight[i * weight.stride(0) + column * weight.stride(1)],
+                    )),
+        );
+    }
+    output[column] = F::cast_from(sum.consume());
 }
 
 #[cfg(test)]
@@ -180,7 +284,7 @@ mod tests {
         futures_lite::future::block_on(async {
             let device = Device::wgpu_options().init_async().await.unwrap();
             for dtype in [DType::F32, DType::F16] {
-                for (k, n) in [(37, 11), (1024, 384)] {
+                for (k, n) in [(37, 11), (1024, 384), (3072, 1024)] {
                     let input: Vec<f32> = (0..k).map(|i| (i % 17) as f32 / 32. - 0.25).collect();
                     let data: Vec<f32> = (0..k * n).map(|i| (i % 31) as f32 / 32. - 0.5).collect();
                     let mut weight = BurnTensor::<2>::from_data(
