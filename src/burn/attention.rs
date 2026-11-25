@@ -1,4 +1,4 @@
-//! Single-query grouped attention directly over the live KV cache.
+//! Causal grouped attention directly over the live KV cache.
 use burn::cubecl;
 use burn::{
     backend::{
@@ -16,12 +16,12 @@ const FUSED_LANES: usize = 128;
 
 #[backend_extension(Cube, Fusion)]
 trait DecodeAttention: Backend {
-    #[fusion(dtype = query, shape = Shape::from([1, query[1], 1, values[3]]))]
-    fn decode_fused(
+    #[fusion(dtype = query, shape = Shape::from([1, query[1], query[2], values[3]]))]
+    fn causal_attention_fused(
         query: FloatTensor<Self>,
         keys: FloatTensor<Self>,
         values: FloatTensor<Self>,
-        length: usize,
+        start_position: usize,
     ) -> FloatTensor<Self>;
 
     #[fusion(dtype = query, shape = Shape::from([1, query[1], 1, *length]))]
@@ -38,6 +38,10 @@ trait DecodeAttention: Backend {
     ) -> FloatTensor<Self>;
 }
 
+pub(super) fn supports_fused(total_length: usize, width: usize) -> bool {
+    total_length > 0 && total_length <= LONG_SCORE_CAP && width <= MAX_SHARED_QUERY
+}
+
 pub(super) fn decode(
     query: BurnTensor<4>,
     keys: BurnTensor<4>,
@@ -45,15 +49,29 @@ pub(super) fn decode(
     length: usize,
 ) -> BurnTensor<4> {
     let width = query.dims()[3];
-    if length > 0 && length <= LONG_SCORE_CAP && width <= MAX_SHARED_QUERY {
-        return BurnTensor::from_dispatch(Dispatch::decode_fused(
+    if supports_fused(length, width) {
+        return BurnTensor::from_dispatch(Dispatch::causal_attention_fused(
             query.into_dispatch(),
             keys.into_dispatch(),
             values.into_dispatch(),
-            length,
+            length - 1,
         ));
     }
     decode_unfused(query, keys, values, length)
+}
+
+pub(super) fn prefill(
+    query: BurnTensor<4>,
+    keys: BurnTensor<4>,
+    values: BurnTensor<4>,
+    start_position: usize,
+) -> BurnTensor<4> {
+    BurnTensor::from_dispatch(Dispatch::causal_attention_fused(
+        query.into_dispatch(),
+        keys.into_dispatch(),
+        values.into_dispatch(),
+        start_position,
+    ))
 }
 
 fn decode_unfused(
@@ -83,33 +101,35 @@ fn decode_unfused(
 }
 
 impl DecodeAttention for CubeBackend {
-    fn decode_fused(
+    fn causal_attention_fused(
         query: FloatTensor<Self>,
         keys: FloatTensor<Self>,
         values: FloatTensor<Self>,
-        length: usize,
+        start_position: usize,
     ) -> FloatTensor<Self> {
         let heads = query.shape()[1];
+        let tokens = query.shape()[2];
         let width = values.shape()[3];
+        let total_length = start_position + tokens;
         let output = Self::float_empty(
-            Shape::from([1, heads, 1, width]),
+            Shape::from([1, heads, tokens, width]),
             &query.device,
             query.dtype.into(),
         );
-        let score_cap = if length <= SHORT_SCORE_CAP {
+        let score_cap = if total_length <= SHORT_SCORE_CAP {
             SHORT_SCORE_CAP
         } else {
             LONG_SCORE_CAP
         };
-        decode_fused_kernel::launch(
+        causal_attention_fused_kernel::launch(
             &query.client,
-            CubeCount::Static(heads as u32, 1, 1),
+            CubeCount::Static(heads as u32, tokens as u32, 1),
             CubeDim::new_1d(FUSED_LANES as u32),
             query.clone().into_tensor_arg(),
             keys.into_tensor_arg(),
             values.into_tensor_arg(),
             output.clone().into_tensor_arg(),
-            length,
+            start_position,
             score_cap,
             FUSED_LANES,
             dtype_to_storage_type(query.dtype),
@@ -167,17 +187,19 @@ impl DecodeAttention for CubeBackend {
 }
 
 #[cube(launch)]
-fn decode_fused_kernel<F: Float>(
+fn causal_attention_fused_kernel<F: Float>(
     query: &Tensor<F>,
     keys: &Tensor<F>,
     values: &Tensor<F>,
     output: &mut Tensor<F>,
-    length: usize,
+    start_position: usize,
     #[comptime] score_cap: usize,
     #[comptime] lanes: usize,
     #[define(F)] _dtype: ElemType,
 ) {
-    let head = CUBE_POS;
+    let head = CUBE_POS_X as usize;
+    let q_row = CUBE_POS_Y as usize;
+    let length = start_position + q_row + 1usize;
     let kv_head = head / (query.shape(1) / keys.shape(1));
     let width = query.shape(3);
     let tid = UNIT_POS as usize;
@@ -186,7 +208,7 @@ fn decode_fused_kernel<F: Float>(
     let mut q_shared = Shared::<[f32]>::new_slice(MAX_SHARED_QUERY);
     let mut scratch = Shared::<[f32]>::new_slice(lanes);
 
-    let q_base = head * query.stride(1);
+    let q_base = head * query.stride(1) + q_row * query.stride(2);
     let q_col_stride = query.stride(3);
     let mut c = tid;
     while c < width {
@@ -274,7 +296,7 @@ fn decode_fused_kernel<F: Float>(
     let v_base = kv_head * values.stride(1);
     let v_tok_stride = values.stride(2);
     let v_col_stride = values.stride(3);
-    let out_base = head * output.stride(1);
+    let out_base = head * output.stride(1) + q_row * output.stride(2);
     let mut column = tid;
     while column < width {
         let mixed = RuntimeCell::<f32>::new(0f32);
@@ -533,6 +555,90 @@ mod tests {
                     assert!(
                         maximum < tolerance,
                         "fused vs unfused {dtype:?} length {length}: {maximum}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a WebGPU adapter"]
+    fn fused_prefill_causal_attention_matches_unfused_reference() {
+        futures_lite::future::block_on(async {
+            let device = Device::wgpu_options().init_async().await.unwrap();
+            for dtype in [DType::F16, DType::F32] {
+                for (heads, kv_heads, width, start_pos, tokens, capacity) in [
+                    (4, 2, 16, 0, 7, 16),
+                    (16, 8, 128, 0, 19, 32),
+                    (16, 8, 128, 12, 19, 64),
+                    (16, 8, 128, 0, 151, 256),
+                    (16, 8, 128, 120, 140, 512),
+                ] {
+                    let tensor = |shape: [usize; 4], salt: usize| {
+                        let n = shape.iter().product::<usize>();
+                        BurnTensor::<4>::from_data(
+                            TensorData::new(
+                                (0..n)
+                                    .map(|i| (((i * salt + 7) % 113) as f32 - 56.) / 64.)
+                                    .collect::<Vec<_>>(),
+                                shape,
+                            ),
+                            (&device, dtype),
+                        )
+                    };
+                    let total = start_pos + tokens;
+                    let query =
+                        tensor([1, heads, tokens, width], 19) * (width as f32).sqrt().recip();
+                    let keys = tensor([1, kv_heads, capacity, width], 31);
+                    let values = tensor([1, kv_heads, capacity, width], 47);
+
+                    let queries = BurnTensor::<1, burn::tensor::Int>::arange(
+                        start_pos as i64..total as i64,
+                        &device,
+                    )
+                    .reshape([tokens, 1]);
+                    let k_idx =
+                        BurnTensor::<1, burn::tensor::Int>::arange(0..total as i64, &device)
+                            .reshape([1, total]);
+                    let mask = (queries - k_idx)
+                        .lower_elem(0)
+                        .reshape([1, 1, 1, tokens, total]);
+                    let groups = heads / kv_heads;
+                    let sel = [0..1, 0..kv_heads, 0..total, 0..width];
+                    let k_view = keys
+                        .clone()
+                        .slice(sel.clone())
+                        .reshape([1, kv_heads, 1, total, width]);
+                    let v_view = values
+                        .clone()
+                        .slice(sel)
+                        .reshape([1, kv_heads, 1, total, width]);
+                    let scores = query
+                        .clone()
+                        .reshape([1, kv_heads, groups, tokens, width])
+                        .matmul(k_view.swap_dims(3, 4))
+                        .cast(DType::F32)
+                        .mask_fill(mask, f32::NEG_INFINITY);
+                    let expected = activation::softmax(scores, 4)
+                        .cast(dtype)
+                        .matmul(v_view)
+                        .reshape([1, heads, tokens, width]);
+
+                    let (actual, expected) = futures_lite::future::zip(
+                        super::super::read(prefill(query, keys, values, start_pos)),
+                        super::super::read(expected),
+                    )
+                    .await;
+                    let maximum = actual
+                        .unwrap()
+                        .into_iter()
+                        .zip(expected.unwrap())
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    let tolerance = if dtype == DType::F16 { 0.002 } else { 1e-5 };
+                    assert!(
+                        maximum < tolerance,
+                        "prefill {dtype:?} start={start_pos} tokens={tokens}: {maximum}"
                     );
                 }
             }

@@ -104,6 +104,8 @@ impl Layer {
         );
         let mixed = if tokens == 1 {
             super::attention::decode(q, keys.clone(), values.clone(), position + tokens)
+        } else if super::attention::supports_fused(position + tokens, c.head_dim) {
+            super::attention::prefill(q, keys.clone(), values.clone(), position)
         } else {
             let selection = [
                 0..1,
@@ -228,7 +230,9 @@ impl Decoder {
                     .into(),
             });
         }
-        let mask = if tokens > 1 {
+        let mask = if tokens > 1
+            && !super::attention::supports_fused(self.position + tokens, self.config.head_dim)
+        {
             let device = hidden.device();
             let queries = Tensor::<1, Int>::arange(
                 self.position as i64..(self.position + tokens) as i64,
