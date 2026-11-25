@@ -387,7 +387,7 @@ impl Model for Burn {
         })
     }
     fn predictor(&mut self, hidden: Self::Hidden) -> Result<Self::Hidden, Error> {
-        Ok(self.predictor.step(hidden)?)
+        Ok(self.predictor.step_unflushed(hidden)?)
     }
     async fn predictor_head(
         &mut self,
