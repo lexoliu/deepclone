@@ -1043,8 +1043,8 @@ mod tests {
 
                 // Standalone qkv_rope_cache_no_norm used by AudioTransformer.
                 let (h_q, h_kv, d_head, cap) = (8usize, 8usize, 64usize, 32usize);
-                let mut kf = BurnTensor::<4>::zeros([1, h_kv, cap, d_head], (&device, dtype));
-                let mut vf = BurnTensor::<4>::zeros([1, h_kv, cap, d_head], (&device, dtype));
+                let kf = BurnTensor::<4>::zeros([1, h_kv, cap, d_head], (&device, dtype));
+                let vf = BurnTensor::<4>::zeros([1, h_kv, cap, d_head], (&device, dtype));
                 let scale = (d_head as f32).sqrt().recip();
                 let t = 5usize;
                 let w_tot = (h_q + 2 * h_kv) * d_head;

@@ -677,7 +677,7 @@ fn store_conv_row<F: Float, N: Size>(
             out_v.insert(2usize, v2);
             out_v.insert(3usize, v3);
             if comptime!(has_residual) {
-                out_v = out_v + Vector::<f32, N>::cast_from(residual[idx]);
+                out_v += Vector::<f32, N>::cast_from(residual[idx]);
             }
             output[idx] = Vector::<F, N>::cast_from(out_v);
         }
