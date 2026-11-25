@@ -39,19 +39,21 @@ impl BatchedProjection for CubeBackend {
             &input.device,
             input.dtype.into(),
         );
-        // A 16 × 16 workgroup computes a 32 × 32 register tile (2 × 2 outputs per thread)
-        // with TILE_K = 16 so shared tiles fit easily within WebGPU's 16 KB guarantee.
+        let tile_m = if rows <= TILE_K { TILE_K } else { TILE_MN };
+        // A 16 × 16 workgroup computes a 32 × 32 register tile (or 16 × 32 for narrow
+        // sequences <= 16 frames) with TILE_K = 16 within WebGPU's 16 KB guarantee.
         projection_kernel::launch(
             &input.client,
             CubeCount::Static(
                 columns.div_ceil(TILE_MN) as u32,
-                rows.div_ceil(TILE_MN) as u32,
+                rows.div_ceil(tile_m) as u32,
                 batch as u32,
             ),
             CubeDim::new_2d(TILE_K as u32, TILE_K as u32),
             input.clone().into_tensor_arg(),
             weight.clone().into_tensor_arg(),
             output.clone().into_tensor_arg(),
+            tile_m,
             weight.meta.strides()[0] == 1,
             input.meta.strides()[1] < input.meta.strides()[2],
             [
@@ -63,18 +65,20 @@ impl BatchedProjection for CubeBackend {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[cube(launch)]
 fn projection_kernel<F: Float, W: Float>(
     input: &Tensor<F>,
     weight: &Tensor<W>,
     output: &mut Tensor<F>,
+    #[comptime] tile_m: usize,
     #[comptime] transposed: bool,
     #[comptime] input_transposed: bool,
     #[define(F, W)] _dtypes: [ElemType; 2],
 ) {
     let tx = UNIT_POS_X as usize;
     let ty = UNIT_POS_Y as usize;
-    let row_base = (CUBE_POS_Y as usize) * TILE_MN;
+    let row_base = (CUBE_POS_Y as usize) * tile_m;
     let col_base = (CUBE_POS_X as usize) * TILE_MN;
     let batch = CUBE_POS_Z as usize;
     let k = input.shape(2);
@@ -86,7 +90,7 @@ fn projection_kernel<F: Float, W: Float>(
     let w_s0 = weight.stride(0);
     let w_s1 = weight.stride(1);
 
-    let mut left = Shared::<[F]>::new_slice(512usize);
+    let mut left = Shared::<[F]>::new_slice(tile_m * TILE_K);
     let mut right = Shared::<[F]>::new_slice(512usize);
 
     let acc00 = RuntimeCell::<f32>::new(0f32);
@@ -109,12 +113,14 @@ fn projection_kernel<F: Float, W: Float>(
                 if r0 < rows {
                     a0 = input[in_b + r0 * in_s1 + ik * in_s2];
                 }
-                if r1 < rows {
+                if comptime!(tile_m > TILE_K) && r1 < rows {
                     a1 = input[in_b + r1 * in_s1 + ik * in_s2];
                 }
             }
             left[tx * TILE_K + ty] = a0;
-            left[(tx + TILE_K) * TILE_K + ty] = a1;
+            if comptime!(tile_m > TILE_K) {
+                left[(tx + TILE_K) * TILE_K + ty] = a1;
+            }
         } else {
             let ik = k_base + tx;
             let r0 = row_base + ty;
@@ -125,12 +131,14 @@ fn projection_kernel<F: Float, W: Float>(
                 if r0 < rows {
                     a0 = input[in_b + r0 * in_s1 + ik * in_s2];
                 }
-                if r1 < rows {
+                if comptime!(tile_m > TILE_K) && r1 < rows {
                     a1 = input[in_b + r1 * in_s1 + ik * in_s2];
                 }
             }
             left[ty * TILE_K + tx] = a0;
-            left[(ty + TILE_K) * TILE_K + tx] = a1;
+            if comptime!(tile_m > TILE_K) {
+                left[(ty + TILE_K) * TILE_K + tx] = a1;
+            }
         }
 
         // Read the contiguous dimension cooperatively for either weight layout.
@@ -172,13 +180,15 @@ fn projection_kernel<F: Float, W: Float>(
         #[unroll]
         for i in 0..TILE_K {
             let a0 = f32::cast_from(left[ty * TILE_K + i]);
-            let a1 = f32::cast_from(left[(ty + TILE_K) * TILE_K + i]);
             let b0 = f32::cast_from(right[i * TILE_MN + tx]);
             let b1 = f32::cast_from(right[i * TILE_MN + tx + TILE_K]);
             acc00.store(acc00.read() + a0 * b0);
             acc01.store(acc01.read() + a0 * b1);
-            acc10.store(acc10.read() + a1 * b0);
-            acc11.store(acc11.read() + a1 * b1);
+            if comptime!(tile_m > TILE_K) {
+                let a1 = f32::cast_from(left[(ty + TILE_K) * TILE_K + i]);
+                acc10.store(acc10.read() + a1 * b0);
+                acc11.store(acc11.read() + a1 * b1);
+            }
         }
         sync_cube();
     }
@@ -195,7 +205,7 @@ fn projection_kernel<F: Float, W: Float>(
             output[(batch * rows + r0) * columns + c1] = F::cast_from(acc01.consume());
         }
     }
-    if r1 < rows {
+    if comptime!(tile_m > TILE_K) && r1 < rows {
         if c0 < columns {
             output[(batch * rows + r1) * columns + c0] = F::cast_from(acc10.consume());
         }
@@ -220,7 +230,12 @@ mod tests {
                     for (transposed, input_transposed) in
                         [(false, false), (false, true), (true, false), (true, true)]
                     {
-                        for [batch, rows, k, columns] in [[2, 19, 37, 23], [1, 9, 1024, 256]] {
+                        for [batch, rows, k, columns] in [
+                            [2, 19, 37, 23],
+                            [1, 9, 1024, 256],
+                            [1, 12, 512, 512],
+                            [1, 12, 512, 1536],
+                        ] {
                             let mut input = BurnTensor::<3>::from_data(
                                 TensorData::new(
                                     (0..batch * rows * k)

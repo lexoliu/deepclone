@@ -253,6 +253,22 @@ pub(crate) struct ConvHistory {
 }
 impl Conv<Causal> {
     pub fn stream(&self, x: Tensor<3>, history: &mut ConvHistory) -> Tensor<3> {
+        self.stream_inner(x, history, None)
+    }
+    pub fn stream_add(
+        &self,
+        x: Tensor<3>,
+        history: &mut ConvHistory,
+        residual: Tensor<3>,
+    ) -> Tensor<3> {
+        self.stream_inner(x, history, Some(residual))
+    }
+    fn stream_inner(
+        &self,
+        x: Tensor<3>,
+        history: &mut ConvHistory,
+        residual: Option<Tensor<3>>,
+    ) -> Tensor<3> {
         // Every convolution in Qwen's waveform decoder has unit stride.
         debug_assert_eq!(self.options.stride[0], 1);
         let context = (self.kernel - 1) * self.options.dilation[0];
@@ -272,15 +288,25 @@ impl Conv<Causal> {
                 });
             }
             return if self.packed {
-                super::conv::causal_conv1d(
-                    x,
-                    previous,
-                    self.weight.clone(),
-                    self.bias.clone(),
-                    self.options.dilation[0],
-                )
+                match residual {
+                    Some(res) => super::conv::causal_conv1d_add(
+                        x,
+                        previous,
+                        self.weight.clone(),
+                        self.bias.clone(),
+                        self.options.dilation[0],
+                        res,
+                    ),
+                    None => super::conv::causal_conv1d(
+                        x,
+                        previous,
+                        self.weight.clone(),
+                        self.bias.clone(),
+                        self.options.dilation[0],
+                    ),
+                }
             } else {
-                super::conv::depthwise_causal_conv1d(
+                let out = super::conv::depthwise_causal_conv1d(
                     x,
                     previous,
                     self.weight
@@ -288,7 +314,11 @@ impl Conv<Causal> {
                         .reshape([self.options.groups, self.kernel]),
                     self.bias.clone(),
                     self.options.dilation[0],
-                )
+                );
+                match residual {
+                    Some(res) => res + out,
+                    None => out,
+                }
             };
         }
         let x = match previous {
@@ -299,7 +329,11 @@ impl Conv<Causal> {
         if context > 0 {
             history.input = Some(x.clone().slice([0..b, 0..c, t - context..t]));
         }
-        self.convolve(x)
+        let out = self.convolve(x);
+        match residual {
+            Some(res) => res + out,
+            None => out,
+        }
     }
 }
 
