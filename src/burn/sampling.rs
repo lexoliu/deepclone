@@ -256,21 +256,11 @@ fn fused_multinomial_kernel<F: Float>(
         sync_cube();
     }
     let flags = data[0];
+    let valid = (flags & 2u32) == 0u32 && (flags & 1u32) != 0u32;
     sync_cube();
 
-    if (flags & 2u32) != 0u32 {
-        if tid == 0 {
-            output[0] = -2i32;
-        }
-        terminate!();
-    }
-    if (flags & 1u32) == 0u32 {
-        if tid == 0 {
-            output[0] = -1i32;
-        }
-        terminate!();
-    }
-
+    // Defer invalid-logit exits until after the sort and shared barriers so every
+    // workgroupBarrier remains in WGSL uniform control flow under browser Dawn/Tint.
     crate::burn::sort::bitonic_sort_indices(input, &mut data, padded, cached_scores);
 
     let best_orig = data[0] as usize;
@@ -293,55 +283,85 @@ fn fused_multinomial_kernel<F: Float>(
     sync_cube();
 
     if cached_scores > 0 {
-        let mut rank = tid;
-        while rank < n {
-            let orig = data[rank] as usize;
-            let s = f32::reinterpret(data[padded + orig]);
-            let s_bits = u32::reinterpret(s);
-            let w = if s_bits == 0xff80_0000u32 || (has_top_k && s < cutoff) {
-                0f32
-            } else {
-                ((s - max_val) / temperature).exp()
-            };
-            data[padded + orig] = u32::reinterpret(w);
-            rank += lanes;
+        if valid {
+            let mut rank = tid;
+            while rank < n {
+                let orig = data[rank] as usize;
+                let s = f32::reinterpret(data[padded + orig]);
+                let s_bits = u32::reinterpret(s);
+                let w = if s_bits == 0xff80_0000u32 || (has_top_k && s < cutoff) {
+                    0f32
+                } else {
+                    ((s - max_val) / temperature).exp()
+                };
+                data[padded + orig] = u32::reinterpret(w);
+                rank += lanes;
+            }
         }
         sync_cube();
     }
 
     if tid == 0 {
-        let mut kept_k = 0usize;
-        let mut total = 0f32;
-        let mut rank = 0usize;
-        while rank < n {
-            let orig = data[rank] as usize;
-            let w = if cached_scores > 0 {
-                f32::reinterpret(data[padded + orig])
-            } else {
-                let s = f32::cast_from(input[orig * stride]);
-                let s_bits = u32::reinterpret(s);
-                if s_bits == 0xff80_0000u32 || (has_top_k && s < cutoff) {
-                    0f32
-                } else {
-                    ((s - max_val) / temperature).exp()
-                }
-            };
-            if w == 0f32 {
-                break;
-            }
-            total += w;
-            kept_k = rank + 1usize;
-            rank += 1usize;
-        }
-
-        let mut kept_p = kept_k;
-        let mut retained = total;
-        if top_p < 1f32 {
-            let threshold = total * top_p;
-            let mut prefix = 0f32;
-            let mut count = 0usize;
+        if (flags & 2u32) != 0u32 {
+            output[0] = -2i32;
+        } else if (flags & 1u32) == 0u32 {
+            output[0] = -1i32;
+        } else {
+            let mut kept_k = 0usize;
+            let mut total = 0f32;
             let mut rank = 0usize;
-            while rank < kept_k {
+            while rank < n {
+                let orig = data[rank] as usize;
+                let w = if cached_scores > 0 {
+                    f32::reinterpret(data[padded + orig])
+                } else {
+                    let s = f32::cast_from(input[orig * stride]);
+                    let s_bits = u32::reinterpret(s);
+                    if s_bits == 0xff80_0000u32 || (has_top_k && s < cutoff) {
+                        0f32
+                    } else {
+                        ((s - max_val) / temperature).exp()
+                    }
+                };
+                if w == 0f32 {
+                    break;
+                }
+                total += w;
+                kept_k = rank + 1usize;
+                rank += 1usize;
+            }
+
+            let mut kept_p = kept_k;
+            let mut retained = total;
+            if top_p < 1f32 {
+                let threshold = total * top_p;
+                let mut prefix = 0f32;
+                let mut count = 0usize;
+                let mut rank = 0usize;
+                while rank < kept_k {
+                    let orig = data[rank] as usize;
+                    let w = if cached_scores > 0 {
+                        f32::reinterpret(data[padded + orig])
+                    } else {
+                        let s = f32::cast_from(input[orig * stride]);
+                        ((s - max_val) / temperature).exp()
+                    };
+                    prefix += w;
+                    count = rank + 1usize;
+                    if prefix >= threshold {
+                        break;
+                    }
+                    rank += 1usize;
+                }
+                kept_p = count;
+                retained = prefix;
+            }
+
+            let target = retained * draw;
+            let mut cumulative = 0f32;
+            let mut chosen = data[kept_p - 1usize] as i32;
+            let mut rank = 0usize;
+            while rank < kept_p {
                 let orig = data[rank] as usize;
                 let w = if cached_scores > 0 {
                     f32::reinterpret(data[padded + orig])
@@ -349,37 +369,15 @@ fn fused_multinomial_kernel<F: Float>(
                     let s = f32::cast_from(input[orig * stride]);
                     ((s - max_val) / temperature).exp()
                 };
-                prefix += w;
-                count = rank + 1usize;
-                if prefix >= threshold {
+                cumulative += w;
+                if cumulative > target {
+                    chosen = orig as i32;
                     break;
                 }
                 rank += 1usize;
             }
-            kept_p = count;
-            retained = prefix;
+            output[0] = chosen;
         }
-
-        let target = retained * draw;
-        let mut cumulative = 0f32;
-        let mut chosen = data[kept_p - 1usize] as i32;
-        let mut rank = 0usize;
-        while rank < kept_p {
-            let orig = data[rank] as usize;
-            let w = if cached_scores > 0 {
-                f32::reinterpret(data[padded + orig])
-            } else {
-                let s = f32::cast_from(input[orig * stride]);
-                ((s - max_val) / temperature).exp()
-            };
-            cumulative += w;
-            if cumulative > target {
-                chosen = orig as i32;
-                break;
-            }
-            rank += 1usize;
-        }
-        output[0] = chosen;
     }
 }
 
