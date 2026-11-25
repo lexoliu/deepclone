@@ -125,27 +125,23 @@ fn gemv_cooperative_kernel<F: Float, W: Float, N: Size>(
             Vector::<f32, N>::cast_from(input[i * in_stride])
         };
         if has0 {
-            let w = Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(
-                weight[col0 * w_stride + i],
-            ));
+            let w =
+                Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(weight[col0 * w_stride + i]));
             acc0 += x * w;
         }
         if has1 {
-            let w = Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(
-                weight[col1 * w_stride + i],
-            ));
+            let w =
+                Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(weight[col1 * w_stride + i]));
             acc1 += x * w;
         }
         if has2 {
-            let w = Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(
-                weight[col2 * w_stride + i],
-            ));
+            let w =
+                Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(weight[col2 * w_stride + i]));
             acc2 += x * w;
         }
         if has3 {
-            let w = Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(
-                weight[col3 * w_stride + i],
-            ));
+            let w =
+                Vector::<f32, N>::cast_from(Vector::<F, N>::cast_from(weight[col3 * w_stride + i]));
             acc3 += x * w;
         }
         i += COOP_LANES_X;
