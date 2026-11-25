@@ -168,7 +168,6 @@ impl<N: Norm, F: FeedForward> Layer<N, F> {
         capacity: usize,
         history: &mut Option<(Tensor<4>, Tensor<4>)>,
     ) -> Tensor<3> {
-        let t = x.dims()[1];
         let (keys, values) = history.take().unwrap_or_else(|| {
             let shape = [1, c.num_key_value_heads, capacity, c.head_dim];
             let device = x.device();
@@ -194,9 +193,7 @@ impl<N: Norm, F: FeedForward> Layer<N, F> {
             scale,
         );
         *history = Some((keys.clone(), values.clone()));
-        let mixed = super::attention::prefill_windowed(q, keys, values, cache_pos, window)
-            .swap_dims(1, 2)
-            .reshape([1, t, c.num_attention_heads * c.head_dim]);
+        let mixed = super::attention::prefill_windowed(q, keys, values, cache_pos, window);
         let x = x + self.output.forward(mixed) * self.attention_scale.clone().unsqueeze();
         let n = self.post.apply(x.clone());
         x + self.mlp.apply(n) * self.mlp_scale.clone().unsqueeze()
@@ -230,22 +227,21 @@ impl<N: Norm, F: FeedForward> AudioTransformer<N, F> {
             || !c.head_dim.is_multiple_of(2)
             || c.num_key_value_heads == 0
             || !c.num_attention_heads.is_multiple_of(c.num_key_value_heads)
+            || window == Some(0)
         {
             return Err(Error::Tensor {
                 name: p.into(),
                 reason: "invalid audio attention dimensions".into(),
             });
         }
-        let rotary = window.map(|_| {
-            rotary_packed_at(
-                w.device(),
-                w.dtype(),
-                0,
-                AUDIO_ROTARY_PRECOMPUTED,
-                c.head_dim,
-                c.rope_theta,
-            )
-        });
+        let rotary = Some(rotary_packed_at(
+            w.device(),
+            w.dtype(),
+            0,
+            AUDIO_ROTARY_PRECOMPUTED,
+            c.head_dim,
+            c.rope_theta,
+        ));
         Ok(Self {
             layers: (0..c.num_hidden_layers)
                 .map(|i| Layer::load(w, &format!("{p}.layers.{i}"), epsilon))
@@ -297,14 +293,16 @@ impl<N: Norm, F: FeedForward> AudioTransformer<N, F> {
             self.config.rope_theta,
         );
         let total = history.frames + t;
+        let cache_start = history.frames - history.cache_len;
+        let key_count = total - cache_start;
         let queries = Tensor::<1, Int>::arange(history.frames as i64..total as i64, &device);
-        let keys = Tensor::<1, Int>::arange(0..total as i64, &device);
-        let distance = queries.reshape([t, 1]) - keys.reshape([1, total]);
+        let keys = Tensor::<1, Int>::arange(cache_start as i64..total as i64, &device);
+        let distance = queries.reshape([t, 1]) - keys.reshape([1, key_count]);
         let mut mask = distance.clone().lower_elem(0);
         if let Some(window) = self.window {
             mask = mask.bool_or(distance.greater_equal_elem(window as i64));
         }
-        let mask = mask.reshape([1, 1, t, total]);
+        let mask = mask.reshape([1, 1, t, key_count]);
         for (layer, past) in self.layers.iter().zip(&mut history.layers) {
             x = layer.forward(x, &self.config, &cosine, &sine, &mask, past);
         }
@@ -428,4 +426,45 @@ fn rotary_tables_at(
         Tensor::<4>::from_data(TensorData::new(cosines, shape), device).cast(dtype),
         Tensor::<4>::from_data(TensorData::new(sines, shape), device).cast(dtype),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::burn::WeightSource;
+
+    struct UnusedWeights;
+    impl WeightSource for UnusedWeights {
+        fn device(&self) -> &Device {
+            unreachable!("validation fails before device access")
+        }
+        fn dtype(&self) -> DType {
+            DType::F32
+        }
+        fn tensor<const D: usize>(&self, name: &str) -> Result<Tensor<D>, Error> {
+            Err(Error::Tensor {
+                name: name.into(),
+                reason: "unused".into(),
+            })
+        }
+        fn optional<const D: usize>(&self, _name: &str) -> Result<Option<Tensor<D>>, Error> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn audio_transformer_rejects_zero_window() {
+        let config = AttentionConfig {
+            hidden_size: 64,
+            num_hidden_layers: 1,
+            num_attention_heads: 4,
+            num_key_value_heads: 4,
+            head_dim: 16,
+            rope_theta: 10000.0,
+        };
+        assert!(
+            AudioTransformer::<RmsNorm, Gated>::load(&UnusedWeights, "test", config, 1e-6, Some(0))
+                .is_err()
+        );
+    }
 }

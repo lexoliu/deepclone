@@ -10,6 +10,10 @@ use burn::{
     tensor::{Shape, Tensor as BurnTensor},
 };
 
+pub(super) const PAD_CAUSAL_ZERO: usize = 0;
+pub(super) const PAD_CAUSAL_EDGE: usize = 1;
+pub(super) const PAD_REFLECT_SAME: usize = 2;
+
 #[backend_extension(Cube, Fusion)]
 trait CodecConv: Backend {
     #[fusion(dtype = input, shape = input.clone())]
@@ -23,14 +27,16 @@ trait CodecConv: Backend {
     ) -> FloatTensor<Self>;
 
     #[allow(clippy::too_many_arguments)]
-    #[fusion(dtype = x, shape = Shape::from([x[0], weight[1], x[2]]))]
+    #[fusion(dtype = x, shape = Shape::from([x[0], weight[1], x[2].div_ceil(*stride)]))]
     fn causal_conv1d(
         x: FloatTensor<Self>,
         history: FloatTensor<Self>,
         weight: FloatTensor<Self>,
         bias: FloatTensor<Self>,
         residual: FloatTensor<Self>,
+        stride: usize,
         dilation: usize,
+        pad_mode: usize,
         has_history: bool,
         has_bias: bool,
         has_residual: bool,
@@ -77,33 +83,51 @@ pub(super) fn snake(
     ))
 }
 
-pub(super) fn causal_conv1d(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn conv1d(
     x: BurnTensor<3>,
     history: Option<BurnTensor<3>>,
     weight: BurnTensor<3>,
     bias: Option<BurnTensor<1>>,
+    stride: usize,
     dilation: usize,
+    pad_mode: usize,
 ) -> BurnTensor<3> {
-    causal_conv1d_inner(x, history, weight, bias, dilation, None)
+    conv1d_inner(x, history, weight, bias, stride, dilation, pad_mode, None)
 }
 
-pub(super) fn causal_conv1d_add(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn conv1d_add(
     x: BurnTensor<3>,
     history: Option<BurnTensor<3>>,
     weight: BurnTensor<3>,
     bias: Option<BurnTensor<1>>,
+    stride: usize,
     dilation: usize,
+    pad_mode: usize,
     residual: BurnTensor<3>,
 ) -> BurnTensor<3> {
-    causal_conv1d_inner(x, history, weight, bias, dilation, Some(residual))
+    conv1d_inner(
+        x,
+        history,
+        weight,
+        bias,
+        stride,
+        dilation,
+        pad_mode,
+        Some(residual),
+    )
 }
 
-fn causal_conv1d_inner(
+#[allow(clippy::too_many_arguments)]
+fn conv1d_inner(
     x: BurnTensor<3>,
     history: Option<BurnTensor<3>>,
     weight: BurnTensor<3>,
     bias: Option<BurnTensor<1>>,
+    stride: usize,
     dilation: usize,
+    pad_mode: usize,
     residual: Option<BurnTensor<3>>,
 ) -> BurnTensor<3> {
     let has_history = history.is_some();
@@ -124,7 +148,9 @@ fn causal_conv1d_inner(
         weight.into_dispatch(),
         bias_dispatch,
         residual_dispatch,
+        stride,
         dilation,
+        pad_mode,
         has_history,
         has_bias,
         has_residual,
@@ -297,7 +323,9 @@ impl CodecConv for CubeBackend {
         weight: FloatTensor<Self>,
         bias: FloatTensor<Self>,
         residual: FloatTensor<Self>,
+        stride: usize,
         dilation: usize,
+        pad_mode: usize,
         has_history: bool,
         has_bias: bool,
         has_residual: bool,
@@ -319,9 +347,16 @@ impl CodecConv for CubeBackend {
         } else {
             x.clone()
         };
-        let [batch, c_in, t_out] = [x.shape()[0], x.shape()[1], x.shape()[2]];
+        let [batch, c_in, t_in] = [x.shape()[0], x.shape()[1], x.shape()[2]];
         let [kernel, c_out, _] = [weight.shape()[0], weight.shape()[1], weight.shape()[2]];
+        let t_out = t_in.div_ceil(stride);
         let hist_len = if has_history { history.shape()[2] } else { 0 };
+        let eff_k = (kernel - 1) * dilation + 1;
+        let left_pad = if pad_mode == PAD_REFLECT_SAME {
+            (eff_k - 1) / 2
+        } else {
+            eff_k - stride
+        };
         let output = Self::float_empty(
             Shape::from([batch, c_out, t_out]),
             &x.device,
@@ -332,6 +367,12 @@ impl CodecConv for CubeBackend {
             let dim = CubeDim::new(&x.client, total);
             let groups = total.div_ceil(dim.num_elems() as usize);
             let max_x = x.client.properties().hardware.max_cube_count.0;
+            let weight_elems = kernel * c_out * c_in;
+            let cache_weights = if weight_elems <= 1024 {
+                weight_elems
+            } else {
+                0
+            };
             causal_conv1d_small_out_kernel::launch(
                 &x.client,
                 row_grid(groups, max_x),
@@ -345,12 +386,48 @@ impl CodecConv for CubeBackend {
                 total,
                 c_in,
                 c_out,
+                t_in,
                 t_out,
                 hist_len,
                 kernel,
+                stride,
                 dilation,
-                u32::from(has_bias),
-                u32::from(has_residual),
+                left_pad,
+                stride == 1,
+                pad_mode,
+                has_bias,
+                has_residual,
+                cache_weights,
+                dtype_to_storage_type(x.dtype),
+            );
+        } else if t_out >= 64 {
+            causal_conv1d_4x4_kernel::launch(
+                &x.client,
+                CubeCount::Static(
+                    t_out.div_ceil(64) as u32,
+                    c_out.div_ceil(32) as u32,
+                    batch as u32,
+                ),
+                CubeDim::new_2d(16, 8),
+                x.clone().into_tensor_arg(),
+                history.into_tensor_arg(),
+                weight.into_tensor_arg(),
+                bias.into_tensor_arg(),
+                residual.into_tensor_arg(),
+                output.clone().into_tensor_arg(),
+                c_in,
+                c_out,
+                t_in,
+                t_out,
+                hist_len,
+                kernel,
+                stride,
+                dilation,
+                left_pad,
+                stride == 1,
+                pad_mode,
+                has_bias,
+                has_residual,
                 dtype_to_storage_type(x.dtype),
             );
         } else {
@@ -370,12 +447,16 @@ impl CodecConv for CubeBackend {
                 output.clone().into_tensor_arg(),
                 c_in,
                 c_out,
+                t_in,
                 t_out,
                 hist_len,
                 kernel,
+                stride,
                 dilation,
-                u32::from(has_bias),
-                u32::from(has_residual),
+                left_pad,
+                pad_mode,
+                has_bias,
+                has_residual,
                 dtype_to_storage_type(x.dtype),
             );
         }
@@ -458,34 +539,58 @@ impl CodecConv for CubeBackend {
         let [batch, c_in, t_in] = [x.shape()[0], x.shape()[1], x.shape()[2]];
         let [kernel, c_out, _] = [weight.shape()[0], weight.shape()[1], weight.shape()[2]];
         let hist_len = if has_history { history.shape()[2] } else { 0 };
-        let bias_flag = u32::from(has_bias);
         let output = Self::float_empty(
             Shape::from([batch, c_out, t_in * stride]),
             &x.device,
             x.dtype.into(),
         );
-        causal_conv_transpose1d_tiled_kernel::launch(
-            &x.client,
-            CubeCount::Static(
-                t_in.div_ceil(32) as u32,
-                c_out.div_ceil(32) as u32,
-                (batch * stride) as u32,
-            ),
-            CubeDim::new_2d(16, 16),
-            x.clone().into_tensor_arg(),
-            history.into_tensor_arg(),
-            weight.into_tensor_arg(),
-            bias.into_tensor_arg(),
-            output.clone().into_tensor_arg(),
-            c_in,
-            c_out,
-            t_in,
-            hist_len,
-            kernel,
-            stride,
-            bias_flag,
-            dtype_to_storage_type(x.dtype),
-        );
+        if t_in >= 64 {
+            causal_conv_transpose1d_4x4_kernel::launch(
+                &x.client,
+                CubeCount::Static(
+                    t_in.div_ceil(64) as u32,
+                    c_out.div_ceil(32) as u32,
+                    (batch * stride) as u32,
+                ),
+                CubeDim::new_2d(16, 8),
+                x.clone().into_tensor_arg(),
+                history.into_tensor_arg(),
+                weight.into_tensor_arg(),
+                bias.into_tensor_arg(),
+                output.clone().into_tensor_arg(),
+                c_in,
+                c_out,
+                t_in,
+                hist_len,
+                kernel,
+                stride,
+                has_bias,
+                dtype_to_storage_type(x.dtype),
+            );
+        } else {
+            causal_conv_transpose1d_tiled_kernel::launch(
+                &x.client,
+                CubeCount::Static(
+                    t_in.div_ceil(32) as u32,
+                    c_out.div_ceil(32) as u32,
+                    (batch * stride) as u32,
+                ),
+                CubeDim::new_2d(16, 16),
+                x.clone().into_tensor_arg(),
+                history.into_tensor_arg(),
+                weight.into_tensor_arg(),
+                bias.into_tensor_arg(),
+                output.clone().into_tensor_arg(),
+                c_in,
+                c_out,
+                t_in,
+                hist_len,
+                kernel,
+                stride,
+                has_bias,
+                dtype_to_storage_type(x.dtype),
+            );
+        }
         output
     }
 }
@@ -596,8 +701,439 @@ fn snake_out_1d_kernel<F: Float, N: Size>(
     ));
 }
 
-/// Register-tiled 32 × 32 causal 1D convolution over contiguous `[B, C, T]` tensors
-/// and packed `[K, C_out, C_in]` weights. Uses 4 KB shared memory per 16 × 16 workgroup.
+#[allow(clippy::too_many_arguments)]
+#[cube]
+fn load_conv_sample<F: Float>(
+    x: &Tensor<F>,
+    history: &Tensor<F>,
+    x_row: usize,
+    h_row: usize,
+    t_in: usize,
+    hist_len: usize,
+    t: usize,
+    tap_offset: usize,
+    left_pad: usize,
+    stride: usize,
+    #[comptime] pad_mode: usize,
+) -> f32 {
+    let pos = t * stride + tap_offset;
+    let mut val = 0f32;
+    if pos < left_pad {
+        let deficit = left_pad - pos;
+        if comptime!(pad_mode == PAD_CAUSAL_ZERO) {
+            if hist_len > 0usize && deficit <= hist_len {
+                val = f32::cast_from(history[h_row + (hist_len - deficit)]);
+            }
+        } else if comptime!(pad_mode == PAD_CAUSAL_EDGE) {
+            val = f32::cast_from(x[x_row]);
+        } else {
+            val = f32::cast_from(x[x_row + deficit]);
+        }
+    } else {
+        let raw = pos - left_pad;
+        if raw < t_in {
+            val = f32::cast_from(x[x_row + raw]);
+        } else if comptime!(pad_mode == PAD_CAUSAL_EDGE) {
+            val = f32::cast_from(x[x_row + (t_in - 1usize)]);
+        } else if comptime!(pad_mode == PAD_REFLECT_SAME) {
+            let excess = raw - (t_in - 1usize);
+            val = f32::cast_from(x[x_row + (t_in - 1usize - excess)]);
+        }
+    }
+    val
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cube]
+fn store_conv_4<F: Float>(
+    output: &mut Tensor<F>,
+    residual: &Tensor<F>,
+    out_row: usize,
+    t0: usize,
+    t_out: usize,
+    bias_val: f32,
+    v0: f32,
+    v1: f32,
+    v2: f32,
+    v3: f32,
+    #[comptime] has_residual: bool,
+) {
+    if t0 < t_out {
+        let idx = out_row + t0;
+        let v = if comptime!(has_residual) {
+            v0 + bias_val + f32::cast_from(residual[idx])
+        } else {
+            v0 + bias_val
+        };
+        output[idx] = F::cast_from(v);
+    }
+    let t1 = t0 + 16usize;
+    if t1 < t_out {
+        let idx = out_row + t1;
+        let v = if comptime!(has_residual) {
+            v1 + bias_val + f32::cast_from(residual[idx])
+        } else {
+            v1 + bias_val
+        };
+        output[idx] = F::cast_from(v);
+    }
+    let t2 = t0 + 32usize;
+    if t2 < t_out {
+        let idx = out_row + t2;
+        let v = if comptime!(has_residual) {
+            v2 + bias_val + f32::cast_from(residual[idx])
+        } else {
+            v2 + bias_val
+        };
+        output[idx] = F::cast_from(v);
+    }
+    let t3 = t0 + 48usize;
+    if t3 < t_out {
+        let idx = out_row + t3;
+        let v = if comptime!(has_residual) {
+            v3 + bias_val + f32::cast_from(residual[idx])
+        } else {
+            v3 + bias_val
+        };
+        output[idx] = F::cast_from(v);
+    }
+}
+
+/// Register-tiled 32 × 64 (4 × 4 outputs/thread) 1D convolution over contiguous `[B, C, T]`
+/// tensors and packed `[K, C_out, C_in]` weights. Uses 6 KB shared memory per 16 × 8 workgroup.
+#[allow(clippy::too_many_arguments)]
+#[cube(launch)]
+fn causal_conv1d_4x4_kernel<F: Float>(
+    x: &Tensor<F>,
+    history: &Tensor<F>,
+    weight: &Tensor<F>,
+    bias: &Tensor<F>,
+    residual: &Tensor<F>,
+    output: &mut Tensor<F>,
+    c_in: usize,
+    c_out: usize,
+    t_in: usize,
+    t_out: usize,
+    hist_len: usize,
+    kernel: usize,
+    stride: usize,
+    dilation: usize,
+    left_pad: usize,
+    #[comptime] unit_stride: bool,
+    #[comptime] pad_mode: usize,
+    #[comptime] has_bias: bool,
+    #[comptime] has_residual: bool,
+    #[define(F)] _dtype: ElemType,
+) {
+    let tx = UNIT_POS_X as usize;
+    let ty = UNIT_POS_Y as usize;
+    let t_base = (CUBE_POS_X as usize) * 64usize;
+    let oc_base = (CUBE_POS_Y as usize) * 32usize;
+    let batch = CUBE_POS_Z as usize;
+
+    let mut w_tile = Shared::<[f32]>::new_slice(512usize);
+    let mut x_tile = Shared::<[f32]>::new_slice(1024usize);
+
+    let a00 = RuntimeCell::<f32>::new(0f32);
+    let a01 = RuntimeCell::<f32>::new(0f32);
+    let a02 = RuntimeCell::<f32>::new(0f32);
+    let a03 = RuntimeCell::<f32>::new(0f32);
+    let a10 = RuntimeCell::<f32>::new(0f32);
+    let a11 = RuntimeCell::<f32>::new(0f32);
+    let a12 = RuntimeCell::<f32>::new(0f32);
+    let a13 = RuntimeCell::<f32>::new(0f32);
+    let a20 = RuntimeCell::<f32>::new(0f32);
+    let a21 = RuntimeCell::<f32>::new(0f32);
+    let a22 = RuntimeCell::<f32>::new(0f32);
+    let a23 = RuntimeCell::<f32>::new(0f32);
+    let a30 = RuntimeCell::<f32>::new(0f32);
+    let a31 = RuntimeCell::<f32>::new(0f32);
+    let a32 = RuntimeCell::<f32>::new(0f32);
+    let a33 = RuntimeCell::<f32>::new(0f32);
+
+    let ic_blocks = c_in.div_ceil(16usize);
+    let full_oc = oc_base + 32usize <= c_out;
+    let oc0 = oc_base + ty;
+    let oc1 = oc0 + 8usize;
+    let oc2 = oc0 + 16usize;
+    let oc3 = oc0 + 24usize;
+    let t0 = t_base + tx;
+    let t1 = t0 + 16usize;
+    let t2 = t0 + 32usize;
+    let t3 = t0 + 48usize;
+
+    for tap in 0..kernel {
+        let tap_offset = tap * dilation;
+        let w_tap_base = tap * c_out;
+        let pos_min = t_base * stride + tap_offset;
+        let pos_max = (t_base + 63usize) * stride + tap_offset;
+        let mut x_interior = false;
+        if t_base + 64usize <= t_out && pos_min >= left_pad {
+            let raw_max = pos_max - left_pad;
+            x_interior = raw_max < t_in;
+        }
+
+        for ic_block in 0..ic_blocks {
+            let ic_base = ic_block * 16usize;
+            let full_ic = ic_base + 16usize <= c_in;
+            let ic_w = ic_base + tx;
+
+            if full_oc && full_ic {
+                w_tile[ty * 16usize + tx] =
+                    f32::cast_from(weight[(w_tap_base + oc0) * c_in + ic_w]);
+                w_tile[(ty + 8usize) * 16usize + tx] =
+                    f32::cast_from(weight[(w_tap_base + oc1) * c_in + ic_w]);
+                w_tile[(ty + 16usize) * 16usize + tx] =
+                    f32::cast_from(weight[(w_tap_base + oc2) * c_in + ic_w]);
+                w_tile[(ty + 24usize) * 16usize + tx] =
+                    f32::cast_from(weight[(w_tap_base + oc3) * c_in + ic_w]);
+            } else {
+                let mut w0 = 0f32;
+                let mut w1 = 0f32;
+                let mut w2 = 0f32;
+                let mut w3 = 0f32;
+                if ic_w < c_in {
+                    if oc0 < c_out {
+                        w0 = f32::cast_from(weight[(w_tap_base + oc0) * c_in + ic_w]);
+                    }
+                    if oc1 < c_out {
+                        w1 = f32::cast_from(weight[(w_tap_base + oc1) * c_in + ic_w]);
+                    }
+                    if oc2 < c_out {
+                        w2 = f32::cast_from(weight[(w_tap_base + oc2) * c_in + ic_w]);
+                    }
+                    if oc3 < c_out {
+                        w3 = f32::cast_from(weight[(w_tap_base + oc3) * c_in + ic_w]);
+                    }
+                }
+                w_tile[ty * 16usize + tx] = w0;
+                w_tile[(ty + 8usize) * 16usize + tx] = w1;
+                w_tile[(ty + 16usize) * 16usize + tx] = w2;
+                w_tile[(ty + 24usize) * 16usize + tx] = w3;
+            }
+
+            let ic0 = ic_base + ty;
+            let ic1 = ic0 + 8usize;
+            let x_row0 = (batch * c_in + ic0) * t_in;
+            let x_row1 = (batch * c_in + ic1) * t_in;
+            if x_interior && full_ic {
+                let src_base = pos_min - left_pad;
+                if comptime!(unit_stride) {
+                    x_tile[ty * 64usize + tx] = f32::cast_from(x[x_row0 + src_base + tx]);
+                    x_tile[ty * 64usize + tx + 16usize] =
+                        f32::cast_from(x[x_row0 + src_base + tx + 16usize]);
+                    x_tile[ty * 64usize + tx + 32usize] =
+                        f32::cast_from(x[x_row0 + src_base + tx + 32usize]);
+                    x_tile[ty * 64usize + tx + 48usize] =
+                        f32::cast_from(x[x_row0 + src_base + tx + 48usize]);
+                    x_tile[(ty + 8usize) * 64usize + tx] =
+                        f32::cast_from(x[x_row1 + src_base + tx]);
+                    x_tile[(ty + 8usize) * 64usize + tx + 16usize] =
+                        f32::cast_from(x[x_row1 + src_base + tx + 16usize]);
+                    x_tile[(ty + 8usize) * 64usize + tx + 32usize] =
+                        f32::cast_from(x[x_row1 + src_base + tx + 32usize]);
+                    x_tile[(ty + 8usize) * 64usize + tx + 48usize] =
+                        f32::cast_from(x[x_row1 + src_base + tx + 48usize]);
+                } else {
+                    let s0 = src_base + tx * stride;
+                    let s1 = s0 + 16usize * stride;
+                    let s2 = s0 + 32usize * stride;
+                    let s3 = s0 + 48usize * stride;
+                    x_tile[ty * 64usize + tx] = f32::cast_from(x[x_row0 + s0]);
+                    x_tile[ty * 64usize + tx + 16usize] = f32::cast_from(x[x_row0 + s1]);
+                    x_tile[ty * 64usize + tx + 32usize] = f32::cast_from(x[x_row0 + s2]);
+                    x_tile[ty * 64usize + tx + 48usize] = f32::cast_from(x[x_row0 + s3]);
+                    x_tile[(ty + 8usize) * 64usize + tx] = f32::cast_from(x[x_row1 + s0]);
+                    x_tile[(ty + 8usize) * 64usize + tx + 16usize] = f32::cast_from(x[x_row1 + s1]);
+                    x_tile[(ty + 8usize) * 64usize + tx + 32usize] = f32::cast_from(x[x_row1 + s2]);
+                    x_tile[(ty + 8usize) * 64usize + tx + 48usize] = f32::cast_from(x[x_row1 + s3]);
+                }
+            } else {
+                let h_row0 = (batch * c_in + ic0) * hist_len;
+                let h_row1 = (batch * c_in + ic1) * hist_len;
+                let mut v00 = 0f32;
+                let mut v01 = 0f32;
+                let mut v02 = 0f32;
+                let mut v03 = 0f32;
+                if ic0 < c_in {
+                    if t0 < t_out {
+                        v00 = load_conv_sample(
+                            x, history, x_row0, h_row0, t_in, hist_len, t0, tap_offset, left_pad,
+                            stride, pad_mode,
+                        );
+                    }
+                    if t1 < t_out {
+                        v01 = load_conv_sample(
+                            x, history, x_row0, h_row0, t_in, hist_len, t1, tap_offset, left_pad,
+                            stride, pad_mode,
+                        );
+                    }
+                    if t2 < t_out {
+                        v02 = load_conv_sample(
+                            x, history, x_row0, h_row0, t_in, hist_len, t2, tap_offset, left_pad,
+                            stride, pad_mode,
+                        );
+                    }
+                    if t3 < t_out {
+                        v03 = load_conv_sample(
+                            x, history, x_row0, h_row0, t_in, hist_len, t3, tap_offset, left_pad,
+                            stride, pad_mode,
+                        );
+                    }
+                }
+                x_tile[ty * 64usize + tx] = v00;
+                x_tile[ty * 64usize + tx + 16usize] = v01;
+                x_tile[ty * 64usize + tx + 32usize] = v02;
+                x_tile[ty * 64usize + tx + 48usize] = v03;
+
+                let mut v10 = 0f32;
+                let mut v11 = 0f32;
+                let mut v12 = 0f32;
+                let mut v13 = 0f32;
+                if ic1 < c_in {
+                    if t0 < t_out {
+                        v10 = load_conv_sample(
+                            x, history, x_row1, h_row1, t_in, hist_len, t0, tap_offset, left_pad,
+                            stride, pad_mode,
+                        );
+                    }
+                    if t1 < t_out {
+                        v11 = load_conv_sample(
+                            x, history, x_row1, h_row1, t_in, hist_len, t1, tap_offset, left_pad,
+                            stride, pad_mode,
+                        );
+                    }
+                    if t2 < t_out {
+                        v12 = load_conv_sample(
+                            x, history, x_row1, h_row1, t_in, hist_len, t2, tap_offset, left_pad,
+                            stride, pad_mode,
+                        );
+                    }
+                    if t3 < t_out {
+                        v13 = load_conv_sample(
+                            x, history, x_row1, h_row1, t_in, hist_len, t3, tap_offset, left_pad,
+                            stride, pad_mode,
+                        );
+                    }
+                }
+                x_tile[(ty + 8usize) * 64usize + tx] = v10;
+                x_tile[(ty + 8usize) * 64usize + tx + 16usize] = v11;
+                x_tile[(ty + 8usize) * 64usize + tx + 32usize] = v12;
+                x_tile[(ty + 8usize) * 64usize + tx + 48usize] = v13;
+            }
+
+            sync_cube();
+            #[unroll]
+            for k in 0..16usize {
+                let wk0 = w_tile[ty * 16usize + k];
+                let wk1 = w_tile[(ty + 8usize) * 16usize + k];
+                let wk2 = w_tile[(ty + 16usize) * 16usize + k];
+                let wk3 = w_tile[(ty + 24usize) * 16usize + k];
+                let xk0 = x_tile[k * 64usize + tx];
+                let xk1 = x_tile[k * 64usize + tx + 16usize];
+                let xk2 = x_tile[k * 64usize + tx + 32usize];
+                let xk3 = x_tile[k * 64usize + tx + 48usize];
+                a00.store(a00.read() + wk0 * xk0);
+                a01.store(a01.read() + wk0 * xk1);
+                a02.store(a02.read() + wk0 * xk2);
+                a03.store(a03.read() + wk0 * xk3);
+                a10.store(a10.read() + wk1 * xk0);
+                a11.store(a11.read() + wk1 * xk1);
+                a12.store(a12.read() + wk1 * xk2);
+                a13.store(a13.read() + wk1 * xk3);
+                a20.store(a20.read() + wk2 * xk0);
+                a21.store(a21.read() + wk2 * xk1);
+                a22.store(a22.read() + wk2 * xk2);
+                a23.store(a23.read() + wk2 * xk3);
+                a30.store(a30.read() + wk3 * xk0);
+                a31.store(a31.read() + wk3 * xk1);
+                a32.store(a32.read() + wk3 * xk2);
+                a33.store(a33.read() + wk3 * xk3);
+            }
+            sync_cube();
+        }
+    }
+
+    if oc0 < c_out {
+        let mut b0 = 0f32;
+        if comptime!(has_bias) {
+            b0 = f32::cast_from(bias[oc0]);
+        }
+        store_conv_4(
+            output,
+            residual,
+            (batch * c_out + oc0) * t_out,
+            t0,
+            t_out,
+            b0,
+            a00.consume(),
+            a01.consume(),
+            a02.consume(),
+            a03.consume(),
+            has_residual,
+        );
+    }
+    if oc1 < c_out {
+        let mut b1 = 0f32;
+        if comptime!(has_bias) {
+            b1 = f32::cast_from(bias[oc1]);
+        }
+        store_conv_4(
+            output,
+            residual,
+            (batch * c_out + oc1) * t_out,
+            t0,
+            t_out,
+            b1,
+            a10.consume(),
+            a11.consume(),
+            a12.consume(),
+            a13.consume(),
+            has_residual,
+        );
+    }
+    if oc2 < c_out {
+        let mut b2 = 0f32;
+        if comptime!(has_bias) {
+            b2 = f32::cast_from(bias[oc2]);
+        }
+        store_conv_4(
+            output,
+            residual,
+            (batch * c_out + oc2) * t_out,
+            t0,
+            t_out,
+            b2,
+            a20.consume(),
+            a21.consume(),
+            a22.consume(),
+            a23.consume(),
+            has_residual,
+        );
+    }
+    if oc3 < c_out {
+        let mut b3 = 0f32;
+        if comptime!(has_bias) {
+            b3 = f32::cast_from(bias[oc3]);
+        }
+        store_conv_4(
+            output,
+            residual,
+            (batch * c_out + oc3) * t_out,
+            t0,
+            t_out,
+            b3,
+            a30.consume(),
+            a31.consume(),
+            a32.consume(),
+            a33.consume(),
+            has_residual,
+        );
+    }
+}
+
+/// Register-tiled 32 × 32 1D convolution for narrow time spans (`t_out < 64`).
+/// Uses 4 KB shared memory per 16 × 16 workgroup.
 #[allow(clippy::too_many_arguments)]
 #[cube(launch)]
 fn causal_conv1d_tiled_kernel<F: Float>(
@@ -609,12 +1145,16 @@ fn causal_conv1d_tiled_kernel<F: Float>(
     output: &mut Tensor<F>,
     c_in: usize,
     c_out: usize,
+    t_in: usize,
     t_out: usize,
     hist_len: usize,
     kernel: usize,
+    stride: usize,
     dilation: usize,
-    has_bias: u32,
-    has_residual: u32,
+    left_pad: usize,
+    #[comptime] pad_mode: usize,
+    #[comptime] has_bias: bool,
+    #[comptime] has_residual: bool,
     #[define(F)] _dtype: ElemType,
 ) {
     let tx = UNIT_POS_X as usize;
@@ -633,7 +1173,7 @@ fn causal_conv1d_tiled_kernel<F: Float>(
 
     let ic_blocks = c_in.div_ceil(16usize);
     for tap in 0..kernel {
-        let lag = (kernel - 1 - tap) * dilation;
+        let tap_offset = tap * dilation;
         let w_tap_base = tap * c_out;
         for ic_block in 0..ic_blocks {
             let ic_base = ic_block * 16;
@@ -654,34 +1194,26 @@ fn causal_conv1d_tiled_kernel<F: Float>(
             w_tile[(ty + 16) * 16 + tx] = w1;
 
             let ic_x = ic_base + ty;
-            let x_row = (batch * c_in + ic_x) * t_out;
+            let x_row = (batch * c_in + ic_x) * t_in;
             let h_row = (batch * c_in + ic_x) * hist_len;
 
             let t0 = t_base + tx;
             let mut v0 = 0f32;
             if ic_x < c_in && t0 < t_out {
-                if t0 >= lag {
-                    v0 = f32::cast_from(x[x_row + (t0 - lag)]);
-                } else if hist_len > 0 {
-                    let deficit = lag - t0;
-                    if deficit <= hist_len {
-                        v0 = f32::cast_from(history[h_row + (hist_len - deficit)]);
-                    }
-                }
+                v0 = load_conv_sample(
+                    x, history, x_row, h_row, t_in, hist_len, t0, tap_offset, left_pad, stride,
+                    pad_mode,
+                );
             }
             x_tile[ty * 32 + tx] = v0;
 
             let t1 = t0 + 16;
             let mut v1 = 0f32;
             if ic_x < c_in && t1 < t_out {
-                if t1 >= lag {
-                    v1 = f32::cast_from(x[x_row + (t1 - lag)]);
-                } else if hist_len > 0 {
-                    let deficit = lag - t1;
-                    if deficit <= hist_len {
-                        v1 = f32::cast_from(history[h_row + (hist_len - deficit)]);
-                    }
-                }
+                v1 = load_conv_sample(
+                    x, history, x_row, h_row, t_in, hist_len, t1, tap_offset, left_pad, stride,
+                    pad_mode,
+                );
             }
             x_tile[ty * 32 + tx + 16] = v1;
 
@@ -705,12 +1237,12 @@ fn causal_conv1d_tiled_kernel<F: Float>(
     let oc1 = oc0 + 16;
     let t0 = t_base + tx;
     let t1 = t0 + 16;
-    let b0 = if has_bias != 0 && oc0 < c_out {
+    let b0 = if comptime!(has_bias) && oc0 < c_out {
         f32::cast_from(bias[oc0])
     } else {
         0f32
     };
-    let b1 = if has_bias != 0 && oc1 < c_out {
+    let b1 = if comptime!(has_bias) && oc1 < c_out {
         f32::cast_from(bias[oc1])
     } else {
         0f32
@@ -718,40 +1250,45 @@ fn causal_conv1d_tiled_kernel<F: Float>(
     if oc0 < c_out {
         let out_row = (batch * c_out + oc0) * t_out;
         if t0 < t_out {
-            let mut v = acc00.consume() + b0;
-            if has_residual != 0 {
-                v += f32::cast_from(residual[out_row + t0]);
-            }
+            let v = if comptime!(has_residual) {
+                acc00.consume() + b0 + f32::cast_from(residual[out_row + t0])
+            } else {
+                acc00.consume() + b0
+            };
             output[out_row + t0] = F::cast_from(v);
         }
         if t1 < t_out {
-            let mut v = acc01.consume() + b0;
-            if has_residual != 0 {
-                v += f32::cast_from(residual[out_row + t1]);
-            }
+            let v = if comptime!(has_residual) {
+                acc01.consume() + b0 + f32::cast_from(residual[out_row + t1])
+            } else {
+                acc01.consume() + b0
+            };
             output[out_row + t1] = F::cast_from(v);
         }
     }
     if oc1 < c_out {
         let out_row = (batch * c_out + oc1) * t_out;
         if t0 < t_out {
-            let mut v = acc10.consume() + b1;
-            if has_residual != 0 {
-                v += f32::cast_from(residual[out_row + t0]);
-            }
+            let v = if comptime!(has_residual) {
+                acc10.consume() + b1 + f32::cast_from(residual[out_row + t0])
+            } else {
+                acc10.consume() + b1
+            };
             output[out_row + t0] = F::cast_from(v);
         }
         if t1 < t_out {
-            let mut v = acc11.consume() + b1;
-            if has_residual != 0 {
-                v += f32::cast_from(residual[out_row + t1]);
-            }
+            let v = if comptime!(has_residual) {
+                acc11.consume() + b1 + f32::cast_from(residual[out_row + t1])
+            } else {
+                acc11.consume() + b1
+            };
             output[out_row + t1] = F::cast_from(v);
         }
     }
 }
 
-/// Time-parallel causal 1D convolution for narrow outputs such as the final mono waveform head.
+/// Time-parallel 1D convolution for narrow outputs such as the final mono waveform head.
+/// Caches small packed weight tables once per workgroup in shared memory.
 #[allow(clippy::too_many_arguments)]
 #[cube(launch)]
 fn causal_conv1d_small_out_kernel<F: Float>(
@@ -764,14 +1301,34 @@ fn causal_conv1d_small_out_kernel<F: Float>(
     total: usize,
     c_in: usize,
     c_out: usize,
+    t_in: usize,
     t_out: usize,
     hist_len: usize,
     kernel: usize,
+    stride: usize,
     dilation: usize,
-    has_bias: u32,
-    has_residual: u32,
+    left_pad: usize,
+    #[comptime] unit_stride: bool,
+    #[comptime] pad_mode: usize,
+    #[comptime] has_bias: bool,
+    #[comptime] has_residual: bool,
+    #[comptime] cache_weights: usize,
     #[define(F)] _dtype: ElemType,
 ) {
+    let mut w_shared = Shared::<[f32]>::new_slice(comptime!(if cache_weights > 0 {
+        cache_weights
+    } else {
+        1usize
+    }));
+    if comptime!(cache_weights > 0) {
+        let mut wi = UNIT_POS as usize;
+        while wi < comptime!(cache_weights) {
+            w_shared[wi] = f32::cast_from(weight[wi]);
+            wi += CUBE_DIM as usize;
+        }
+        sync_cube();
+    }
+
     let cube = (CUBE_POS_X as usize) + (CUBE_POS_Y as usize) * (CUBE_COUNT_X as usize);
     let idx = cube * (CUBE_DIM as usize) + (UNIT_POS as usize);
     if idx >= total {
@@ -782,37 +1339,48 @@ fn causal_conv1d_small_out_kernel<F: Float>(
     let oc = bo % c_out;
     let batch = bo / c_out;
 
-    let acc = RuntimeCell::<f32>::new(if has_bias != 0 {
-        f32::cast_from(bias[oc])
-    } else {
-        0f32
-    });
+    let mut init = 0f32;
+    if comptime!(has_bias) {
+        init = f32::cast_from(bias[oc]);
+    }
+    let acc = RuntimeCell::<f32>::new(init);
     for tap in 0..kernel {
-        let lag = (kernel - 1 - tap) * dilation;
+        let tap_offset = tap * dilation;
         let w_base = (tap * c_out + oc) * c_in;
-        if t >= lag {
-            let src_t = t - lag;
+        let pos = t * stride + tap_offset;
+        if comptime!(unit_stride && pad_mode == PAD_CAUSAL_ZERO) && pos >= left_pad {
+            let src_t = pos - left_pad;
             for ic in 0..c_in {
-                let xv = f32::cast_from(x[(batch * c_in + ic) * t_out + src_t]);
-                let wv = f32::cast_from(weight[w_base + ic]);
+                let xv = f32::cast_from(x[(batch * c_in + ic) * t_in + src_t]);
+                let wv = if comptime!(cache_weights > 0) {
+                    w_shared[w_base + ic]
+                } else {
+                    f32::cast_from(weight[w_base + ic])
+                };
                 acc.store(acc.read() + xv * wv);
             }
-        } else if hist_len > 0 {
-            let deficit = lag - t;
-            if deficit <= hist_len {
-                let src_h = hist_len - deficit;
-                for ic in 0..c_in {
-                    let xv = f32::cast_from(history[(batch * c_in + ic) * hist_len + src_h]);
-                    let wv = f32::cast_from(weight[w_base + ic]);
-                    acc.store(acc.read() + xv * wv);
-                }
+        } else {
+            for ic in 0..c_in {
+                let x_row = (batch * c_in + ic) * t_in;
+                let h_row = (batch * c_in + ic) * hist_len;
+                let xv = load_conv_sample(
+                    x, history, x_row, h_row, t_in, hist_len, t, tap_offset, left_pad, stride,
+                    pad_mode,
+                );
+                let wv = if comptime!(cache_weights > 0) {
+                    w_shared[w_base + ic]
+                } else {
+                    f32::cast_from(weight[w_base + ic])
+                };
+                acc.store(acc.read() + xv * wv);
             }
         }
     }
-    let mut sum = acc.consume();
-    if has_residual != 0 {
-        sum += f32::cast_from(residual[idx]);
-    }
+    let sum = if comptime!(has_residual) {
+        acc.consume() + f32::cast_from(residual[idx])
+    } else {
+        acc.consume()
+    };
     output[idx] = F::cast_from(sum);
 }
 
@@ -865,8 +1433,348 @@ fn depthwise_causal_conv1d_kernel<F: Float>(
     output[idx] = F::cast_from(acc.consume());
 }
 
-/// Register-tiled 32 × 32 causal 1D transposed convolution grouped by output phase
-/// `t_out = ti * stride + phase`, reading packed `[K, C_out, C_in]` weights.
+#[allow(clippy::too_many_arguments)]
+#[cube]
+fn load_transpose_sample<F: Float>(
+    x: &Tensor<F>,
+    history: &Tensor<F>,
+    x_row: usize,
+    h_row: usize,
+    hist_len: usize,
+    ti: usize,
+    m: usize,
+) -> f32 {
+    if ti >= m {
+        f32::cast_from(x[x_row + (ti - m)])
+    } else if hist_len > 0usize {
+        let deficit = m - ti;
+        if deficit <= hist_len {
+            f32::cast_from(history[h_row + (hist_len - deficit)])
+        } else {
+            0f32
+        }
+    } else {
+        0f32
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cube]
+fn store_transpose_4<F: Float>(
+    output: &mut Tensor<F>,
+    out_row: usize,
+    ti0: usize,
+    t_in: usize,
+    stride: usize,
+    phase: usize,
+    bias_val: f32,
+    v0: f32,
+    v1: f32,
+    v2: f32,
+    v3: f32,
+) {
+    if ti0 < t_in {
+        output[out_row + ti0 * stride + phase] = F::cast_from(v0 + bias_val);
+    }
+    let ti1 = ti0 + 16usize;
+    if ti1 < t_in {
+        output[out_row + ti1 * stride + phase] = F::cast_from(v1 + bias_val);
+    }
+    let ti2 = ti0 + 32usize;
+    if ti2 < t_in {
+        output[out_row + ti2 * stride + phase] = F::cast_from(v2 + bias_val);
+    }
+    let ti3 = ti0 + 48usize;
+    if ti3 < t_in {
+        output[out_row + ti3 * stride + phase] = F::cast_from(v3 + bias_val);
+    }
+}
+
+/// Register-tiled 32 × 64 (4 × 4 outputs/thread) causal 1D transposed convolution grouped by
+/// output phase `t_out = ti * stride + phase`. Uses 6 KB shared memory per 16 × 8 workgroup.
+#[allow(clippy::too_many_arguments)]
+#[cube(launch)]
+fn causal_conv_transpose1d_4x4_kernel<F: Float>(
+    x: &Tensor<F>,
+    history: &Tensor<F>,
+    weight: &Tensor<F>,
+    bias: &Tensor<F>,
+    output: &mut Tensor<F>,
+    c_in: usize,
+    c_out: usize,
+    t_in: usize,
+    hist_len: usize,
+    kernel: usize,
+    stride: usize,
+    #[comptime] has_bias: bool,
+    #[define(F)] _dtype: ElemType,
+) {
+    let tx = UNIT_POS_X as usize;
+    let ty = UNIT_POS_Y as usize;
+    let t_base = (CUBE_POS_X as usize) * 64usize;
+    let oc_base = (CUBE_POS_Y as usize) * 32usize;
+    let bz = CUBE_POS_Z as usize;
+    let batch = bz / stride;
+    let phase = bz - batch * stride;
+
+    let mut w_tile = Shared::<[f32]>::new_slice(512usize);
+    let mut x_tile = Shared::<[f32]>::new_slice(1024usize);
+
+    let a00 = RuntimeCell::<f32>::new(0f32);
+    let a01 = RuntimeCell::<f32>::new(0f32);
+    let a02 = RuntimeCell::<f32>::new(0f32);
+    let a03 = RuntimeCell::<f32>::new(0f32);
+    let a10 = RuntimeCell::<f32>::new(0f32);
+    let a11 = RuntimeCell::<f32>::new(0f32);
+    let a12 = RuntimeCell::<f32>::new(0f32);
+    let a13 = RuntimeCell::<f32>::new(0f32);
+    let a20 = RuntimeCell::<f32>::new(0f32);
+    let a21 = RuntimeCell::<f32>::new(0f32);
+    let a22 = RuntimeCell::<f32>::new(0f32);
+    let a23 = RuntimeCell::<f32>::new(0f32);
+    let a30 = RuntimeCell::<f32>::new(0f32);
+    let a31 = RuntimeCell::<f32>::new(0f32);
+    let a32 = RuntimeCell::<f32>::new(0f32);
+    let a33 = RuntimeCell::<f32>::new(0f32);
+
+    let ic_blocks = c_in.div_ceil(16usize);
+    let full_oc = oc_base + 32usize <= c_out;
+    let oc0 = oc_base + ty;
+    let oc1 = oc0 + 8usize;
+    let oc2 = oc0 + 16usize;
+    let oc3 = oc0 + 24usize;
+    let ti0 = t_base + tx;
+    let ti1 = ti0 + 16usize;
+    let ti2 = ti0 + 32usize;
+    let ti3 = ti0 + 48usize;
+
+    let mut m = 0usize;
+    let mut k_idx = phase;
+    while k_idx < kernel {
+        let w_k_base = k_idx * c_out;
+        let x_interior = t_base + 64usize <= t_in && t_base >= m;
+        for ic_block in 0..ic_blocks {
+            let ic_base = ic_block * 16usize;
+            let full_ic = ic_base + 16usize <= c_in;
+            let ic_w = ic_base + tx;
+
+            if full_oc && full_ic {
+                w_tile[ty * 16usize + tx] = f32::cast_from(weight[(w_k_base + oc0) * c_in + ic_w]);
+                w_tile[(ty + 8usize) * 16usize + tx] =
+                    f32::cast_from(weight[(w_k_base + oc1) * c_in + ic_w]);
+                w_tile[(ty + 16usize) * 16usize + tx] =
+                    f32::cast_from(weight[(w_k_base + oc2) * c_in + ic_w]);
+                w_tile[(ty + 24usize) * 16usize + tx] =
+                    f32::cast_from(weight[(w_k_base + oc3) * c_in + ic_w]);
+            } else {
+                let mut w0 = 0f32;
+                let mut w1 = 0f32;
+                let mut w2 = 0f32;
+                let mut w3 = 0f32;
+                if ic_w < c_in {
+                    if oc0 < c_out {
+                        w0 = f32::cast_from(weight[(w_k_base + oc0) * c_in + ic_w]);
+                    }
+                    if oc1 < c_out {
+                        w1 = f32::cast_from(weight[(w_k_base + oc1) * c_in + ic_w]);
+                    }
+                    if oc2 < c_out {
+                        w2 = f32::cast_from(weight[(w_k_base + oc2) * c_in + ic_w]);
+                    }
+                    if oc3 < c_out {
+                        w3 = f32::cast_from(weight[(w_k_base + oc3) * c_in + ic_w]);
+                    }
+                }
+                w_tile[ty * 16usize + tx] = w0;
+                w_tile[(ty + 8usize) * 16usize + tx] = w1;
+                w_tile[(ty + 16usize) * 16usize + tx] = w2;
+                w_tile[(ty + 24usize) * 16usize + tx] = w3;
+            }
+
+            let ic0 = ic_base + ty;
+            let ic1 = ic0 + 8usize;
+            let x_row0 = (batch * c_in + ic0) * t_in;
+            let x_row1 = (batch * c_in + ic1) * t_in;
+            if x_interior && full_ic {
+                let src_base = t_base - m;
+                x_tile[ty * 64usize + tx] = f32::cast_from(x[x_row0 + src_base + tx]);
+                x_tile[ty * 64usize + tx + 16usize] =
+                    f32::cast_from(x[x_row0 + src_base + tx + 16usize]);
+                x_tile[ty * 64usize + tx + 32usize] =
+                    f32::cast_from(x[x_row0 + src_base + tx + 32usize]);
+                x_tile[ty * 64usize + tx + 48usize] =
+                    f32::cast_from(x[x_row0 + src_base + tx + 48usize]);
+                x_tile[(ty + 8usize) * 64usize + tx] = f32::cast_from(x[x_row1 + src_base + tx]);
+                x_tile[(ty + 8usize) * 64usize + tx + 16usize] =
+                    f32::cast_from(x[x_row1 + src_base + tx + 16usize]);
+                x_tile[(ty + 8usize) * 64usize + tx + 32usize] =
+                    f32::cast_from(x[x_row1 + src_base + tx + 32usize]);
+                x_tile[(ty + 8usize) * 64usize + tx + 48usize] =
+                    f32::cast_from(x[x_row1 + src_base + tx + 48usize]);
+            } else {
+                let h_row0 = (batch * c_in + ic0) * hist_len;
+                let h_row1 = (batch * c_in + ic1) * hist_len;
+                let mut v00 = 0f32;
+                let mut v01 = 0f32;
+                let mut v02 = 0f32;
+                let mut v03 = 0f32;
+                if ic0 < c_in {
+                    if ti0 < t_in {
+                        v00 = load_transpose_sample(x, history, x_row0, h_row0, hist_len, ti0, m);
+                    }
+                    if ti1 < t_in {
+                        v01 = load_transpose_sample(x, history, x_row0, h_row0, hist_len, ti1, m);
+                    }
+                    if ti2 < t_in {
+                        v02 = load_transpose_sample(x, history, x_row0, h_row0, hist_len, ti2, m);
+                    }
+                    if ti3 < t_in {
+                        v03 = load_transpose_sample(x, history, x_row0, h_row0, hist_len, ti3, m);
+                    }
+                }
+                x_tile[ty * 64usize + tx] = v00;
+                x_tile[ty * 64usize + tx + 16usize] = v01;
+                x_tile[ty * 64usize + tx + 32usize] = v02;
+                x_tile[ty * 64usize + tx + 48usize] = v03;
+
+                let mut v10 = 0f32;
+                let mut v11 = 0f32;
+                let mut v12 = 0f32;
+                let mut v13 = 0f32;
+                if ic1 < c_in {
+                    if ti0 < t_in {
+                        v10 = load_transpose_sample(x, history, x_row1, h_row1, hist_len, ti0, m);
+                    }
+                    if ti1 < t_in {
+                        v11 = load_transpose_sample(x, history, x_row1, h_row1, hist_len, ti1, m);
+                    }
+                    if ti2 < t_in {
+                        v12 = load_transpose_sample(x, history, x_row1, h_row1, hist_len, ti2, m);
+                    }
+                    if ti3 < t_in {
+                        v13 = load_transpose_sample(x, history, x_row1, h_row1, hist_len, ti3, m);
+                    }
+                }
+                x_tile[(ty + 8usize) * 64usize + tx] = v10;
+                x_tile[(ty + 8usize) * 64usize + tx + 16usize] = v11;
+                x_tile[(ty + 8usize) * 64usize + tx + 32usize] = v12;
+                x_tile[(ty + 8usize) * 64usize + tx + 48usize] = v13;
+            }
+
+            sync_cube();
+            #[unroll]
+            for k in 0..16usize {
+                let wk0 = w_tile[ty * 16usize + k];
+                let wk1 = w_tile[(ty + 8usize) * 16usize + k];
+                let wk2 = w_tile[(ty + 16usize) * 16usize + k];
+                let wk3 = w_tile[(ty + 24usize) * 16usize + k];
+                let xk0 = x_tile[k * 64usize + tx];
+                let xk1 = x_tile[k * 64usize + tx + 16usize];
+                let xk2 = x_tile[k * 64usize + tx + 32usize];
+                let xk3 = x_tile[k * 64usize + tx + 48usize];
+                a00.store(a00.read() + wk0 * xk0);
+                a01.store(a01.read() + wk0 * xk1);
+                a02.store(a02.read() + wk0 * xk2);
+                a03.store(a03.read() + wk0 * xk3);
+                a10.store(a10.read() + wk1 * xk0);
+                a11.store(a11.read() + wk1 * xk1);
+                a12.store(a12.read() + wk1 * xk2);
+                a13.store(a13.read() + wk1 * xk3);
+                a20.store(a20.read() + wk2 * xk0);
+                a21.store(a21.read() + wk2 * xk1);
+                a22.store(a22.read() + wk2 * xk2);
+                a23.store(a23.read() + wk2 * xk3);
+                a30.store(a30.read() + wk3 * xk0);
+                a31.store(a31.read() + wk3 * xk1);
+                a32.store(a32.read() + wk3 * xk2);
+                a33.store(a33.read() + wk3 * xk3);
+            }
+            sync_cube();
+        }
+        m += 1;
+        k_idx += stride;
+    }
+
+    let t_out = t_in * stride;
+    if oc0 < c_out {
+        let mut b0 = 0f32;
+        if comptime!(has_bias) {
+            b0 = f32::cast_from(bias[oc0]);
+        }
+        store_transpose_4(
+            output,
+            (batch * c_out + oc0) * t_out,
+            ti0,
+            t_in,
+            stride,
+            phase,
+            b0,
+            a00.consume(),
+            a01.consume(),
+            a02.consume(),
+            a03.consume(),
+        );
+    }
+    if oc1 < c_out {
+        let mut b1 = 0f32;
+        if comptime!(has_bias) {
+            b1 = f32::cast_from(bias[oc1]);
+        }
+        store_transpose_4(
+            output,
+            (batch * c_out + oc1) * t_out,
+            ti0,
+            t_in,
+            stride,
+            phase,
+            b1,
+            a10.consume(),
+            a11.consume(),
+            a12.consume(),
+            a13.consume(),
+        );
+    }
+    if oc2 < c_out {
+        let mut b2 = 0f32;
+        if comptime!(has_bias) {
+            b2 = f32::cast_from(bias[oc2]);
+        }
+        store_transpose_4(
+            output,
+            (batch * c_out + oc2) * t_out,
+            ti0,
+            t_in,
+            stride,
+            phase,
+            b2,
+            a20.consume(),
+            a21.consume(),
+            a22.consume(),
+            a23.consume(),
+        );
+    }
+    if oc3 < c_out {
+        let mut b3 = 0f32;
+        if comptime!(has_bias) {
+            b3 = f32::cast_from(bias[oc3]);
+        }
+        store_transpose_4(
+            output,
+            (batch * c_out + oc3) * t_out,
+            ti0,
+            t_in,
+            stride,
+            phase,
+            b3,
+            a30.consume(),
+            a31.consume(),
+            a32.consume(),
+            a33.consume(),
+        );
+    }
+}
+
+/// Register-tiled 32 × 32 causal 1D transposed convolution for narrow time spans (`t_in < 64`).
 #[allow(clippy::too_many_arguments)]
 #[cube(launch)]
 fn causal_conv_transpose1d_tiled_kernel<F: Float>(
@@ -881,7 +1789,7 @@ fn causal_conv_transpose1d_tiled_kernel<F: Float>(
     hist_len: usize,
     kernel: usize,
     stride: usize,
-    has_bias: u32,
+    #[comptime] has_bias: bool,
     #[define(F)] _dtype: ElemType,
 ) {
     let tx = UNIT_POS_X as usize;
@@ -930,28 +1838,14 @@ fn causal_conv_transpose1d_tiled_kernel<F: Float>(
             let ti0 = t_base + tx;
             let mut v0 = 0f32;
             if ic_x < c_in && ti0 < t_in {
-                if ti0 >= m {
-                    v0 = f32::cast_from(x[x_row + (ti0 - m)]);
-                } else if hist_len > 0 {
-                    let deficit = m - ti0;
-                    if deficit <= hist_len {
-                        v0 = f32::cast_from(history[h_row + (hist_len - deficit)]);
-                    }
-                }
+                v0 = load_transpose_sample(x, history, x_row, h_row, hist_len, ti0, m);
             }
             x_tile[ty * 32 + tx] = v0;
 
             let ti1 = ti0 + 16;
             let mut v1 = 0f32;
             if ic_x < c_in && ti1 < t_in {
-                if ti1 >= m {
-                    v1 = f32::cast_from(x[x_row + (ti1 - m)]);
-                } else if hist_len > 0 {
-                    let deficit = m - ti1;
-                    if deficit <= hist_len {
-                        v1 = f32::cast_from(history[h_row + (hist_len - deficit)]);
-                    }
-                }
+                v1 = load_transpose_sample(x, history, x_row, h_row, hist_len, ti1, m);
             }
             x_tile[ty * 32 + tx + 16] = v1;
 
@@ -978,12 +1872,12 @@ fn causal_conv_transpose1d_tiled_kernel<F: Float>(
     let ti0 = t_base + tx;
     let ti1 = ti0 + 16;
     let t_out = t_in * stride;
-    let b0 = if has_bias != 0 && oc0 < c_out {
+    let b0 = if comptime!(has_bias) && oc0 < c_out {
         f32::cast_from(bias[oc0])
     } else {
         0f32
     };
-    let b1 = if has_bias != 0 && oc1 < c_out {
+    let b1 = if comptime!(has_bias) && oc1 < c_out {
         f32::cast_from(bias[oc1])
     } else {
         0f32
@@ -1086,8 +1980,9 @@ mod tests {
             let device = Device::wgpu_options().init_async().await.unwrap();
             for dtype in [DType::F32, DType::F16] {
                 let tol = if dtype == DType::F16 { 0.005 } else { 1e-4 };
-                // Full causal conv1d: covers small-out (c_out=1), tiled cached (c_out=37, c_out=96),
-                // pointwise (k=1), dilated (d=9), and uncached span fallback (span > 64).
+                // Full causal conv1d: covers small-out with shared weight cache (c_out=1),
+                // narrow 32x32 tiled (time < 64), 4x4 32x64 tiled (time >= 64), pointwise (k=1),
+                // and dilated (d=9, d=11).
                 for [batch, c_in, c_out, time, kernel, dilation] in [
                     [1, 96, 1, 73, 7, 1],
                     [2, 19, 37, 41, 7, 3],
@@ -1139,12 +2034,14 @@ mod tests {
                             burn::tensor::ops::ConvOptions::new([1], [0], [dilation], 1),
                         )
                         .cast(dtype);
-                        let full = causal_conv1d(
+                        let full = conv1d(
                             input.clone(),
                             None,
                             packed.clone(),
                             bias.clone(),
+                            1,
                             dilation,
+                            PAD_CAUSAL_ZERO,
                         );
                         // Stream in uneven spans including t < context and t >= context.
                         let mut parts = Vec::new();
@@ -1152,12 +2049,14 @@ mod tests {
                         let mut start = 0;
                         for end in [1, 4, 21, time] {
                             let part = input.clone().slice([0..batch, 0..c_in, start..end]);
-                            parts.push(causal_conv1d(
+                            parts.push(conv1d(
                                 part.clone(),
                                 hist.clone(),
                                 packed.clone(),
                                 bias.clone(),
+                                1,
                                 dilation,
+                                PAD_CAUSAL_ZERO,
                             ));
                             if pad_left > 0 {
                                 let t = end - start;
@@ -1187,12 +2086,14 @@ mod tests {
                             ),
                             (&device, dtype),
                         );
-                        let with_res = causal_conv1d_add(
+                        let with_res = conv1d_add(
                             input.clone(),
                             None,
                             packed.clone(),
                             bias.clone(),
+                            1,
                             dilation,
+                            PAD_CAUSAL_ZERO,
                             residual.clone(),
                         );
                         let ref_res = (reference.clone().cast(DType::F32)
@@ -1288,12 +2189,100 @@ mod tests {
                     .fold(0f32, f32::max);
                 assert!(err < tol, "depthwise {dtype:?}: {err}");
 
-                // Causal transposed conv1d across all codec upsample (stride, kernel) shapes.
+                // Strided causal, causal-edge (CodecEncoder), and reflect-same (Speaker) conv1d.
+                for [c_in, c_out, time, kernel, stride, dilation, pad_mode] in [
+                    [32, 64, 300, 8, 4, 1, PAD_CAUSAL_ZERO],
+                    [64, 64, 313, 10, 5, 1, PAD_CAUSAL_ZERO],
+                    [64, 64, 151, 4, 2, 1, PAD_CAUSAL_EDGE],
+                    [64, 64, 137, 5, 1, 1, PAD_REFLECT_SAME],
+                    [64, 64, 137, 3, 1, 4, PAD_REFLECT_SAME],
+                    [35, 37, 51, 3, 1, 2, PAD_REFLECT_SAME],
+                ] {
+                    let input = BurnTensor::<3>::from_data(
+                        TensorData::new(
+                            (0..c_in * time)
+                                .map(|i| ((i * 13 + 7) as f32).sin() * 0.5)
+                                .collect::<Vec<_>>(),
+                            [1, c_in, time],
+                        ),
+                        (&device, dtype),
+                    );
+                    let weight = BurnTensor::<3>::from_data(
+                        TensorData::new(
+                            (0..c_out * c_in * kernel)
+                                .map(|i| ((i * 29 + 3) as f32).cos() * 0.05)
+                                .collect::<Vec<_>>(),
+                            [c_out, c_in, kernel],
+                        ),
+                        (&device, dtype),
+                    );
+                    let bias = BurnTensor::<1>::from_data(
+                        TensorData::new(
+                            (0..c_out)
+                                .map(|i| (i as f32) * 0.01 - 0.05)
+                                .collect::<Vec<_>>(),
+                            [c_out],
+                        ),
+                        (&device, dtype),
+                    );
+                    let eff_k = (kernel - 1) * dilation + 1;
+                    let padded = if pad_mode == PAD_REFLECT_SAME {
+                        let left = (eff_k - 1) / 2;
+                        input.clone().pad(
+                            [(0, 0), (0, 0), (left, eff_k - 1 - left)],
+                            burn::tensor::ops::PadMode::Reflect,
+                        )
+                    } else {
+                        let mode = if pad_mode == PAD_CAUSAL_EDGE {
+                            burn::tensor::ops::PadMode::Edge
+                        } else {
+                            burn::tensor::ops::PadMode::Constant(0.0)
+                        };
+                        input.clone().pad(
+                            [
+                                (0, 0),
+                                (0, 0),
+                                (eff_k - stride, (stride - time % stride) % stride),
+                            ],
+                            mode,
+                        )
+                    };
+                    let reference = burn::tensor::module::conv1d(
+                        padded.cast(DType::F32),
+                        weight.clone().cast(DType::F32),
+                        Some(bias.clone().cast(DType::F32)),
+                        burn::tensor::ops::ConvOptions::new([stride], [0], [dilation], 1),
+                    )
+                    .cast(dtype);
+                    let packed = contiguous(weight.permute([2, 0, 1]));
+                    let actual =
+                        conv1d(input, None, packed, Some(bias), stride, dilation, pad_mode);
+                    let (a, e) = futures_lite::future::zip(
+                        super::super::read(actual),
+                        super::super::read(reference),
+                    )
+                    .await;
+                    let err = a
+                        .unwrap()
+                        .iter()
+                        .zip(&e.unwrap())
+                        .map(|(x, y)| (x - y).abs())
+                        .fold(0f32, f32::max);
+                    assert!(
+                        err < tol,
+                        "conv1d pad={pad_mode} s={stride} k={kernel} d={dilation} {dtype:?}: {err}"
+                    );
+                }
+
+                // Causal transposed conv1d across all codec upsample (stride, kernel) shapes,
+                // covering both 32x32 (t_in < 64) and 4x4 32x64 (t_in >= 64) kernels.
                 for [batch, c_in, c_out, time, stride, kernel] in [
                     [1, 35, 37, 25, 2, 2],
                     [2, 24, 19, 17, 3, 6],
                     [1, 48, 36, 19, 5, 10],
                     [1, 32, 32, 12, 8, 16],
+                    [1, 64, 64, 73, 4, 8],
+                    [1, 32, 96, 128, 3, 6],
                 ] {
                     let input = BurnTensor::<3>::from_data(
                         TensorData::new(

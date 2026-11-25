@@ -400,7 +400,7 @@ impl FusedTransformer for CubeBackend {
             .min(4);
         let inter_vecs = inter / vec_w;
         let total_vecs = batch * tokens * inter_vecs;
-        let dim = if total_vecs >= 64 {
+        let dim = if (64..=2048).contains(&total_vecs) {
             CubeDim::new_1d(64)
         } else {
             CubeDim::new(&gate_up.client, total_vecs)

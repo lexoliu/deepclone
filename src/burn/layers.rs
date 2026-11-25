@@ -101,7 +101,7 @@ impl RmsNorm {
 }
 
 pub(crate) trait Padding {
-    const CAUSAL_ZERO: bool = false;
+    const PAD_MODE: usize;
     fn apply(&self, x: Tensor<3>, kernel: usize, stride: usize) -> Tensor<3>;
 }
 pub(crate) struct Causal;
@@ -123,18 +123,20 @@ fn causal_pad(
     )
 }
 impl Padding for Causal {
-    const CAUSAL_ZERO: bool = true;
+    const PAD_MODE: usize = super::conv::PAD_CAUSAL_ZERO;
     fn apply(&self, x: Tensor<3>, kernel: usize, stride: usize) -> Tensor<3> {
         causal_pad(x, kernel, stride, burn::tensor::ops::PadMode::Constant(0.0))
     }
 }
 impl Padding for CausalEdge {
+    const PAD_MODE: usize = super::conv::PAD_CAUSAL_EDGE;
     fn apply(&self, x: Tensor<3>, kernel: usize, stride: usize) -> Tensor<3> {
         causal_pad(x, kernel, stride, burn::tensor::ops::PadMode::Edge)
     }
 }
 pub(crate) struct ReflectSame;
 impl Padding for ReflectSame {
+    const PAD_MODE: usize = super::conv::PAD_REFLECT_SAME;
     fn apply(&self, x: Tensor<3>, kernel: usize, _stride: usize) -> Tensor<3> {
         let left = (kernel - 1) / 2;
         x.pad(
@@ -159,9 +161,11 @@ impl<P: Padding> Conv<P> {
         padding: P,
     ) -> Self {
         let kernel = weight.dims()[2];
-        let packed = P::CAUSAL_ZERO && options.stride == [1] && options.groups == 1;
+        let packed = options.groups == 1
+            && (P::PAD_MODE != super::conv::PAD_REFLECT_SAME
+                || (options.stride == [1] && kernel > 1));
         // Pack `[C_out, C_in, K]` to contiguous `[K, C_out, C_in]` once at load
-        // so tiled channel-first causal convolutions read coalesced input channels.
+        // so tiled channel-first convolutions read coalesced input channels.
         let weight = if packed {
             super::conv::contiguous(weight.permute([2, 0, 1]))
         } else {
@@ -192,24 +196,59 @@ impl<P: Padding> Conv<P> {
         ))
     }
     fn is_causal_depthwise(&self) -> bool {
-        P::CAUSAL_ZERO
+        P::PAD_MODE == super::conv::PAD_CAUSAL_ZERO
             && !self.packed
             && self.options.stride == [1]
             && self.options.groups == self.weight.dims()[0]
             && self.weight.dims()[1] == 1
     }
     pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+        self.forward_inner(x, None)
+    }
+    pub fn forward_add(&self, x: Tensor<3>, residual: Tensor<3>) -> Tensor<3> {
+        self.forward_inner(x, Some(residual))
+    }
+    fn forward_inner(&self, x: Tensor<3>, residual: Option<Tensor<3>>) -> Tensor<3> {
         if self.packed {
-            return super::conv::causal_conv1d(
-                x,
-                None,
-                self.weight.clone(),
-                self.bias.clone(),
-                self.options.dilation[0],
-            );
+            let eff_k = (self.kernel - 1) * self.options.dilation[0] + 1;
+            let left_pad = (eff_k - 1) / 2;
+            let right_pad = eff_k - 1 - left_pad;
+            let can_fused = P::PAD_MODE != super::conv::PAD_REFLECT_SAME
+                || (x.dims()[2] > left_pad && x.dims()[2] > right_pad);
+            if can_fused {
+                return match residual {
+                    Some(res) => super::conv::conv1d_add(
+                        x,
+                        None,
+                        self.weight.clone(),
+                        self.bias.clone(),
+                        self.options.stride[0],
+                        self.options.dilation[0],
+                        P::PAD_MODE,
+                        res,
+                    ),
+                    None => super::conv::conv1d(
+                        x,
+                        None,
+                        self.weight.clone(),
+                        self.bias.clone(),
+                        self.options.stride[0],
+                        self.options.dilation[0],
+                        P::PAD_MODE,
+                    ),
+                };
+            }
+            let x = self.padding.apply(x, eff_k, self.options.stride[0]);
+            let unpacked = self.weight.clone().permute([1, 2, 0]);
+            let out =
+                burn::tensor::module::conv1d(x, unpacked, self.bias.clone(), self.options.clone());
+            return match residual {
+                Some(res) => res + out,
+                None => out,
+            };
         }
         if self.is_causal_depthwise() {
-            return super::conv::depthwise_causal_conv1d(
+            let out = super::conv::depthwise_causal_conv1d(
                 x,
                 None,
                 self.weight
@@ -218,10 +257,18 @@ impl<P: Padding> Conv<P> {
                 self.bias.clone(),
                 self.options.dilation[0],
             );
+            return match residual {
+                Some(res) => res + out,
+                None => out,
+            };
         }
         let kernel = (self.kernel - 1) * self.options.dilation[0] + 1;
         let x = self.padding.apply(x, kernel, self.options.stride[0]);
-        self.convolve(x)
+        let out = self.convolve(x);
+        match residual {
+            Some(res) => res + out,
+            None => out,
+        }
     }
     fn convolve(&self, x: Tensor<3>) -> Tensor<3> {
         let [output, input, kernel] = self.weight.dims();
@@ -289,20 +336,24 @@ impl Conv<Causal> {
             }
             return if self.packed {
                 match residual {
-                    Some(res) => super::conv::causal_conv1d_add(
+                    Some(res) => super::conv::conv1d_add(
                         x,
                         previous,
                         self.weight.clone(),
                         self.bias.clone(),
+                        1,
                         self.options.dilation[0],
+                        super::conv::PAD_CAUSAL_ZERO,
                         res,
                     ),
-                    None => super::conv::causal_conv1d(
+                    None => super::conv::conv1d(
                         x,
                         previous,
                         self.weight.clone(),
                         self.bias.clone(),
+                        1,
                         self.options.dilation[0],
+                        super::conv::PAD_CAUSAL_ZERO,
                     ),
                 }
             } else {
@@ -466,8 +517,9 @@ mod tests {
                                     (kernel - 1) * dilation + 1,
                                     stride,
                                 );
-                                let unit_causal = stride == 1 && groups == 1;
-                                let reference_dtype = if unit_causal { DType::F32 } else { dtype };
+                                let packed_causal = groups == 1;
+                                let reference_dtype =
+                                    if packed_causal { DType::F32 } else { dtype };
                                 let reference = burn::tensor::module::conv1d(
                                     padded.cast(reference_dtype),
                                     raw_weight.cast(reference_dtype),
