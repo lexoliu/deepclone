@@ -5,14 +5,17 @@ use burn::{
         Backend, Dispatch, TensorMetadata, backend_extension, cubecl::dtype_to_storage_type,
         ops::FloatTensorOps, tensor::FloatTensor, wgpu::CubeBackend,
     },
-    cubecl::{ir::ElemType, prelude::*},
+    cubecl::{ir::ElemType, prelude::*, tensor_vector_size_parallel},
     tensor::{DType, Shape, Tensor as BurnTensor, activation},
 };
+
+use super::gemv::lane_sum;
 
 const SHORT_SCORE_CAP: usize = 256;
 const LONG_SCORE_CAP: usize = 2048;
 const MAX_SHARED_QUERY: usize = 256;
-const FUSED_LANES: usize = 128;
+const SHORT_LANES: usize = 32;
+const LONG_LANES: usize = 128;
 
 #[backend_extension(Cube, Fusion)]
 trait DecodeAttention: Backend {
@@ -140,10 +143,49 @@ impl DecodeAttention for CubeBackend {
         } else {
             LONG_SCORE_CAP
         };
+        let lanes = if max_span <= SHORT_SCORE_CAP {
+            SHORT_LANES
+        } else {
+            LONG_LANES
+        };
+        let vec_w = if query.meta.strides()[3] == 1
+            && keys.meta.strides()[3] == 1
+            && values.meta.strides()[3] == 1
+            && output.meta.strides()[3] == 1
+        {
+            let q_vec = tensor_vector_size_parallel(
+                query.client.io_optimized_vector_sizes(query.dtype.size()),
+                query.meta.shape(),
+                query.meta.strides(),
+                3,
+            );
+            let k_vec = tensor_vector_size_parallel(
+                keys.client.io_optimized_vector_sizes(keys.dtype.size()),
+                keys.meta.shape(),
+                keys.meta.strides(),
+                3,
+            );
+            let v_vec = tensor_vector_size_parallel(
+                values.client.io_optimized_vector_sizes(values.dtype.size()),
+                values.meta.shape(),
+                values.meta.strides(),
+                3,
+            );
+            let o_vec = tensor_vector_size_parallel(
+                output.client.io_optimized_vector_sizes(output.dtype.size()),
+                output.meta.shape(),
+                output.meta.strides(),
+                3,
+            );
+            q_vec.min(k_vec).min(v_vec).min(o_vec).min(4)
+        } else {
+            1
+        };
         causal_attention_fused_kernel::launch(
             &query.client,
             CubeCount::Static(heads as u32, tokens as u32, 1),
-            CubeDim::new_1d(FUSED_LANES as u32),
+            CubeDim::new_1d(lanes as u32),
+            vec_w,
             query.clone().into_tensor_arg(),
             keys.into_tensor_arg(),
             values.into_tensor_arg(),
@@ -151,7 +193,7 @@ impl DecodeAttention for CubeBackend {
             start_position,
             window,
             score_cap,
-            FUSED_LANES,
+            lanes,
             dtype_to_storage_type(query.dtype),
         );
         output
@@ -208,11 +250,11 @@ impl DecodeAttention for CubeBackend {
 
 #[allow(clippy::too_many_arguments)]
 #[cube(launch)]
-fn causal_attention_fused_kernel<F: Float>(
-    query: &Tensor<F>,
-    keys: &Tensor<F>,
-    values: &Tensor<F>,
-    output: &mut Tensor<F>,
+fn causal_attention_fused_kernel<F: Float, N: Size>(
+    query: &Tensor<Vector<F, N>>,
+    keys: &Tensor<Vector<F, N>>,
+    values: &Tensor<Vector<F, N>>,
+    output: &mut Tensor<Vector<F, N>>,
     start_position: usize,
     window: usize,
     #[comptime] score_cap: usize,
@@ -229,34 +271,45 @@ fn causal_attention_fused_kernel<F: Float>(
     };
     let span = length - min_token;
     let kv_head = head / (query.shape(1) / keys.shape(1));
-    let width = query.shape(3);
+    let vec_size = query.vector_size();
+    let width_vecs = query.shape(3) / vec_size;
     let tid = UNIT_POS as usize;
 
     let mut scores = Shared::<[f32]>::new_slice(score_cap);
-    let mut q_shared = Shared::<[f32]>::new_slice(MAX_SHARED_QUERY);
+    let mut q_shared =
+        Shared::<[Vector<f32, N>]>::new_slice(comptime!(MAX_SHARED_QUERY / vec_size));
     let mut scratch = Shared::<[f32]>::new_slice(lanes);
 
-    let q_base = head * query.stride(1) + q_row * query.stride(2);
+    let q_base = (head * query.stride(1) + q_row * query.stride(2)) / vec_size;
     let q_col_stride = query.stride(3);
     let mut c = tid;
-    while c < width {
-        q_shared[c] = f32::cast_from(query[q_base + c * q_col_stride]);
+    while c < width_vecs {
+        let qv = if comptime!(vec_size > 1) {
+            query[q_base + c]
+        } else {
+            query[q_base + c * q_col_stride]
+        };
+        q_shared[c] = Vector::<f32, N>::cast_from(qv);
         c += lanes;
     }
     sync_cube();
 
     // Preserve the exact score rounding boundary before FP32 softmax.
-    let k_base = kv_head * keys.stride(1);
-    let k_tok_stride = keys.stride(2);
+    let k_base = (kv_head * keys.stride(1)) / vec_size;
+    let k_tok_stride = keys.stride(2) / vec_size;
     let k_col_stride = keys.stride(3);
     let mut token = tid;
     while token < span {
         let dot = RuntimeCell::<f32>::new(0f32);
         let k_row = k_base + (min_token + token) * k_tok_stride;
-        for column in 0..width {
-            dot.store(
-                dot.read() + q_shared[column] * f32::cast_from(keys[k_row + column * k_col_stride]),
-            );
+        for column in 0..width_vecs {
+            let k_elem = if comptime!(vec_size > 1) {
+                keys[k_row + column]
+            } else {
+                keys[k_row + column * k_col_stride]
+            };
+            let kv = Vector::<f32, N>::cast_from(k_elem);
+            dot.store(dot.read() + lane_sum(q_shared[column] * kv));
         }
         scores[token] = f32::cast_from(F::cast_from(dot.consume()));
         token += lanes;
@@ -321,24 +374,24 @@ fn causal_attention_fused_kernel<F: Float>(
     }
     sync_cube();
 
-    let v_base = kv_head * values.stride(1);
-    let v_tok_stride = values.stride(2);
+    let v_base = (kv_head * values.stride(1)) / vec_size;
+    let v_tok_stride = values.stride(2) / vec_size;
     let v_col_stride = values.stride(3);
-    let out_base = head * output.stride(1) + q_row * output.stride(2);
+    let out_base = (head * output.stride(1) + q_row * output.stride(2)) / vec_size;
     let mut column = tid;
-    while column < width {
-        let mixed = RuntimeCell::<f32>::new(0f32);
+    while column < width_vecs {
+        let mixed = RuntimeCell::<Vector<f32, N>>::new(Vector::<f32, N>::new(0f32));
         for tok in 0..span {
-            mixed.store(
-                mixed.read()
-                    + scores[tok]
-                        * f32::cast_from(
-                            values
-                                [v_base + (min_token + tok) * v_tok_stride + column * v_col_stride],
-                        ),
-            );
+            let prob = Vector::<f32, N>::new(scores[tok]);
+            let v_elem = if comptime!(vec_size > 1) {
+                values[v_base + (min_token + tok) * v_tok_stride + column]
+            } else {
+                values[v_base + (min_token + tok) * v_tok_stride + column * v_col_stride]
+            };
+            let v = Vector::<f32, N>::cast_from(v_elem);
+            mixed.store(mixed.read() + prob * v);
         }
-        output[out_base + column] = F::cast_from(mixed.consume());
+        output[out_base + column] = Vector::<F, N>::cast_from(mixed.consume());
         column += lanes;
     }
 }

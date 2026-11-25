@@ -85,7 +85,7 @@ impl VectorProjection for CubeBackend {
 }
 
 #[cube]
-fn lane_sum<N: Size>(p: Vector<f32, N>) -> f32 {
+pub(super) fn lane_sum<N: Size>(p: Vector<f32, N>) -> f32 {
     let mut d = 0f32;
     #[unroll]
     for lane in 0..p.vector_size() {
