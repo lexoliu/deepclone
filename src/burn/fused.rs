@@ -1089,10 +1089,9 @@ mod tests {
                     &ac.slice([0..1, 0..1, rot_pos..rot_pos + t, 0..d_head]),
                     &asn.slice([0..1, 0..1, rot_pos..rot_pos + t, 0..d_head]),
                 );
-                let (q_a, k_out, _v_out) = qkv_rope_cache_no_norm(
+                let (q_a, kf, _v_out) = qkv_rope_cache_no_norm(
                     qkv_a, rot_packed, kf, vf, cache_pos, rot_pos, h_q, h_kv, d_head, scale,
                 );
-                kf = k_out;
                 let ((qa, qr), (ka, kr)) = futures_lite::future::zip(
                     futures_lite::future::zip(super::super::read(q_a), super::super::read(q_r)),
                     futures_lite::future::zip(
