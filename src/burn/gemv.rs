@@ -5,7 +5,7 @@ use burn::{
         Backend, Dispatch, TensorMetadata, backend_extension, cubecl::dtype_to_storage_type,
         ops::FloatTensorOps, tensor::FloatTensor, wgpu::CubeBackend,
     },
-    cubecl::{ir::ElemType, prelude::*},
+    cubecl::{ir::ElemType, prelude::*, tensor_vector_size_parallel},
     tensor::{Shape, Tensor as BurnTensor},
 };
 
@@ -96,7 +96,7 @@ fn gemv_cooperative_kernel<F: Float, W: Float, N: Size>(
     let col_base = (CUBE_POS_X as usize) * COOP_OUTPUTS_PER_CUBE + ty * COOP_ROWS_PER_LANE;
     let width = output.shape(2);
     let k = input.shape(2);
-    let vec_size = comptime!(input.vector_size());
+    let vec_size = input.vector_size();
     let k_vecs = k / vec_size;
     let w_stride = weight.stride(1) / vec_size;
     let in_stride = input.stride(2);
@@ -152,11 +152,11 @@ fn gemv_cooperative_kernel<F: Float, W: Float, N: Size>(
     let mut s2 = 0f32;
     let mut s3 = 0f32;
     #[unroll]
-    for lane in 0..vec_size {
-        s0 += acc0[lane];
-        s1 += acc1[lane];
-        s2 += acc2[lane];
-        s3 += acc3[lane];
+    for lane in 0..acc0.vector_size() {
+        s0 += acc0.extract(lane);
+        s1 += acc1.extract(lane);
+        s2 += acc2.extract(lane);
+        s3 += acc3.extract(lane);
     }
 
     let mut partial = Shared::<[f32]>::new_slice(COOP_OUTPUTS_PER_CUBE * COOP_LANES_X);
