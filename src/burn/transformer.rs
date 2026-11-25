@@ -141,11 +141,10 @@ impl Layer {
                 .cast(x.dtype())
                 .matmul(values_view)
                 .reshape([1, c.num_attention_heads, tokens, c.head_dim])
+                .swap_dims(1, 2)
+                .reshape([1, tokens, c.num_attention_heads * c.head_dim])
         };
         self.kv = Some((keys, values));
-        let mixed = mixed
-            .swap_dims(1, 2)
-            .reshape([1, tokens, c.num_attention_heads * c.head_dim]);
         let projected = self.output.forward(mixed);
         let (x, normalized) = self.post.add_forward(x, projected);
         let gate_up = self.gate_up.raw(normalized);

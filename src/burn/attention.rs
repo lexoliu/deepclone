@@ -19,7 +19,7 @@ const LONG_LANES: usize = 128;
 
 #[backend_extension(Cube, Fusion)]
 trait DecodeAttention: Backend {
-    #[fusion(dtype = query, shape = Shape::from([1, query[1], query[2], values[3]]))]
+    #[fusion(dtype = query, shape = Shape::from([1, query[2], query[1] * values[3]]))]
     fn causal_attention_fused(
         query: FloatTensor<Self>,
         keys: FloatTensor<Self>,
@@ -51,8 +51,8 @@ pub(super) fn decode(
     keys: BurnTensor<4>,
     values: BurnTensor<4>,
     length: usize,
-) -> BurnTensor<4> {
-    let width = query.dims()[3];
+) -> BurnTensor<3> {
+    let [_, heads, _, width] = query.dims();
     if supports_fused(length, width) {
         return BurnTensor::from_dispatch(Dispatch::causal_attention_fused(
             query.into_dispatch(),
@@ -62,7 +62,7 @@ pub(super) fn decode(
             0,
         ));
     }
-    decode_unfused(query, keys, values, length)
+    decode_unfused(query, keys, values, length).reshape([1, 1, heads * width])
 }
 
 pub(super) fn prefill(
@@ -70,7 +70,7 @@ pub(super) fn prefill(
     keys: BurnTensor<4>,
     values: BurnTensor<4>,
     start_position: usize,
-) -> BurnTensor<4> {
+) -> BurnTensor<3> {
     prefill_windowed(query, keys, values, start_position, 0)
 }
 
@@ -80,7 +80,7 @@ pub(super) fn prefill_windowed(
     values: BurnTensor<4>,
     start_position: usize,
     window: usize,
-) -> BurnTensor<4> {
+) -> BurnTensor<3> {
     BurnTensor::from_dispatch(Dispatch::causal_attention_fused(
         query.into_dispatch(),
         keys.into_dispatch(),
@@ -134,7 +134,7 @@ impl DecodeAttention for CubeBackend {
             total_length
         };
         let output = Self::float_empty(
-            Shape::from([1, heads, tokens, width]),
+            Shape::from([1, tokens, heads * width]),
             &query.device,
             query.dtype.into(),
         );
@@ -151,7 +151,7 @@ impl DecodeAttention for CubeBackend {
         let vec_w = if query.meta.strides()[3] == 1
             && keys.meta.strides()[3] == 1
             && values.meta.strides()[3] == 1
-            && output.meta.strides()[3] == 1
+            && output.meta.strides()[2] == 1
         {
             let q_vec = tensor_vector_size_parallel(
                 query.client.io_optimized_vector_sizes(query.dtype.size()),
@@ -175,7 +175,7 @@ impl DecodeAttention for CubeBackend {
                 output.client.io_optimized_vector_sizes(output.dtype.size()),
                 output.meta.shape(),
                 output.meta.strides(),
-                3,
+                2,
             );
             q_vec.min(k_vec).min(v_vec).min(o_vec).min(4)
         } else {
@@ -377,7 +377,7 @@ fn causal_attention_fused_kernel<F: Float, N: Size>(
     let v_base = (kv_head * values.stride(1)) / vec_size;
     let v_tok_stride = values.stride(2) / vec_size;
     let v_col_stride = values.stride(3);
-    let out_base = (head * output.stride(1) + q_row * output.stride(2)) / vec_size;
+    let out_base = (q_row * output.stride(1)) / vec_size + head * width_vecs;
     let mut column = tid;
     while column < width_vecs {
         let mixed = RuntimeCell::<Vector<f32, N>>::new(Vector::<f32, N>::new(0f32));
@@ -468,7 +468,7 @@ mod tests {
         keys: BurnTensor<4>,
         values: BurnTensor<4>,
         length: usize,
-    ) -> BurnTensor<4> {
+    ) -> BurnTensor<3> {
         let [_, heads, _, width] = query.dims();
         let kv_heads = keys.dims()[1];
         let selection = [0..1, 0..kv_heads, 0..length, 0..width];
@@ -483,7 +483,7 @@ mod tests {
         activation::softmax(q.matmul(k.swap_dims(3, 4)).cast(DType::F32), 4)
             .cast(dtype)
             .matmul(v)
-            .reshape([1, heads, 1, width])
+            .reshape([1, 1, heads * width])
     }
 
     #[test]
@@ -526,8 +526,8 @@ mod tests {
                     device.flush().unwrap();
                 }
                 let (actual, expected) = futures_lite::future::zip(
-                    super::super::read(BurnTensor::cat(actual, 2)),
-                    super::super::read(BurnTensor::cat(expected, 2)),
+                    super::super::read(BurnTensor::cat(actual, 1)),
+                    super::super::read(BurnTensor::cat(expected, 1)),
                 )
                 .await;
                 let maximum = actual
@@ -621,7 +621,8 @@ mod tests {
                     let keys = tensor([1, kv_heads, capacity, width], 31);
                     let values = tensor([1, kv_heads, capacity, width], 47);
                     let expected =
-                        decode_unfused(query.clone(), keys.clone(), values.clone(), length);
+                        decode_unfused(query.clone(), keys.clone(), values.clone(), length)
+                            .reshape([1, 1, heads * width]);
                     let (actual, expected) = futures_lite::future::zip(
                         super::super::read(decode(query, keys, values, length)),
                         super::super::read(expected),
@@ -709,7 +710,9 @@ mod tests {
                     let expected = activation::softmax(scores, 4)
                         .cast(dtype)
                         .matmul(v_view)
-                        .reshape([1, heads, tokens, width]);
+                        .reshape([1, heads, tokens, width])
+                        .swap_dims(1, 2)
+                        .reshape([1, tokens, heads * width]);
 
                     let (actual, expected) = futures_lite::future::zip(
                         super::super::read(prefill_windowed(

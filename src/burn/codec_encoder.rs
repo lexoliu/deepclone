@@ -49,13 +49,10 @@ impl Residual {
         })
     }
     fn forward(&self, x: Tensor<3>) -> Tensor<3> {
-        let y = self.last.forward(activation::elu(
-            self.first.forward(activation::elu(x.clone(), 1.0)),
-            1.0,
-        ));
-        y + match &self.shortcut {
-            Some(conv) => conv.forward(x),
-            None => x,
+        let h = activation::elu(self.first.forward(activation::elu(x.clone(), 1.0)), 1.0);
+        match &self.shortcut {
+            Some(conv) => self.last.forward(h) + conv.forward(x),
+            None => self.last.forward_add(h, x),
         }
     }
 }
@@ -66,6 +63,8 @@ struct Stage {
 struct Quantizer {
     projection: Conv<Causal>,
     codebooks: Vec<Tensor<2>>,
+    codebooks_t: Vec<Tensor<2>>,
+    codebook_norms: Vec<Tensor<2>>,
 }
 impl Quantizer {
     fn load(w: &impl WeightSource, p: &str, groups: usize) -> Result<Self, Error> {
@@ -80,21 +79,32 @@ impl Quantizer {
                     .unsqueeze_dim(1);
                 Ok(sum / count)
             })
-            .collect::<Result<_, Error>>()?;
+            .collect::<Result<Vec<_>, Error>>()?;
+        let codebooks_t = codebooks.iter().map(|b| b.clone().transpose()).collect();
+        let codebook_norms = codebooks
+            .iter()
+            .map(|b| (b.clone() * b.clone()).sum_dim(1).transpose())
+            .collect();
         Ok(Self {
             projection: Conv::load(w, &format!("{p}.input_proj"), 1, 1, 1, Causal)?,
             codebooks,
+            codebooks_t,
+            codebook_norms,
         })
     }
     fn encode(&self, x: Tensor<3>) -> Vec<Tensor<3, Int>> {
         let mut residual = self.projection.forward(x).swap_dims(1, 2);
         let [b, t, d] = residual.dims();
         let mut codes = Vec::with_capacity(self.codebooks.len());
-        for book in &self.codebooks {
+        for ((book, book_t), wnorm) in self
+            .codebooks
+            .iter()
+            .zip(&self.codebooks_t)
+            .zip(&self.codebook_norms)
+        {
             let flat = residual.clone().reshape([b * t, d]);
             let xnorm = (flat.clone() * flat.clone()).sum_dim(1);
-            let wnorm = (book.clone() * book.clone()).sum_dim(1).transpose();
-            let distances = (xnorm + wnorm - flat.matmul(book.clone().transpose()) * 2.0)
+            let distances = (xnorm + wnorm.clone() - flat.matmul(book_t.clone()) * 2.0)
                 .clamp_min(0.0)
                 .sqrt();
             let indices = distances.argmin(1).reshape([b, t]);
