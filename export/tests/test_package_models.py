@@ -59,6 +59,17 @@ class Packaging(unittest.TestCase):
                     archive.extractfile("audio/encoder.mlmodelc/weight.bin").read(),
                     b"fixture weights",
                 )
+            manifest["weight_bits"] = 8
+            (transformers / "transformers.json").write_text(json.dumps(manifest))
+            self.assertIn(
+                "transformers/embedding.mlmodelc/weight.bin",
+                inputs(transformers, audio),
+            )
+            manifest["weight_bits"] = 4
+            (transformers / "transformers.json").write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "8-bit or 16-bit"):
+                inputs(transformers, audio)
+            manifest["weight_bits"] = 16
             manifest["text_embedding"] = "../private"
             (transformers / "transformers.json").write_text(json.dumps(manifest))
             with self.assertRaisesRegex(ValueError, "Invalid model path"):

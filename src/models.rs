@@ -8,7 +8,7 @@ pub use ondevice::Zenwave;
 pub use ondevice::{Archive, Error, Pin, Progress, Sha256, Store, Transport};
 use std::path::PathBuf;
 
-/// Batched 0.6B FP16 model for ANE-backed streaming, with FP32 conditioning.
+/// Batched 0.6B W8 model for ANE-backed streaming, with FP16 text embedding and FP32 conditioning.
 ///
 /// ```no_run
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -22,11 +22,11 @@ use std::path::PathBuf;
 /// ```
 pub const fn qwen3_tts_0_6b() -> Bundle<'static> {
     Bundle::new(Pin {
-        url: "https://huggingface.co/lexoliu/deepclone-qwen3-tts-coreml/resolve/b92456a0bb21dc18cad07a6828ff391deb38ae3f/qwen3-tts-0.6b-coreml-realtime.tar.zst",
+        url: "https://huggingface.co/lexoliu/deepclone-qwen3-tts-coreml/resolve/0f399e630142b43580bb63e18ede1f89627a836e/qwen3-tts-0.6b-coreml-realtime.tar.zst",
         sha256: Sha256::from_hex(
-            "ed7ee326b29aa966ce61562776cbe8db3cc16f0dd73fb80346f49b5e5e0c1e7b",
+            "b921fbee529ddc6d85cead0c37b3676f2d2ed5721f49020d11473c665a601f96",
         ),
-        size: 1_882_140_090,
+        size: 1_493_078_943,
         kind: Archive,
     })
 }
