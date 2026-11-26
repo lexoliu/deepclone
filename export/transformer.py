@@ -61,8 +61,14 @@ class RmsNorm(nn.Module):
         )
 
 
-def gated_silu(gate, up):
-    return (gate * up) * torch.sigmoid(gate)
+# Power-of-2 scaling factor for MLP gated_silu: keeps |gate * up| inside float16
+# range (Predictor layer 2 reaches ~139k on real Talker outputs) with zero
+# mantissa rounding error; DecoderLayer restores the factor after down().
+MLP_GATE_SCALE = 16.0
+
+
+def gated_silu(gate, up, scale=1.0):
+    return ((gate * (1.0 / scale)) * torch.sigmoid(gate)) * up
 
 
 def rotary(x, cosine, sine):
@@ -127,7 +133,9 @@ class DecoderLayer(nn.Module):
         )
         normalized = self.post_norm(hidden)
         gate, up = self.gate_up(normalized).chunk(2, dim=1)
-        hidden = hidden + self.down(gated_silu(gate, up))
+        hidden = (
+            hidden + self.down(gated_silu(gate, up, MLP_GATE_SCALE)) * MLP_GATE_SCALE
+        )
         return hidden, keys, values
 
 

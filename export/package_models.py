@@ -19,9 +19,12 @@ def inputs(transformers, audio):
         raise ValueError("Published transformer weights must be FP16")
     components = [
         manifest["text_embedding"],
-        manifest["codec_frame"],
-        *manifest["codec_embeddings"],
+        *manifest.get("codec_embeddings", []),
     ]
+    if manifest.get("codec_frame"):
+        components.append(manifest["codec_frame"])
+    if manifest.get("tables"):
+        components.append(manifest["tables"])
     if manifest["predictor_projection"]:
         components.append(manifest["predictor_projection"])
     for decoder in manifest["decoders"].values():

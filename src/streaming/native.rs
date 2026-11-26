@@ -308,6 +308,7 @@ where
         &request.language,
         request.options.generation.clone(),
     )?;
+    let warmup = session.reference_warmup()?;
     let (pending, plans) = async_channel::bounded::<DecodePlan>(1);
     let dispatcher = tracing::dispatcher::get_default(Clone::clone);
     std::thread::scope(|scope| {
@@ -317,6 +318,12 @@ where
                 let _input = CloseInput(&request.text);
                 tracing::dispatcher::with_default(&dispatcher, || {
                     futures_lite::future::block_on(async {
+                        if let Some(plan) = warmup {
+                            if request.audio.is_closed() {
+                                return Err(Error::Cancelled);
+                            }
+                            let _ = plan.decode(codec).await?;
+                        }
                         while let Ok(plan) = plans.recv().await {
                             if request.audio.is_closed() {
                                 return Err(Error::Cancelled);

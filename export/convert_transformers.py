@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 from qwen_tts import Qwen3TTSModel
+from safetensors.torch import save_file
 
 from artifact import convert, enumerated_axis
 from provenance import snapshot, verify_or_record
@@ -29,6 +30,7 @@ def export(
     weight_bits,
     sequence_lengths,
     resume=False,
+    host_tables=False,
 ):
     talker = reference.model.talker
     manifest = {"weight_bits": weight_bits, "decoders": {}}
@@ -54,31 +56,62 @@ def export(
     manifest["text_embedding"] = component(
         TextEmbedding(talker), (token,), ["token"], ["hidden"], "text-embedding"
     )
-    manifest["codec_embeddings"] = [
-        component(
-            CodecEmbedding(embedding),
-            (token,),
-            ["token"],
-            ["hidden"],
-            f"codec-embedding-{index}",
-        )
+    if host_tables:
+        tables = {}
         for index, embedding in enumerate(
             [
                 talker.get_input_embeddings(),
                 *talker.code_predictor.get_input_embeddings(),
             ]
+        ):
+            tables[f"codec_embeddings.{index}"] = (
+                embedding.weight.detach().to(torch.float16).contiguous()
+            )
+        tables["talker_norm"] = (
+            talker.model.norm.weight.detach().to(torch.float16).contiguous()
         )
-    ]
-    manifest["codec_frame"] = component(
-        CodecFrame(talker),
-        (
-            torch.zeros((1, talker.config.num_code_groups), dtype=torch.int32),
-            torch.zeros((1, talker.config.hidden_size, 1, 1), dtype=torch.float16),
-        ),
-        ["codes", "text"],
-        ["hidden"],
-        "codec-frame",
-    )
+        tables["talker_head"] = (
+            talker.codec_head.weight.detach().to(torch.float16).contiguous()
+        )
+        tables["predictor_norm"] = (
+            talker.code_predictor.model.norm.weight.detach()
+            .to(torch.float16)
+            .contiguous()
+        )
+        for index, head in enumerate(talker.code_predictor.lm_head):
+            tables[f"predictor_heads.{index}"] = (
+                head.weight.detach().to(torch.float16).contiguous()
+            )
+        save_file(tables, str(output / "tables.safetensors"))
+        manifest["tables"] = "tables.safetensors"
+        manifest["codec_embeddings"] = []
+        manifest["codec_frame"] = None
+    else:
+        manifest["codec_embeddings"] = [
+            component(
+                CodecEmbedding(embedding),
+                (token,),
+                ["token"],
+                ["hidden"],
+                f"codec-embedding-{index}",
+            )
+            for index, embedding in enumerate(
+                [
+                    talker.get_input_embeddings(),
+                    *talker.code_predictor.get_input_embeddings(),
+                ]
+            )
+        ]
+        manifest["codec_frame"] = component(
+            CodecFrame(talker),
+            (
+                torch.zeros((1, talker.config.num_code_groups), dtype=torch.int32),
+                torch.zeros((1, talker.config.hidden_size, 1, 1), dtype=torch.float16),
+            ),
+            ["codes", "text"],
+            ["hidden"],
+            "codec-frame",
+        )
     projection = talker.code_predictor.small_to_mtp_projection
     manifest["predictor_projection"] = (
         component(
@@ -91,15 +124,16 @@ def export(
         if isinstance(projection, torch.nn.Linear)
         else None
     )
-    for name, decoder, capacity, heads in [
-        ("talker", talker, context, [talker.codec_head]),
+    for name, decoder, capacity, heads, lengths in [
+        ("talker", talker, context, [talker.codec_head], sequence_lengths),
         (
             "predictor",
             talker.code_predictor,
             # Two prefix positions produce the first residual code; only the
-            # remaining groups feed another token. Total positions = groups.
+            # remaining groups feed another token. Minimum positions = groups.
             talker.config.num_code_groups,
             talker.code_predictor.lm_head,
+            [1],
         ),
     ]:
         config = decoder.config
@@ -111,7 +145,6 @@ def export(
         )
         mask[..., -1] = 0
         chunks = []
-        lengths = sequence_lengths if name == "talker" else [1]
         shapes = {
             feature: enumerated_axis(value, (axis,), lengths)
             for feature, value, axis in [
@@ -140,9 +173,12 @@ def export(
         manifest["decoders"][name] = {
             "chunks": chunks,
             "rope_theta": config.rope_theta,
+            "rms_norm_eps": config.rms_norm_eps,
             "context": capacity,
             "sequence_lengths": lengths,
-            "heads": [
+            "heads": []
+            if host_tables
+            else [
                 component(
                     OutputHead(decoder.model.norm, head),
                     (hidden,),
@@ -184,6 +220,11 @@ def main():
         action="store_true",
         help="Reuse completed components from the same source and settings",
     )
+    parser.add_argument(
+        "--host-tables",
+        action="store_true",
+        help="Store codec embeddings and output heads in tables.safetensors for native host execution",
+    )
     args = parser.parse_args()
     if args.context <= 0 or args.chunk_layers <= 0:
         parser.error("context and chunk-layers must be positive")
@@ -207,6 +248,7 @@ def main():
                 "predictor_chunk_layers": predictor_chunk_layers,
                 "weight_bits": args.weight_bits,
                 "sequence_lengths": args.sequence_lengths,
+                "host_tables": args.host_tables,
             },
         ),
         args.resume,
@@ -226,6 +268,7 @@ def main():
         args.weight_bits,
         args.sequence_lengths,
         args.resume,
+        args.host_tables,
     )
 
 
