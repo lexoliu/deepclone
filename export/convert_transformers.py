@@ -45,6 +45,7 @@ def export(
         states=(),
         shapes=None,
         bits=weight_bits,
+        trace_dtype=torch.float16,
     ):
         path = output / (name + ".mlmodelc")
         if resume and path.exists():
@@ -57,7 +58,8 @@ def export(
             # The component was interrupted before its completion report was
             # published. The run's provenance has already been checked.
             shutil.rmtree(path)
-        convert(module.half(), inputs, names, outputs, path, bits, states, shapes)
+        prepared = module.float() if trace_dtype == torch.float32 else module.half()
+        convert(prepared, inputs, names, outputs, path, bits, states, shapes)
         return path.name
 
     # TextEmbedding is a 151,936-row gather table that executes on CPU;
@@ -127,13 +129,17 @@ def export(
             "codec-frame",
         )
     projection = talker.code_predictor.small_to_mtp_projection
+    # Biased 1x1 convolutions must be traced in float32 before Core ML FLOAT16
+    # lowering so coremltools keeps weight and bias dtypes aligned.
     manifest["predictor_projection"] = (
         component(
             Projection(projection),
-            (torch.zeros((1, talker.config.hidden_size, 1, 1), dtype=torch.float16),),
+            (torch.zeros((1, talker.config.hidden_size, 1, 1), dtype=torch.float32),),
             ["hidden"],
             ["hidden_out"],
             "predictor-projection",
+            bits=16,
+            trace_dtype=torch.float32,
         )
         if isinstance(projection, torch.nn.Linear)
         else None
