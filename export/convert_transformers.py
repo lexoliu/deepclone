@@ -36,25 +36,39 @@ def export(
     manifest = {"weight_bits": weight_bits, "decoders": {}}
     token = torch.zeros((1, 1), dtype=torch.int32)
 
-    def component(module, inputs, names, outputs, name, states=(), shapes=None):
+    def component(
+        module,
+        inputs,
+        names,
+        outputs,
+        name,
+        states=(),
+        shapes=None,
+        bits=weight_bits,
+    ):
         path = output / (name + ".mlmodelc")
         if resume and path.exists():
             report_path = path.with_suffix(".json")
             if report_path.exists():
                 report = json.loads(report_path.read_text())
-                if report["weight_bits"] != weight_bits:
+                if report["weight_bits"] != bits:
                     raise ValueError(f"{name}: existing weight precision differs")
                 return path.name
             # The component was interrupted before its completion report was
             # published. The run's provenance has already been checked.
             shutil.rmtree(path)
-        convert(
-            module.half(), inputs, names, outputs, path, weight_bits, states, shapes
-        )
+        convert(module.half(), inputs, names, outputs, path, bits, states, shapes)
         return path.name
 
+    # TextEmbedding is a 151,936-row gather table that executes on CPU;
+    # quantizing it gives no ANE speedup and stalls Core ML gather constant folding.
     manifest["text_embedding"] = component(
-        TextEmbedding(talker), (token,), ["token"], ["hidden"], "text-embedding"
+        TextEmbedding(talker),
+        (token,),
+        ["token"],
+        ["hidden"],
+        "text-embedding",
+        bits=16,
     )
     if host_tables:
         tables = {}
