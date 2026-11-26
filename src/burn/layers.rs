@@ -1,30 +1,123 @@
 use super::{Error, WeightSource};
-use burn::tensor::{DType, Tensor};
+use burn::tensor::{DType, Int, Tensor};
+
+struct QuantizedWeight {
+    qweight: Tensor<2, Int>,
+    scales: Tensor<2>,
+    bits: u8,
+    group_size: usize,
+}
+
+enum LinearWeight {
+    Dense(Box<Tensor<2>>),
+    Quantized(Box<QuantizedWeight>),
+}
+
+impl LinearWeight {
+    fn out_features(&self) -> usize {
+        match self {
+            Self::Dense(w) => w.dims()[1],
+            Self::Quantized(qw) => qw.qweight.dims()[0],
+        }
+    }
+}
 
 pub(crate) struct Linear {
-    weight: Tensor<2>,
+    weight: LinearWeight,
     bias: Option<Tensor<1>>,
 }
 impl Linear {
     pub fn load(weights: &impl WeightSource, prefix: &str) -> Result<Self, Error> {
+        let bias = weights.optional(&format!("{prefix}.bias"))?;
+        if let Some(qweight) = weights.optional_packed::<2>(&format!("{prefix}.qweight_i4"))? {
+            return Self::from_quantized(weights, prefix, qweight, 4, bias);
+        }
+        if let Some(qweight) = weights.optional_packed::<2>(&format!("{prefix}.qweight_i8"))? {
+            return Self::from_quantized(weights, prefix, qweight, 8, bias);
+        }
         Ok(Self {
-            weight: weights
-                .tensor::<2>(&format!("{prefix}.weight"))?
-                .transpose(),
-            bias: weights.optional(&format!("{prefix}.bias"))?,
+            weight: LinearWeight::Dense(Box::new(
+                weights
+                    .tensor::<2>(&format!("{prefix}.weight"))?
+                    .transpose(),
+            )),
+            bias,
+        })
+    }
+    fn from_quantized(
+        weights: &impl WeightSource,
+        prefix: &str,
+        qweight: Tensor<2, Int>,
+        bits: u8,
+        bias: Option<Tensor<1>>,
+    ) -> Result<Self, Error> {
+        let scales = weights.tensor::<2>(&format!("{prefix}.scales"))?;
+        let [n, k_words] = qweight.dims();
+        let [sn, groups] = scales.dims();
+        let pack = 32 / usize::from(bits);
+        let k = k_words * pack;
+        if sn != n || groups == 0 || !k.is_multiple_of(groups) || !(k / groups).is_multiple_of(pack)
+        {
+            return Err(Error::Tensor {
+                name: format!("{prefix}.scales"),
+                reason: format!(
+                    "quantized W{bits} shape mismatch: qweight=[{n},{k_words}], scales=[{sn},{groups}]"
+                ),
+            });
+        }
+        Ok(Self {
+            weight: LinearWeight::Quantized(Box::new(QuantizedWeight {
+                qweight,
+                scales,
+                bits,
+                group_size: k / groups,
+            })),
+            bias,
         })
     }
     pub fn cast(mut self, dtype: DType) -> Self {
-        self.weight = self.weight.cast(dtype);
+        self.weight = match self.weight {
+            LinearWeight::Dense(w) => LinearWeight::Dense(Box::new(w.as_ref().clone().cast(dtype))),
+            LinearWeight::Quantized(qw) => LinearWeight::Quantized(Box::new(QuantizedWeight {
+                qweight: qw.qweight,
+                scales: qw.scales.cast(dtype),
+                bits: qw.bits,
+                group_size: qw.group_size,
+            })),
+        };
         self.bias = self.bias.map(|bias| bias.cast(dtype));
         self
     }
     pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let dtype = x.dtype();
-        let y = if x.dims()[0] == 1 && x.dims()[1] == 1 {
-            super::gemv::project(x, self.weight.clone())
-        } else {
-            super::projection::project(x, self.weight.clone())
+        let is_decode = x.dims()[0] == 1 && x.dims()[1] == 1;
+        let y = match &self.weight {
+            LinearWeight::Dense(weight) => {
+                if is_decode {
+                    super::gemv::project(x, weight.as_ref().clone())
+                } else {
+                    super::projection::project(x, weight.as_ref().clone())
+                }
+            }
+            LinearWeight::Quantized(qw) => {
+                if is_decode {
+                    super::quant_gemv::project_gemv(
+                        x,
+                        qw.qweight.clone(),
+                        qw.scales.clone(),
+                        qw.bits,
+                        qw.group_size,
+                    )
+                } else {
+                    super::quant_gemv::project_batched(
+                        x,
+                        qw.qweight.clone(),
+                        qw.scales.clone(),
+                        qw.bits,
+                        qw.group_size,
+                    )
+                }
+            }
         };
         match &self.bias {
             Some(bias) => y + bias.clone().cast(dtype).unsqueeze(),
@@ -49,7 +142,7 @@ impl<const N: usize> JoinedLinear<N> {
                     .iter()
                     .map(|layer| {
                         layer.bias.clone().unwrap_or_else(|| {
-                            Tensor::<1>::zeros([layer.weight.dims()[1]], weights.device())
+                            Tensor::<1>::zeros([layer.weight.out_features()], weights.device())
                                 .cast(weights.dtype())
                         })
                     })
@@ -59,16 +152,56 @@ impl<const N: usize> JoinedLinear<N> {
         } else {
             None
         };
-        // Preserve contiguous input features within each output row so decode
-        // lanes can cooperate on the reduction without repacking every token.
-        let weight = Tensor::cat(
-            layers
-                .into_iter()
-                .map(|layer| layer.weight.transpose())
-                .collect(),
-            0,
-        )
-        .transpose();
+        let weight = match &layers[0].weight {
+            LinearWeight::Dense(_) => {
+                // Preserve contiguous input features within each output row so decode
+                // lanes can cooperate on the reduction without repacking every token.
+                let mut rows = Vec::with_capacity(layers.len());
+                for layer in layers {
+                    let LinearWeight::Dense(w) = layer.weight else {
+                        return Err(Error::Tensor {
+                            name: prefixes[0].clone(),
+                            reason: "cannot join dense and quantized projections".into(),
+                        });
+                    };
+                    rows.push(w.as_ref().clone().transpose());
+                }
+                LinearWeight::Dense(Box::new(Tensor::cat(rows, 0).transpose()))
+            }
+            LinearWeight::Quantized(qw) => {
+                let (bits, group_size) = (qw.bits, qw.group_size);
+                let mut qweights = Vec::with_capacity(layers.len());
+                let mut scales = Vec::with_capacity(layers.len());
+                qweights.push(qw.qweight.clone());
+                scales.push(qw.scales.clone());
+
+                for layer in layers.into_iter().skip(1) {
+                    let LinearWeight::Quantized(qw_next) = layer.weight else {
+                        return Err(Error::Tensor {
+                            name: prefixes[0].clone(),
+                            reason: "cannot join quantized and dense projections".into(),
+                        });
+                    };
+                    if qw_next.bits != bits || qw_next.group_size != group_size {
+                        return Err(Error::Tensor {
+                            name: prefixes[0].clone(),
+                            reason: format!(
+                                "mismatched quantization in joined projection: W{}/g{} vs W{bits}/g{group_size}",
+                                qw_next.bits, qw_next.group_size
+                            ),
+                        });
+                    }
+                    qweights.push(qw_next.qweight);
+                    scales.push(qw_next.scales);
+                }
+                LinearWeight::Quantized(Box::new(QuantizedWeight {
+                    qweight: Tensor::cat(qweights, 0),
+                    scales: Tensor::cat(scales, 0),
+                    bits,
+                    group_size,
+                }))
+            }
+        };
         Ok(Self {
             projection: Linear { weight, bias },
         })
@@ -577,10 +710,10 @@ mod tests {
         futures_lite::future::block_on(async {
             let device = Device::wgpu_options().init_async().await.unwrap();
             let projection = Linear {
-                weight: Tensor::from_data(
+                weight: LinearWeight::Dense(Box::new(Tensor::from_data(
                     TensorData::new(vec![0.125f32], [1, 1]),
                     (&device, DType::F16),
-                ),
+                ))),
                 bias: None,
             };
             let gate_up = Tensor::from_data(

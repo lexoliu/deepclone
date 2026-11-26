@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 
 import librosa
+import torch
 from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from safetensors import safe_open
 from safetensors.torch import save_file
@@ -52,7 +53,11 @@ def prepare(size, source, output, shard_bytes):
             names = weights.keys()
             for name in names:
                 tensor = weights.get_tensor(name)
-                precise = kind == "audio" or name.startswith("speaker_encoder.")
+                precise = (
+                    kind == "audio" and not name.startswith("decoder.")
+                ) or name.startswith("speaker_encoder.")
+                if not precise and tensor.dtype in (torch.float32, torch.bfloat16):
+                    tensor = tensor.to(torch.float16).contiguous()
                 length = tensor.numel() * tensor.element_size()
                 if batch and (total + length > shard_bytes or precise != conditioning):
                     flush(conditioning)

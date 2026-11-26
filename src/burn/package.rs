@@ -68,7 +68,7 @@ impl<T: crate::sampling::TokenSampler, S: crate::sampling::TokenSampler>
             backend,
             codec,
             Assets {
-                weight_bits: 16,
+                weight_bits: weights.transformer_weight_bits(),
                 config: json(path.join("config.json"))?,
                 encoder_contract,
                 decoder_contract,

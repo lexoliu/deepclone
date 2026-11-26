@@ -3,7 +3,7 @@ use super::{
     audio_transformer::{AttentionConfig, AudioHistory, AudioTransformer, Gated},
     layers::{Causal, Conv, ConvHistory, LayerNorm, Linear, RmsNorm, TransposeConv},
 };
-use burn::tensor::{Int, Tensor, activation, module};
+use burn::tensor::{DType, Int, Tensor, activation, module};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -27,13 +27,16 @@ impl Quantizer {
         let codebooks = (0..groups)
             .map(|i| {
                 let p = format!("{p}.vq.layers.{i}._codebook");
-                let sum = w.tensor::<2>(&format!("{p}.embedding_sum"))?;
+                let raw_sum = w.tensor::<2>(&format!("{p}.embedding_sum"))?;
+                let dtype = raw_sum.dtype();
+                let sum = raw_sum.cast(DType::F32);
                 // EuclideanCodebook uses a 1e-5 floor for unused centroids.
                 let count = w
                     .tensor::<1>(&format!("{p}.cluster_usage"))?
+                    .cast(DType::F32)
                     .clamp_min(1e-5)
                     .unsqueeze_dim(1);
-                Ok(sum / count)
+                Ok((sum / count).cast(dtype))
             })
             .collect::<Result<_, Error>>()?;
         Ok(Self {
@@ -63,9 +66,13 @@ struct Snake {
 }
 impl Snake {
     fn load(w: &impl WeightSource, p: &str) -> Result<Self, Error> {
-        let alpha = w.tensor::<1>(&format!("{p}.alpha"))?.exp();
+        let raw_alpha = w.tensor::<1>(&format!("{p}.alpha"))?;
+        let dtype = raw_alpha.dtype();
+        let alpha = raw_alpha.cast(DType::F32).exp().cast(dtype);
         // SnakeBeta specifies a 1e-9 denominator stabilizer.
-        let inverse_beta = (w.tensor::<1>(&format!("{p}.beta"))?.exp() + 1e-9).recip();
+        let inverse_beta = (w.tensor::<1>(&format!("{p}.beta"))?.cast(DType::F32).exp() + 1e-9)
+            .recip()
+            .cast(dtype);
         Ok(Self {
             alpha,
             inverse_beta,
@@ -509,6 +516,73 @@ mod tests {
                 assert_close(&actual, &full, "reference-checkpoint branch");
                 assert_eq!(checkpoint.frames, 8);
             }
+        });
+    }
+
+    #[test]
+    #[ignore = "requires real codec fixtures, pinned official weights and a GPU adapter"]
+    fn fp16_codec_matches_official_waveforms() {
+        futures_lite::future::block_on(async {
+            let source = PathBuf::from(std::env::var_os("DEEPCLONE_BURN_SOURCE").unwrap());
+            let fixture = PathBuf::from(std::env::var_os("DEEPCLONE_BURN_FIXTURES").unwrap());
+            let config: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(source.join("speech_tokenizer/config.json")).unwrap(),
+            )
+            .unwrap();
+            let config: CodecDecoderConfig =
+                serde_json::from_value(config["decoder_config"].clone()).unwrap();
+            let device = Device::wgpu_options().init_async().await.unwrap();
+            let bytes = std::fs::read(source.join("speech_tokenizer/model.safetensors")).unwrap();
+            let weights = Weights::new(&bytes, device.clone(), DType::F16).unwrap();
+            let decoder = CodecDecoder::load(&weights, &config).unwrap();
+            let bytes = std::fs::read(fixture.join("audio-fixtures.safetensors")).unwrap();
+            let data = Weights::new(&bytes, device.clone(), DType::F32).unwrap();
+            let codes = data.indices::<3>("codes.80").unwrap();
+            let [_, groups, frames] = codes.dims();
+            let packed = codes
+                .into_data_async()
+                .await
+                .unwrap()
+                .try_into_vec::<i32>()
+                .unwrap();
+            let mut cache = decoder.cache();
+            for stop in [12, 24, 60, 80] {
+                let prefix: Vec<_> = (0..groups)
+                    .flat_map(|g| packed[g * frames..g * frames + stop].iter().copied())
+                    .collect();
+                let _ = decoder
+                    .prefix(prefix, groups, stop, &mut cache, &device)
+                    .await
+                    .unwrap();
+            }
+            let expected = read(data.tensor::<3>("waveform.80").unwrap())
+                .await
+                .unwrap();
+            let actual = &cache.samples;
+            assert_eq!(actual.len(), expected.len());
+            assert!(
+                actual.iter().all(|v| v.is_finite()),
+                "nonfinite FP16 samples"
+            );
+            let diff_sq: f64 = actual
+                .iter()
+                .zip(&expected)
+                .map(|(&a, &b)| f64::from(a - b).powi(2))
+                .sum();
+            let ref_sq: f64 = expected.iter().map(|&b| f64::from(b).powi(2)).sum();
+            let rel_l2 = (diff_sq / ref_sq).sqrt();
+            let max_abs = actual
+                .iter()
+                .zip(&expected)
+                .map(|(&a, &b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            eprintln!(
+                "FP16 CodecDecoder vs FP32 official (80 frames): rel_l2={rel_l2:.5}, max_abs={max_abs:.5}"
+            );
+            assert!(
+                rel_l2 < 0.02,
+                "FP16 CodecDecoder relative L2 error too high: {rel_l2}"
+            );
         });
     }
 }
