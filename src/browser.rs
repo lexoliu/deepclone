@@ -126,7 +126,7 @@ impl ModelBuilder {
             backend,
             codec,
             Assets {
-                weight_bits: if self.precision == DType::F16 { 16 } else { 32 },
+                weight_bits: self.weights.transformer_weight_bits(),
                 config: serde_json::from_str(config).map_err(error)?,
                 encoder_contract,
                 decoder_contract,
