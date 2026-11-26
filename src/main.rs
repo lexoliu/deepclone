@@ -18,7 +18,7 @@ use std::{convert::Infallible, os::fd::AsFd, time::Duration};
 use std::{
     error::Error,
     fs::File,
-    io::{BufReader, BufWriter, Write},
+    io::{BufReader, BufWriter, Seek, SeekFrom, Write},
     num::NonZeroUsize,
     path::PathBuf,
     process::ExitCode,
@@ -274,6 +274,52 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn ieee_float_wav_uses_standard_header_and_roundtrips() {
+        let path = std::env::temp_dir().join(format!(
+            "deepclone-wav-test-{}-{}.wav",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let expected = [0.0f32, 0.25, -0.5, 0.75, -1.0];
+        let mut writer = super::IeeeFloatWavWriter::create(&path, 24_000).unwrap();
+        writer.write_samples(&expected[..2]).unwrap();
+        writer.write_samples(&expected[2..]).unwrap();
+        writer.finalize().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(bytes.len(), 44 + expected.len() * 4);
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..16], b"WAVEfmt ");
+        assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 16);
+        // Standard WAVE_FORMAT_IEEE_FLOAT (0x0003) instead of WAVE_FORMAT_EXTENSIBLE (0xFFFE).
+        assert_eq!(u16::from_le_bytes(bytes[20..22].try_into().unwrap()), 3);
+        assert_eq!(u16::from_le_bytes(bytes[22..24].try_into().unwrap()), 1);
+        assert_eq!(
+            u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            24_000
+        );
+        assert_eq!(u16::from_le_bytes(bytes[34..36].try_into().unwrap()), 32);
+        assert_eq!(&bytes[36..40], b"data");
+        assert_eq!(
+            u32::from_le_bytes(bytes[40..44].try_into().unwrap()) as usize,
+            expected.len() * 4
+        );
+
+        let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes)).unwrap();
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, 24_000);
+        assert_eq!(spec.bits_per_sample, 32);
+        assert_eq!(spec.sample_format, hound::SampleFormat::Float);
+        let decoded: Vec<f32> = reader.samples::<f32>().map(Result::unwrap).collect();
+        assert_eq!(decoded, expected);
     }
 
     #[test]
@@ -567,6 +613,75 @@ async fn write_pcm<E: Error + 'static>(
     Ok(())
 }
 
+/// Standard 44-byte mono IEEE 754 float WAV writer (`WAVE_FORMAT_IEEE_FLOAT`).
+///
+/// Avoids `hound`'s `WAVE_FORMAT_EXTENSIBLE` header with `SPEAKER_FRONT_LEFT`,
+/// which macOS CoreAudio routes exclusively to the left channel.
+struct IeeeFloatWavWriter {
+    writer: BufWriter<File>,
+    data_bytes: u32,
+}
+
+impl IeeeFloatWavWriter {
+    fn create(path: &std::path::Path, sample_rate: u32) -> std::io::Result<Self> {
+        let mut writer = BufWriter::new(File::create(path)?);
+        let byte_rate = sample_rate.checked_mul(4).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "sample rate overflow")
+        })?;
+        let mut header = [0u8; 44];
+        header[0..4].copy_from_slice(b"RIFF");
+        header[8..12].copy_from_slice(b"WAVE");
+        header[12..16].copy_from_slice(b"fmt ");
+        header[16..20].copy_from_slice(&16u32.to_le_bytes());
+        // RFC 2361 WAVE_FORMAT_IEEE_FLOAT = 0x0003.
+        header[20..22].copy_from_slice(&3u16.to_le_bytes());
+        header[22..24].copy_from_slice(&1u16.to_le_bytes());
+        header[24..28].copy_from_slice(&sample_rate.to_le_bytes());
+        header[28..32].copy_from_slice(&byte_rate.to_le_bytes());
+        header[32..34].copy_from_slice(&4u16.to_le_bytes());
+        header[34..36].copy_from_slice(&32u16.to_le_bytes());
+        header[36..40].copy_from_slice(b"data");
+        writer.write_all(&header)?;
+        Ok(Self {
+            writer,
+            data_bytes: 0,
+        })
+    }
+
+    fn write_samples(&mut self, samples: &[f32]) -> std::io::Result<()> {
+        let added = u32::try_from(samples.len().saturating_mul(4))
+            .ok()
+            .and_then(|bytes| self.data_bytes.checked_add(bytes))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "WAV exceeds 4 GiB RIFF limit",
+                )
+            })?;
+        for &sample in samples {
+            self.writer.write_all(&sample.to_le_bytes())?;
+        }
+        self.writer.flush()?;
+        self.data_bytes = added;
+        Ok(())
+    }
+
+    fn finalize(mut self) -> std::io::Result<()> {
+        let riff_size = self.data_bytes.checked_add(36).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WAV exceeds 4 GiB RIFF limit",
+            )
+        })?;
+        self.writer.flush()?;
+        self.writer.seek(SeekFrom::Start(4))?;
+        self.writer.write_all(&riff_size.to_le_bytes())?;
+        self.writer.seek(SeekFrom::Start(40))?;
+        self.writer.write_all(&self.data_bytes.to_le_bytes())?;
+        self.writer.flush()
+    }
+}
+
 async fn write_audio<I, E>(
     voice: &mut Voice,
     text: I,
@@ -578,26 +693,19 @@ where
     I: Stream<Item = Result<String, E>> + Send + 'static,
     E: Error + Send + 'static,
 {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: voice.sample_rate(),
-        bits_per_sample: 32,
-        sample_format: hound::SampleFormat::Float,
-    };
+    let sample_rate = voice.sample_rate();
     let path = path.to_owned();
     let mut writer =
-        tokio::task::spawn_blocking(move || hound::WavWriter::create(path, spec)).await??;
+        tokio::task::spawn_blocking(move || IeeeFloatWavWriter::create(&path, sample_rate))
+            .await??;
     let mut audio = voice.synthesize(text, language, options).await?;
     let mut samples = 0;
     while let Some(chunk) = audio.next().await {
         let chunk = chunk?;
         samples += chunk.samples.len();
         writer = tokio::task::spawn_blocking(move || {
-            for sample in chunk.samples {
-                writer.write_sample(sample)?;
-            }
-            writer.flush()?;
-            Ok::<_, hound::Error>(writer)
+            writer.write_samples(&chunk.samples)?;
+            Ok::<_, std::io::Error>(writer)
         })
         .await??;
     }
