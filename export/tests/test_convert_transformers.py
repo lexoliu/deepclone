@@ -46,7 +46,7 @@ class ConvertTransformers(unittest.TestCase):
 
         predictor = SimpleNamespace(
             config=predictor_config,
-            small_to_mtp_projection=None,
+            small_to_mtp_projection=torch.nn.Linear(16, 16, bias=True),
             get_input_embeddings=lambda: [pred_emb],
             model=SimpleNamespace(
                 layers=[Qwen3TTSTalkerDecoderLayer(predictor_config, 0)],
@@ -87,7 +87,11 @@ class ConvertTransformers(unittest.TestCase):
         def fake_convert(
             module, inputs, names, outputs, path, weight_bits, states=(), shapes=None
         ):
-            recorded[Path(path).name] = weight_bits
+            recorded[Path(path).name] = (
+                weight_bits,
+                inputs[0].dtype,
+                next(module.parameters()).dtype,
+            )
             Path(path).mkdir(parents=True, exist_ok=True)
             Path(path).with_suffix(".json").write_text(
                 json.dumps({"weight_bits": weight_bits})
@@ -111,9 +115,13 @@ class ConvertTransformers(unittest.TestCase):
                 resume=False,
                 host_tables=True,
             )
-            self.assertEqual(recorded["text-embedding.mlmodelc"], 16)
-            self.assertEqual(recorded["talker-0.mlmodelc"], 8)
-            self.assertEqual(recorded["predictor-0.mlmodelc"], 8)
+            self.assertEqual(recorded["text-embedding.mlmodelc"][0], 16)
+            self.assertEqual(
+                recorded["predictor-projection.mlmodelc"],
+                (16, torch.float32, torch.float32),
+            )
+            self.assertEqual(recorded["talker-0.mlmodelc"][0], 8)
+            self.assertEqual(recorded["predictor-0.mlmodelc"][0], 8)
 
             # Resume verifies each component against its own expected precision.
             recorded.clear()
