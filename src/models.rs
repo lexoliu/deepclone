@@ -22,11 +22,11 @@ use std::path::PathBuf;
 /// ```
 pub const fn qwen3_tts_0_6b() -> Bundle<'static> {
     Bundle::new(Pin {
-        url: "https://huggingface.co/lexoliu/deepclone-qwen3-tts-coreml/resolve/0f399e630142b43580bb63e18ede1f89627a836e/qwen3-tts-0.6b-coreml-realtime.tar.zst",
+        url: "https://huggingface.co/lexoliu/deepclone-qwen3-tts-coreml/resolve/a38187efd44473d94dc662c577f665255069b123/qwen3-tts-0.6b-coreml-realtime.tar.zst",
         sha256: Sha256::from_hex(
-            "b921fbee529ddc6d85cead0c37b3676f2d2ed5721f49020d11473c665a601f96",
+            "7292fbb71460cbe96c76413a4bc2e4186caddf3886c5616bfeae27e04421cfbd",
         ),
-        size: 1_493_078_943,
+        size: 1_493_030_289,
         kind: Archive,
     })
 }

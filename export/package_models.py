@@ -27,9 +27,12 @@ def inputs(transformers, audio):
         components.append(manifest["tables"])
     if manifest["predictor_projection"]:
         components.append(manifest["predictor_projection"])
+    batched_transformers = False
     for decoder in manifest["decoders"].values():
         components.extend(decoder["chunks"])
         components.extend(decoder["heads"])
+        if any(length > 1 for length in decoder.get("sequence_lengths", [])):
+            batched_transformers = True
     selected = {
         "transformers": (
             transformers,
@@ -46,10 +49,17 @@ def inputs(transformers, audio):
         metadata = json.loads((audio / contract).read_text())
         if metadata["compute_precision"] != precision:
             raise ValueError(f"{component} must use {precision}")
-        if component == "decoder" and metadata.get("execution") != "stateful_frame":
-            raise ValueError(
-                "Published waveform decoder must use stateful_frame execution"
-            )
+        if component == "decoder":
+            if metadata.get("execution") != "stateful_frame":
+                raise ValueError(
+                    "Published waveform decoder must use stateful_frame execution"
+                )
+            if batched_transformers and not any(
+                frames > 1 for frames in metadata.get("batch_frames", [])
+            ):
+                raise ValueError(
+                    "Batched transformer exports require a batched waveform decoder"
+                )
         selected["audio"][1].extend([contract, f"{component}.mlmodelc"])
     files = {}
     for prefix, (root, names) in selected.items():

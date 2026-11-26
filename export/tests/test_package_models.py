@@ -60,11 +60,37 @@ class Packaging(unittest.TestCase):
                     b"fixture weights",
                 )
             manifest["weight_bits"] = 8
+            manifest["decoders"] = {
+                "talker": {"chunks": [], "heads": [], "sequence_lengths": [1, 16]}
+            }
             (transformers / "transformers.json").write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "batched waveform decoder"):
+                inputs(transformers, audio)
+            (audio / "decoder.contract.json").write_text(
+                json.dumps(
+                    {
+                        "compute_precision": "fp16",
+                        "execution": "stateful_frame",
+                        "batch_frames": [1],
+                    }
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "batched waveform decoder"):
+                inputs(transformers, audio)
+            (audio / "decoder.contract.json").write_text(
+                json.dumps(
+                    {
+                        "compute_precision": "fp16",
+                        "execution": "stateful_frame",
+                        "batch_frames": [1, 4, 12],
+                    }
+                )
+            )
             self.assertIn(
                 "transformers/embedding.mlmodelc/weight.bin",
                 inputs(transformers, audio),
             )
+            manifest["decoders"] = {}
             manifest["weight_bits"] = 4
             (transformers / "transformers.json").write_text(json.dumps(manifest))
             with self.assertRaisesRegex(ValueError, "8-bit or 16-bit"):
