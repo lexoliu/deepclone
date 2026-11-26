@@ -15,8 +15,8 @@ def digest(path):
 
 def inputs(transformers, audio):
     manifest = json.loads((transformers / "transformers.json").read_text())
-    if manifest["weight_bits"] != 16:
-        raise ValueError("Published transformer weights must be FP16")
+    if manifest["weight_bits"] not in (8, 16):
+        raise ValueError("Published transformer weights must be 8-bit or 16-bit")
     components = [
         manifest["text_embedding"],
         *manifest.get("codec_embeddings", []),
