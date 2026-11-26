@@ -500,6 +500,38 @@ impl DecodePlan {
             blocks,
         })
     }
+    pub(crate) fn reference_warmup(
+        contract: &AudioContract,
+        codes: &AcousticCodes,
+    ) -> Result<Option<Self>, Error> {
+        let end = codes.reference_frames;
+        let context = codec_context_start(end);
+        if end == context {
+            return Ok(None);
+        }
+        let groups = codes.groups.get();
+        if groups != contract.code_groups {
+            return Err(Error::Contract(
+                "code group count differs from waveform decoder",
+            ));
+        }
+        if contract.capacity < CODEC_CAPACITY {
+            return Err(Error::Contract(
+                "waveform decoder capacity must cover 300 frames and 25 context frames",
+            ));
+        }
+        Ok(Some(Self {
+            sample_rate: contract.sample_rate,
+            start_sample: 0,
+            capacity: contract.capacity,
+            groups,
+            samples_per_frame: contract.samples_per_frame,
+            blocks: vec![DecodeBlock {
+                codes: codes.values[context * groups..end * groups].to_vec(),
+                discard_frames: end - context,
+            }],
+        }))
+    }
     pub(crate) async fn decode(self, codec: &mut impl Codec) -> Result<AudioChunk, Error> {
         let mut samples = Vec::new();
         for block in self.blocks {
@@ -798,6 +830,9 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> CodeSession<'_, B, T, S> {
             }
         }
         Ok(true)
+    }
+    pub(crate) fn reference_warmup(&self) -> Result<Option<DecodePlan>, Error> {
+        DecodePlan::reference_warmup(self.decoder_contract, &self.codes)
     }
     pub(crate) async fn next_plan(
         &mut self,

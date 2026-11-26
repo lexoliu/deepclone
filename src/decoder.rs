@@ -27,9 +27,14 @@ pub enum Error {
 /// native storage between chunks. Reset starts another independent sequence.
 pub struct Decoder {
     chunks: Vec<Session>,
-    frequencies: Vec<f32>,
-    mask: Vec<f16>,
+    cos_values: Vec<f16>,
+    sin_values: Vec<f16>,
+    step_cosines: Vec<Tensor<f16>>,
+    step_sines: Vec<Tensor<f16>>,
+    step_masks: Vec<Tensor<f16>>,
     hidden_size: usize,
+    head_dim: usize,
+    capacity: usize,
     #[cfg(feature = "inference")]
     sequence_lengths: BatchSizes,
     position: Option<usize>,
@@ -117,14 +122,49 @@ impl Decoder {
                 return Err(Error::Contract("chunk output must match hidden input"));
             }
         }
-        let frequencies = (0..head_dim / 2)
+        let half = head_dim / 2;
+        let frequencies: Vec<f32> = (0..half)
             .map(|index| rope_theta.powf(-((2 * index) as f32) / head_dim as f32))
             .collect();
+        let mut cos_values = Vec::with_capacity(half * capacity);
+        let mut sin_values = Vec::with_capacity(half * capacity);
+        for &frequency in &frequencies {
+            for index in 0..capacity {
+                let (sine, cosine) = (frequency * index as f32).sin_cos();
+                cos_values.push(f16::from_f32(cosine));
+                sin_values.push(f16::from_f32(sine));
+            }
+        }
+        let mut step_cosines = Vec::with_capacity(capacity);
+        let mut step_sines = Vec::with_capacity(capacity);
+        let mut step_masks = Vec::with_capacity(capacity);
+        let mut cos_buf = Vec::with_capacity(head_dim);
+        let mut sin_buf = Vec::with_capacity(head_dim);
+        let mut mask_buf = vec![f16::MIN; capacity];
+        for pos in 0..capacity {
+            cos_buf.clear();
+            sin_buf.clear();
+            for freq in 0..half {
+                cos_buf.push(cos_values[freq * capacity + pos]);
+                sin_buf.push(sin_values[freq * capacity + pos]);
+            }
+            cos_buf.extend_from_within(..);
+            sin_buf.extend_from_within(..);
+            step_cosines.push(Tensor::from_slice(&[1, 1, head_dim, 1], &cos_buf)?);
+            step_sines.push(Tensor::from_slice(&[1, 1, head_dim, 1], &sin_buf)?);
+            mask_buf[capacity - pos - 1] = f16::ZERO;
+            step_masks.push(Tensor::from_slice(&[1, 1, 1, capacity], &mask_buf)?);
+        }
         Ok(Self {
             chunks: functions.into_iter().map(Function::into_session).collect(),
-            frequencies,
-            mask: vec![f16::MIN; capacity],
+            cos_values,
+            sin_values,
+            step_cosines,
+            step_sines,
+            step_masks,
             hidden_size,
+            head_dim,
+            capacity,
             #[cfg(feature = "inference")]
             sequence_lengths,
             position: Some(0),
@@ -137,13 +177,12 @@ impl Decoder {
         self.position
     }
     pub fn capacity(&self) -> usize {
-        self.mask.len()
+        self.capacity
     }
     pub fn reset(&mut self) {
         for chunk in &mut self.chunks {
             chunk.reset();
         }
-        self.mask.fill(f16::MIN);
         self.position = Some(0);
     }
     /// Advance once. An inference failure invalidates this sequence: reset
@@ -205,40 +244,46 @@ impl Decoder {
     }
     fn span(&mut self, mut hidden: Tensor<f16>, length: usize) -> Result<Tensor<f16>, Error> {
         let position = self.position.ok_or(Error::InvalidState)?;
-        if length > self.capacity() - position {
-            return Err(Error::ContextExhausted(self.capacity()));
+        let capacity = self.capacity;
+        if length > capacity - position {
+            return Err(Error::ContextExhausted(capacity));
         }
         if hidden.shape() != [1, self.hidden_size, 1, length] {
             return Err(Error::Contract(
                 "token embedding shape disagrees with decoder",
             ));
         }
-        let mut cosines = Vec::with_capacity(self.frequencies.len() * 2 * length);
-        let mut sines = Vec::with_capacity(self.frequencies.len() * 2 * length);
-        for frequency in &self.frequencies {
-            for index in position..position + length {
-                let (sine, cosine) = (frequency * index as f32).sin_cos();
-                cosines.push(f16::from_f32(cosine));
-                sines.push(f16::from_f32(sine));
-            }
-        }
-        cosines.extend_from_within(..);
-        sines.extend_from_within(..);
-        let shape = [1, 1, self.frequencies.len() * 2, length];
-        let cosine = Tensor::from_slice(&shape, &cosines)?;
-        let sine = Tensor::from_slice(&shape, &sines)?;
-        let capacity = self.capacity();
-        self.mask[capacity - position - length..capacity - position].fill(f16::ZERO);
-        let mask = if length == 1 {
-            Tensor::from_slice(&[1, 1, 1, capacity], &self.mask)?
+        let batch_tensors;
+        let (cosine, sine, mask): (&Tensor<f16>, &Tensor<f16>, &Tensor<f16>) = if length == 1 {
+            (
+                &self.step_cosines[position],
+                &self.step_sines[position],
+                &self.step_masks[position],
+            )
         } else {
+            let half = self.head_dim / 2;
+            let mut cosines = Vec::with_capacity(self.head_dim * length);
+            let mut sines = Vec::with_capacity(self.head_dim * length);
+            for freq in 0..half {
+                let start = freq * capacity + position;
+                cosines.extend_from_slice(&self.cos_values[start..start + length]);
+                sines.extend_from_slice(&self.sin_values[start..start + length]);
+            }
+            cosines.extend_from_within(..);
+            sines.extend_from_within(..);
+            let shape = [1, 1, self.head_dim, length];
             let mut values = vec![f16::MIN; length * capacity];
             for index in 0..length {
                 values[index * capacity + capacity - position - length
                     ..index * capacity + capacity - length + index + 1]
                     .fill(f16::ZERO);
             }
-            Tensor::from_slice(&[1, 1, length, capacity], &values)?
+            batch_tensors = (
+                Tensor::from_slice(&shape, &cosines)?,
+                Tensor::from_slice(&shape, &sines)?,
+                Tensor::from_slice(&[1, 1, length, capacity], &values)?,
+            );
+            (&batch_tensors.0, &batch_tensors.1, &batch_tensors.2)
         };
         // Prevent accidental continuation after a partially completed chain.
         let next_position = position + length;
@@ -246,9 +291,9 @@ impl Decoder {
         for (index, chunk) in self.chunks.iter_mut().enumerate() {
             let mut inputs = Inputs::new();
             inputs.insert("hidden", &hidden)?;
-            inputs.insert("cosine", &cosine)?;
-            inputs.insert("sine", &sine)?;
-            inputs.insert("mask", &mask)?;
+            inputs.insert("cosine", cosine)?;
+            inputs.insert("sine", sine)?;
+            inputs.insert("mask", mask)?;
             hidden = chunk
                 .predict(&inputs)
                 .map_err(|source| Error::Prediction {

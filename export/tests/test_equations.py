@@ -9,7 +9,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from audio_models import CausalConv, CausalTranspose
-from transformer import Projection, RmsNorm, gated_silu
+from transformer import MLP_GATE_SCALE, Projection, RmsNorm, gated_silu
 
 
 class Equations(unittest.TestCase):
@@ -84,6 +84,16 @@ class Equations(unittest.TestCase):
         gate = torch.linspace(-20, 20, 1024)
         up = torch.cos(gate)
         torch.testing.assert_close(gated_silu(gate, up), F.silu(gate) * up)
+        torch.testing.assert_close(
+            gated_silu(gate, up, MLP_GATE_SCALE) * MLP_GATE_SCALE,
+            F.silu(gate) * up,
+        )
+        extreme_gate = torch.tensor([333.2, -333.2], dtype=torch.float16)
+        extreme_up = torch.tensor([416.8, 416.8], dtype=torch.float16)
+        scaled = gated_silu(extreme_gate, extreme_up, MLP_GATE_SCALE)
+        self.assertTrue(torch.isfinite(scaled).all())
+        expected = (F.silu(extreme_gate.float()) * extreme_up.float()) / MLP_GATE_SCALE
+        torch.testing.assert_close(scaled.float(), expected, rtol=2e-3, atol=1e-2)
 
 
 if __name__ == "__main__":
