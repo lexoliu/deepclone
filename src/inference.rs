@@ -500,6 +500,7 @@ impl DecodePlan {
             blocks,
         })
     }
+    #[cfg(all(feature = "streaming", not(target_arch = "wasm32")))]
     pub(crate) fn reference_warmup(
         contract: &AudioContract,
         codes: &AcousticCodes,
@@ -831,6 +832,7 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> CodeSession<'_, B, T, S> {
         }
         Ok(true)
     }
+    #[cfg(all(feature = "streaming", not(target_arch = "wasm32")))]
     pub(crate) fn reference_warmup(&self) -> Result<Option<DecodePlan>, Error> {
         DecodePlan::reference_warmup(self.decoder_contract, &self.codes)
     }
