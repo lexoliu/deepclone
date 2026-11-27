@@ -138,6 +138,7 @@ export interface WasmBuilder {
   free(): void;
 }
 export interface WasmManifest {
+  js: string;
   url: string;
 }
 export interface WasmModule {

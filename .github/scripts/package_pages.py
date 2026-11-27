@@ -14,15 +14,24 @@ PAGES_MAX_FILE_BYTES = 25 * 1024 * 1024
 
 
 def package_pages(dist: Path, wasm_out: Path, assets_origin: str) -> dict[str, str]:
-    wasm_source = dist / "wasm" / "deepclone_bg.wasm"
+    wasm_dir = dist / "wasm"
+    wasm_source = wasm_dir / "deepclone_bg.wasm"
     if not wasm_source.is_file() or wasm_source.stat().st_size == 0:
         raise ValueError(f"Missing browser WebAssembly binary: {wasm_source}")
+    js_source = wasm_dir / "deepclone.js"
+    if not js_source.is_file() or js_source.stat().st_size == 0:
+        raise ValueError(f"Missing browser WebAssembly JS glue: {js_source}")
 
     headers_file = dist / "_headers"
     if not headers_file.is_file():
         raise ValueError(f"Missing Cloudflare Pages _headers file: {headers_file}")
     headers_text = headers_file.read_text(encoding="utf-8")
-    for required in ("Content-Security-Policy:", "Permissions-Policy:"):
+    for required in (
+        "Content-Security-Policy:",
+        "Permissions-Policy:",
+        "/wasm.json",
+        "/wasm/*",
+    ):
         if required not in headers_text:
             raise ValueError(f"_headers omits {required}")
 
@@ -32,16 +41,28 @@ def package_pages(dist: Path, wasm_out: Path, assets_origin: str) -> dict[str, s
     object_key = f"wasm/{filename}"
     public_url = f"{assets_origin.rstrip('/')}/{object_key}"
 
+    js_digest = hashlib.sha256(js_source.read_bytes()).hexdigest()
+    js_filename = f"deepclone-{js_digest[:16]}.js"
+    js_url = f"/wasm/{js_filename}"
+
     wasm_out.mkdir(parents=True, exist_ok=True)
     shutil.move(str(wasm_source), str(wasm_out / filename))
+    shutil.move(str(js_source), str(wasm_dir / js_filename))
 
     for unused_types in ("deepclone.d.ts", "deepclone_bg.wasm.d.ts"):
-        candidate = dist / "wasm" / unused_types
+        candidate = wasm_dir / unused_types
         if candidate.exists():
             candidate.unlink()
 
+    remaining_wasm_files = sorted(path.name for path in wasm_dir.iterdir())
+    if remaining_wasm_files != [js_filename]:
+        raise ValueError(
+            f"Unexpected files remain in Pages wasm directory: {remaining_wasm_files}"
+        )
+
     (dist / "wasm.json").write_text(
-        json.dumps({"url": public_url}, indent=2) + "\n", encoding="utf-8"
+        json.dumps({"js": js_url, "url": public_url}, indent=2) + "\n",
+        encoding="utf-8",
     )
 
     for path in sorted(dist.rglob("*")):
@@ -60,6 +81,8 @@ def package_pages(dist: Path, wasm_out: Path, assets_origin: str) -> dict[str, s
         "key": object_key,
         "sha256": digest,
         "url": public_url,
+        "js": js_url,
+        "js_sha256": js_digest,
     }
     (wasm_out / "metadata.json").write_text(
         json.dumps(metadata, indent=2) + "\n", encoding="utf-8"

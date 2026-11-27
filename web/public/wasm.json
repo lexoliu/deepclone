@@ -1,3 +1,4 @@
 {
+  "js": "/wasm/deepclone.js",
   "url": "/wasm/deepclone_bg.wasm"
 }

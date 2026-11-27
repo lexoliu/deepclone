@@ -163,16 +163,23 @@ async function execute(command: Command): Promise<void> {
         }
         loadedPackage = undefined;
         if (!module) {
-          const url = "/wasm/deepclone.js";
-          const [loaded, wasmResponse] = await Promise.all([
-            import(/* @vite-ignore */ url) as Promise<WasmModule>,
-            fetch("/wasm.json", { signal: operation.signal }),
-          ]);
+          const wasmResponse = await fetch("/wasm.json", {
+            cache: "no-cache",
+            signal: operation.signal,
+          });
           if (!wasmResponse.ok)
             throw new Error("WebAssembly configuration could not be loaded.");
           const wasmManifest = (await wasmResponse.json()) as WasmManifest;
-          if (typeof wasmManifest.url !== "string" || !wasmManifest.url)
+          if (
+            typeof wasmManifest.js !== "string" ||
+            !wasmManifest.js ||
+            typeof wasmManifest.url !== "string" ||
+            !wasmManifest.url
+          )
             throw new Error("Invalid WebAssembly configuration.");
+          const loaded = (await import(
+            /* @vite-ignore */ wasmManifest.js
+          )) as WasmModule;
           await loaded.default({ module_or_path: wasmManifest.url });
           module = loaded;
         }
