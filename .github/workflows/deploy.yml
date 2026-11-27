@@ -1,0 +1,90 @@
+name: deploy
+on:
+  workflow_run:
+    workflows: [ci]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: deploy-pages
+  cancel-in-progress: false
+jobs:
+  pages:
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      deployments: write
+    steps:
+      - name: Resolve verified CI artifact on main
+        id: source
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+        run: |
+          main_sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq '.sha')
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            if [ "$RUN_REPO" != "$GITHUB_REPOSITORY" ] || [ "$RUN_SHA" != "$main_sha" ]; then
+              echo "deploy=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            run_id="$RUN_ID"
+            target_sha="$RUN_SHA"
+          else
+            run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --branch main --event push --status success --commit "$main_sha" --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+            if [ -z "$run_id" ]; then
+              echo "No successful CI run found for main (${main_sha})." >&2
+              exit 1
+            fi
+            target_sha="$main_sha"
+          fi
+          {
+            echo "deploy=true"
+            echo "run_id=${run_id}"
+            echo "sha=${target_sha}"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: steps.source.outputs.deploy == 'true'
+        with:
+          ref: ${{ steps.source.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        if: steps.source.outputs.deploy == 'true'
+        with:
+          name: deepclone-browser
+          run-id: ${{ steps.source.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: dist
+      - name: Prepare Cloudflare Pages and R2 bundles
+        if: steps.source.outputs.deploy == 'true'
+        run: python3 .github/scripts/package_pages.py prepare --dist dist --wasm-out wasm-r2 --assets-origin https://assets.deepclone.lexo.cool
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        if: steps.source.outputs.deploy == 'true'
+        with:
+          bun-version: 1.4.2
+      - name: Publish Wasm to R2 and deploy Cloudflare Pages
+        if: steps.source.outputs.deploy == 'true'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TARGET_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          key=$(jq -er '.key' wasm-r2/metadata.json)
+          file="wasm-r2/$(jq -er '.file' wasm-r2/metadata.json)"
+          bunx wrangler@4.143.1 r2 object put "deepclone/${key}" \
+            --file "$file" \
+            --content-type "application/wasm" \
+            --cache-control "public, max-age=31536000, immutable" \
+            --remote
+          bunx wrangler@4.143.1 pages deploy dist \
+            --project-name deepclone \
+            --branch main \
+            --commit-hash "$TARGET_SHA"
+          python3 .github/scripts/package_pages.py prune --bucket deepclone --active-key "$key"

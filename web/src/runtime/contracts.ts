@@ -58,8 +58,11 @@ export interface WasmBuilder {
   ): WasmVoice;
   free(): void;
 }
+export interface WasmManifest {
+  url: string;
+}
 export interface WasmModule {
-  default(): Promise<unknown>;
+  default(options?: { module_or_path: string }): Promise<unknown>;
   BrowserRuntime: { create(configuration: string): Promise<WasmRuntime> };
   TextInput: new (capacity: number) => WasmInput;
 }
