@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import type {
-  Command,
-  Event,
-  ModelEntry,
-  SavedConditioning,
+import {
+  isCurrentConditioning,
+  type Command,
+  type Event,
+  type ModelEntry,
+  type SavedConditioning,
 } from "./contracts";
 import { Player, referenceAudio } from "./audio";
 
@@ -298,7 +299,10 @@ export function useVoice(referenceReady = true, hasCachedConditioning = false) {
     >;
     timing.current = times;
     try {
-      const skipInitialVoice = !savedConditioning;
+      const validConditioning = isCurrentConditioning(savedConditioning)
+        ? savedConditioning
+        : undefined;
+      const skipInitialVoice = !validConditioning;
       if (!worker.current) initializeWorker(true, skipInitialVoice);
       const previous = player.current;
       const active = new Player();
@@ -318,7 +322,7 @@ export function useVoice(referenceReady = true, hasCachedConditioning = false) {
       if (samples) {
         reference.current = null;
         let currentSamples = samples;
-        let activeConditioning = savedConditioning;
+        let activeConditioning = validConditioning;
         const firstConditioned = wait("conditioned");
         send(
           {

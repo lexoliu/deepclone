@@ -1,15 +1,17 @@
 /// <reference lib="webworker" />
-import type {
-  Command,
-  Event,
-  Manifest,
-  ModelEntry,
-  SavedConditioning,
-  WasmInput,
-  WasmManifest,
-  WasmModule,
-  WasmRuntime,
-  WasmVoice,
+import {
+  REFERENCE_AUDIO_VERSION,
+  isCurrentConditioning,
+  type Command,
+  type Event,
+  type Manifest,
+  type ModelEntry,
+  type SavedConditioning,
+  type WasmInput,
+  type WasmManifest,
+  type WasmModule,
+  type WasmRuntime,
+  type WasmVoice,
 } from "./contracts";
 import {
   TEXT_EMBEDDING_TENSOR,
@@ -114,6 +116,7 @@ async function extractConditioning(
     }
     return {
       modelSha256: pkg.entry.sha256,
+      audioVersion: REFERENCE_AUDIO_VERSION,
       speaker: extracted.speaker,
       speakerShape: [
         extracted.speakerShape[0]!,
@@ -253,7 +256,10 @@ async function execute(command: Command): Promise<void> {
       operation = new AbortController();
       try {
         const cached = command.conditioning;
-        if (cached && cached.modelSha256 === loadedPackage.entry.sha256) {
+        if (
+          isCurrentConditioning(cached) &&
+          cached.modelSha256 === loadedPackage.entry.sha256
+        ) {
           if (!voice) {
             if (!runtime) {
               const response = await fetch("/runtime.json", {
