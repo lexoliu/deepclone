@@ -3,6 +3,7 @@ import {
   COPY,
   LANGUAGES,
   detectBrowserLanguage,
+  detectSynthesisLanguage,
   resolveLanguage,
 } from "./i18n";
 
@@ -62,4 +63,37 @@ test("browser language detection maps regional tags and falls back to English", 
   expect(detectBrowserLanguage(["nl-NL", "sv-SE"])).toBe("English");
   expect(resolveLanguage("Russian")).toBe("Russian");
   expect(resolveLanguage("Unknown")).toBe("English");
+});
+
+test("detectSynthesisLanguage resolves script languages and falls back to auto on mixed or cross-lingual Latin prompts", () => {
+  expect(
+    detectSynthesisLanguage("你好很高兴见到你，这是一个测试", "Chinese"),
+  ).toBe("Chinese");
+  expect(detectSynthesisLanguage("你好，这是 WebGPU 测试", "Chinese")).toBe(
+    "Chinese",
+  );
+  expect(detectSynthesisLanguage("こんにちは、テストです。", "Chinese")).toBe(
+    "Japanese",
+  );
+  expect(detectSynthesisLanguage("안녕하세요, 테스트입니다.", "Chinese")).toBe(
+    "Korean",
+  );
+  expect(detectSynthesisLanguage("Привет, это тест.", "English")).toBe(
+    "Russian",
+  );
+  expect(detectSynthesisLanguage("Hello, this is a test.", "English")).toBe(
+    "English",
+  );
+  expect(detectSynthesisLanguage("Bonjour tout le monde.", "French")).toBe(
+    "French",
+  );
+  expect(detectSynthesisLanguage("Hello, this is a test.", "Chinese")).toBe(
+    "auto",
+  );
+  expect(
+    detectSynthesisLanguage(
+      "法律让人安心。規則への信頼。규칙에 대한 신뢰.",
+      "Chinese",
+    ),
+  ).toBe("auto");
 });

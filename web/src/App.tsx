@@ -20,6 +20,7 @@ import {
   COPY,
   LANGUAGES,
   detectBrowserLanguage,
+  detectSynthesisLanguage,
   resolveLanguage,
   type LanguageId,
 } from "./i18n";
@@ -98,7 +99,7 @@ export default function App() {
       file,
       transcript,
       text,
-      "auto",
+      detectSynthesisLanguage(text, activeLanguage),
       savedConditioning,
       (conditioning) =>
         reference.saveConditioning(file, transcript, conditioning),

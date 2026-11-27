@@ -552,7 +552,7 @@ test("background preparation stays usable, reuses conditioning, re-conditions on
                 kind: "conditioned",
                 conditioning: {
                   modelSha256: "0".repeat(64),
-                  audioVersion: 2,
+                  audioVersion: 3,
                   speaker: new Float32Array([0.5]),
                   speakerShape: [1, 1, 1],
                   codes: new Uint32Array([1, 2]),
@@ -859,9 +859,10 @@ test("legacy cached conditioning is ignored and quiet stereo-with-silent-channel
               transcript,
               source: "record",
               language: "Chinese",
-              // Legacy conditioning lacks audioVersion and must trigger re-extraction.
+              // Legacy conditioning from an older audioVersion must trigger re-extraction.
               conditioning: {
                 modelSha256: "0".repeat(64),
+                audioVersion: 2,
                 speaker: new Float32Array([0.1]),
                 speakerShape: [1, 1, 1],
                 codes: new Uint32Array([1, 2]),
@@ -923,7 +924,7 @@ test("legacy cached conditioning is ignored and quiet stereo-with-silent-channel
                 kind: "conditioned",
                 conditioning: {
                   modelSha256: "0".repeat(64),
-                  audioVersion: 2,
+                  audioVersion: 3,
                   speaker: new Float32Array([0.5]),
                   speakerShape: [1, 1, 1],
                   codes: new Uint32Array([1, 2]),
@@ -935,6 +936,10 @@ test("legacy cached conditioning is ignored and quiet stereo-with-silent-channel
           return;
         }
         if (command.kind === "start") {
+          Object.assign(window, {
+            receivedLanguage:
+              (command as { language?: string }).language ?? null,
+          });
           this.onmessage?.(
             new MessageEvent("message", { data: { kind: "started" } }),
           );
@@ -981,7 +986,7 @@ test("legacy cached conditioning is ignored and quiet stereo-with-silent-channel
   );
 
   await page.goto("/");
-  await page.getByTestId("prompt-input").fill(CJK_SAMPLE);
+  await page.getByTestId("prompt-input").fill("你好很高兴见到你，这是一个测试");
   await page.getByTestId("synthesize-button").click();
   await expect(page.getByTestId("download-wav")).toBeVisible();
 
@@ -992,6 +997,7 @@ test("legacy cached conditioning is ignored and quiet stereo-with-silent-channel
       receivedSampleCount: number;
       receivedRms: number;
       receivedPeak: number;
+      receivedLanguage?: string | null;
     };
     return {
       initialSkipVoice: w.initialSkipVoice,
@@ -999,14 +1005,16 @@ test("legacy cached conditioning is ignored and quiet stereo-with-silent-channel
       receivedSampleCount: w.receivedSampleCount,
       receivedRms: w.receivedRms,
       receivedPeak: w.receivedPeak,
+      receivedLanguage: w.receivedLanguage ?? null,
     };
   });
   expect(observed.initialSkipVoice).toBe(true);
   expect(observed.receivedConditioning).toBeNull();
   expect(observed.receivedSampleCount).toBe(12000);
-  expect(observed.receivedRms).toBeGreaterThan(0.065);
-  expect(observed.receivedRms).toBeLessThan(0.095);
+  expect(observed.receivedRms).toBeGreaterThan(0.04);
+  expect(observed.receivedRms).toBeLessThan(0.06);
   expect(observed.receivedPeak).toBeLessThanOrEqual(0.895);
+  expect(observed.receivedLanguage).toBe("Chinese");
 });
 
 test("generated audio history persists across reloads and supports downloading, single delete, and clear all", async ({
@@ -1033,7 +1041,7 @@ test("generated audio history persists across reloads and supports downloading, 
                 kind: "conditioned",
                 conditioning: {
                   modelSha256: "0".repeat(64),
-                  audioVersion: 2,
+                  audioVersion: 3,
                   speaker: new Float32Array([0.5]),
                   speakerShape: [1, 1, 1],
                   codes: new Uint32Array([1, 2]),
@@ -1045,6 +1053,10 @@ test("generated audio history persists across reloads and supports downloading, 
           return;
         }
         if (command.kind === "start") {
+          Object.assign(window, {
+            receivedLanguage:
+              (command as { language?: string }).language ?? null,
+          });
           this.onmessage?.(
             new MessageEvent("message", { data: { kind: "started" } }),
           );
@@ -1163,4 +1175,81 @@ test("generated audio history persists across reloads and supports downloading, 
   await expect(page.getByTestId("history-section")).toHaveCount(0);
   await page.reload();
   await expect(page.getByTestId("history-section")).toHaveCount(0);
+});
+
+test("reference recorder requests stereo with noise suppression and AGC and saves lossless WAV", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const original = navigator.mediaDevices.getUserMedia.bind(
+      navigator.mediaDevices,
+    );
+    navigator.mediaDevices.getUserMedia = async (
+      constraints?: MediaStreamConstraints,
+    ) => {
+      Object.assign(window, { capturedConstraints: constraints });
+      return original(constraints);
+    };
+  });
+  await page.goto("/");
+  await page.getByTestId("lang-Chinese").click();
+  await page.getByTestId("continue-step-2").click();
+  await page.getByTestId("start-recording").click();
+  await expect(
+    page.getByRole("status").filter({ hasText: /录音中 · (0\.[3-9]|[1-9])/ }),
+  ).toBeVisible();
+  await page.getByTestId("stop-recording").click();
+  await expect(page.getByTestId("review-audio")).toBeVisible();
+  await page.getByTestId("complete-setup").click();
+  await expect(page.getByTestId("prompt-input")).toBeVisible();
+
+  const recorded = await page.evaluate(async () => {
+    const constraints = (
+      window as unknown as { capturedConstraints?: MediaStreamConstraints }
+    ).capturedConstraints;
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const req = indexedDB.open("deepclone-voices");
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    try {
+      const saved = await new Promise<{ file: File }>((resolve, reject) => {
+        const req = db
+          .transaction("reference", "readonly")
+          .objectStore("reference")
+          .get("selected");
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+      const buf = await saved.file.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      const view = new DataView(buf);
+      return {
+        audioConstraints: constraints?.audio,
+        name: saved.file.name,
+        type: saved.file.type,
+        size: saved.file.size,
+        riff: String.fromCharCode(...bytes.slice(0, 4)),
+        wave: String.fromCharCode(...bytes.slice(8, 12)),
+        channels: view.getUint16(22, true),
+        sampleRate: view.getUint32(24, true),
+      };
+    } finally {
+      db.close();
+    }
+  });
+
+  expect(recorded.audioConstraints).toEqual({
+    channelCount: { ideal: 2 },
+    noiseSuppression: true,
+    autoGainControl: true,
+    echoCancellation: false,
+  });
+  expect(recorded.name).toBe("my-voice.wav");
+  expect(recorded.type).toBe("audio/wav");
+  expect(recorded.riff).toBe("RIFF");
+  expect(recorded.wave).toBe("WAVE");
+  expect(recorded.channels).toBeGreaterThanOrEqual(1);
+  expect(recorded.channels).toBeLessThanOrEqual(2);
+  expect(recorded.size).toBeGreaterThan(4096);
 });

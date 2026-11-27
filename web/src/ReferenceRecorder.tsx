@@ -1,6 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { CheckIcon, ReloadIcon, StopIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
+import {
+  RECORDING_AUDIO_CONSTRAINTS,
+  startMicRecorder,
+  type ActiveRecording,
+} from "@/runtime/recorder";
 import { COPY, LANGUAGES, type LanguageId } from "./i18n";
 
 function MicWaveIcon() {
@@ -45,8 +50,7 @@ export function ReferenceRecorder({
   >(null);
   const [preview, setPreview] = useState<string | null>(null);
   const [seconds, setSeconds] = useState(0);
-  const recorder = useRef<MediaRecorder | null>(null);
-  const stream = useRef<MediaStream | null>(null);
+  const recorder = useRef<ActiveRecording | null>(null);
   const recorded = useRef<File | null>(null);
   const url = useRef<string | null>(null);
   const alive = useRef(true);
@@ -73,9 +77,8 @@ export function ReferenceRecorder({
     alive.current = true;
     return () => {
       alive.current = false;
-      const active = recorder.current;
-      if (active && active.state !== "inactive") active.stop();
-      stream.current?.getTracks().forEach((track) => track.stop());
+      recorder.current?.abort();
+      recorder.current = null;
       if (url.current) URL.revokeObjectURL(url.current);
     };
   }, []);
@@ -94,81 +97,41 @@ export function ReferenceRecorder({
     clearPreview();
     setErrorKind(null);
     setPhase("requesting");
+    let media: MediaStream | null = null;
     try {
-      if (
-        !navigator.mediaDevices?.getUserMedia ||
-        typeof MediaRecorder === "undefined"
-      ) {
+      if (!navigator.mediaDevices?.getUserMedia) {
         setErrorKind("unavailable");
         setPhase("idle");
         return;
       }
-      const media = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-        },
+      media = await navigator.mediaDevices.getUserMedia({
+        audio: RECORDING_AUDIO_CONSTRAINTS,
       });
       if (!alive.current) {
         media.getTracks().forEach((track) => track.stop());
         return;
       }
-      stream.current = media;
-      const mimeType = [
-        "audio/webm;codecs=opus",
-        "audio/mp4",
-        "audio/ogg;codecs=opus",
-      ].find((type) => MediaRecorder.isTypeSupported(type));
-      if (!mimeType) {
+      const active = await startMicRecorder(media, () => {
+        recorder.current = null;
+        if (!alive.current) return;
+        setErrorKind("stopped");
+        setPhase("idle");
+      });
+      if (!alive.current) {
+        active?.abort();
+        media.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      if (!active) {
         media.getTracks().forEach((track) => track.stop());
         setErrorKind("unsupported");
         setPhase("idle");
         return;
       }
-      const active = new MediaRecorder(media, { mimeType });
       recorder.current = active;
-      const chunks: Blob[] = [];
-      let failed = false;
-      active.ondataavailable = (event) => {
-        if (event.data.size) chunks.push(event.data);
-      };
-      active.onerror = () => {
-        failed = true;
-        media.getTracks().forEach((track) => track.stop());
-        if (!alive.current) return;
-        setErrorKind("stopped");
-        setPhase("idle");
-      };
-      active.onstop = () => {
-        media.getTracks().forEach((track) => track.stop());
-        stream.current = null;
-        if (!alive.current || failed) return;
-        const type = active.mimeType || chunks[0]?.type;
-        const blob = new Blob(chunks, { type });
-        if (!blob.size) {
-          setErrorKind("empty");
-          setPhase("idle");
-          return;
-        }
-        recorded.current = new File(
-          [blob],
-          type.includes("mp4")
-            ? "my-voice.m4a"
-            : type.includes("ogg")
-              ? "my-voice.ogg"
-              : "my-voice.webm",
-          { type },
-        );
-        url.current = URL.createObjectURL(blob);
-        setPreview(url.current);
-        setPhase("review");
-      };
-      active.start();
       setPhase("recording");
     } catch (reason) {
-      stream.current?.getTracks().forEach((track) => track.stop());
+      media?.getTracks().forEach((track) => track.stop());
       if (!alive.current) return;
       const denied =
         reason instanceof DOMException &&
@@ -177,6 +140,23 @@ export function ReferenceRecorder({
       setErrorKind(denied ? "denied" : "unavailable");
       setPhase("idle");
     }
+  }
+
+  async function stop() {
+    const active = recorder.current;
+    if (!active) return;
+    recorder.current = null;
+    const file = await active.stop();
+    if (!alive.current) return;
+    if (!file || !file.size) {
+      setErrorKind("empty");
+      setPhase("idle");
+      return;
+    }
+    recorded.current = file;
+    url.current = URL.createObjectURL(file);
+    setPreview(url.current);
+    setPhase("review");
   }
 
   const errorMessage =
@@ -248,7 +228,7 @@ export function ReferenceRecorder({
               data-testid="stop-recording"
               size="lg"
               className="h-14 w-full rounded-2xl bg-accent text-base font-medium text-accent-foreground hover:bg-accent/90 md:h-12 md:w-auto md:min-w-44 md:px-7"
-              onClick={() => recorder.current?.stop()}
+              onClick={() => void stop()}
             >
               <StopIcon className="size-4" />
               {copy.stopRecording}

@@ -15,7 +15,7 @@ export interface Manifest {
 }
 // Bump when browser reference audio preprocessing changes so cached IndexedDB
 // conditioning from older frontends is transparently re-extracted.
-export const REFERENCE_AUDIO_VERSION = 2;
+export const REFERENCE_AUDIO_VERSION = 3;
 
 export interface SavedConditioning {
   modelSha256: string;
