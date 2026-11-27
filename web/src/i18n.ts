@@ -139,6 +139,42 @@ export function resolveLanguage(saved: string | undefined): LanguageId {
   return isLanguageId(saved) ? saved : detectBrowserLanguage();
 }
 
+const LATIN_LANGUAGES = new Set<LanguageId>([
+  "English",
+  "French",
+  "German",
+  "Spanish",
+  "Italian",
+  "Portuguese",
+]);
+
+export function detectSynthesisLanguage(
+  text: string,
+  referenceLanguage: LanguageId,
+): string {
+  const hasHangul = /[\uAC00-\uD7AF\u1100-\u11FF\u3130-\u318F]/.test(text);
+  const hasKana = /[\u3040-\u309F\u30A0-\u30FF\u31F0-\u31FF]/.test(text);
+  const hasHan = /\p{Script=Han}/u.test(text);
+  const hasCyrillic = /\p{Script=Cyrillic}/u.test(text);
+  const nonLatinFamilies =
+    Number(hasHangul) +
+    Number(hasKana) +
+    Number(hasCyrillic) +
+    Number(hasHan && !hasKana && !hasHangul);
+  if (nonLatinFamilies > 1) return "auto";
+  if (hasHangul) return "Korean";
+  if (hasKana) return "Japanese";
+  if (hasHan) return "Chinese";
+  if (hasCyrillic) return "Russian";
+  if (
+    /\p{Script=Latin}/u.test(text) &&
+    LATIN_LANGUAGES.has(referenceLanguage)
+  ) {
+    return referenceLanguage;
+  }
+  return "auto";
+}
+
 export interface UiCopy {
   stepIndicator: (current: number, total: number) => string;
   back: string;
