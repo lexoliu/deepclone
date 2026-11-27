@@ -13,32 +13,32 @@ enum LinearWeight {
     Quantized(Box<QuantizedWeight>),
 }
 
-impl LinearWeight {
-    fn out_features(&self) -> usize {
-        match self {
-            Self::Dense(w) => w.dims()[1],
-            Self::Quantized(qw) => qw.qweight.dims()[0],
-        }
-    }
-}
-
 pub(crate) struct Linear {
     weight: LinearWeight,
     bias: Option<Tensor<1>>,
 }
 impl Linear {
     pub fn load(weights: &mut impl WeightSource, prefix: &str) -> Result<Self, Error> {
-        let bias = weights.optional(&format!("{prefix}.bias"))?;
+        Self::load_as(weights, prefix, weights.dtype())
+    }
+    pub fn load_as(
+        weights: &mut impl WeightSource,
+        prefix: &str,
+        dtype: DType,
+    ) -> Result<Self, Error> {
+        let bias = weights
+            .optional::<1>(&format!("{prefix}.bias"))?
+            .map(|b| if b.dtype() == dtype { b } else { b.cast(dtype) });
         if let Some(qweight) = weights.optional_packed::<2>(&format!("{prefix}.qweight_i4"))? {
-            return Self::from_quantized(weights, prefix, qweight, 4, bias);
+            return Self::from_quantized(weights, prefix, qweight, 4, bias, dtype);
         }
         if let Some(qweight) = weights.optional_packed::<2>(&format!("{prefix}.qweight_i8"))? {
-            return Self::from_quantized(weights, prefix, qweight, 8, bias);
+            return Self::from_quantized(weights, prefix, qweight, 8, bias, dtype);
         }
         Ok(Self {
             weight: LinearWeight::Dense(Box::new(
                 weights
-                    .tensor::<2>(&format!("{prefix}.weight"))?
+                    .tensor_as::<2>(&format!("{prefix}.weight"), dtype)?
                     .transpose(),
             )),
             bias,
@@ -50,8 +50,18 @@ impl Linear {
         qweight: Tensor<2, Int>,
         bits: u8,
         bias: Option<Tensor<1>>,
+        dtype: DType,
     ) -> Result<Self, Error> {
-        let scales = weights.tensor::<2>(&format!("{prefix}.scales"))?;
+        let scales = weights.tensor_as::<2>(&format!("{prefix}.scales"), dtype)?;
+        Self::from_quantized_parts(prefix, qweight, scales, bits, bias)
+    }
+    fn from_quantized_parts(
+        prefix: &str,
+        qweight: Tensor<2, Int>,
+        scales: Tensor<2>,
+        bits: u8,
+        bias: Option<Tensor<1>>,
+    ) -> Result<Self, Error> {
         let [n, k_words] = qweight.dims();
         let [sn, groups] = scales.dims();
         let pack = 32 / usize::from(bits);
@@ -74,19 +84,6 @@ impl Linear {
             })),
             bias,
         })
-    }
-    pub fn cast(mut self, dtype: DType) -> Self {
-        self.weight = match self.weight {
-            LinearWeight::Dense(w) => LinearWeight::Dense(Box::new(w.as_ref().clone().cast(dtype))),
-            LinearWeight::Quantized(qw) => LinearWeight::Quantized(Box::new(QuantizedWeight {
-                qweight: qw.qweight,
-                scales: qw.scales.cast(dtype),
-                bits: qw.bits,
-                group_size: qw.group_size,
-            })),
-        };
-        self.bias = self.bias.map(|bias| bias.cast(dtype));
-        self
     }
     pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let dtype = x.dtype();
@@ -131,76 +128,71 @@ pub(crate) struct JoinedLinear<const N: usize> {
     projection: Linear,
 }
 impl<const N: usize> JoinedLinear<N> {
-    pub fn load(weights: &mut impl WeightSource, prefixes: [String; N]) -> Result<Self, Error> {
-        let layers = prefixes
+    pub fn load<W: WeightSource>(weights: &mut W, prefixes: [String; N]) -> Result<Self, Error> {
+        let bias_values: Vec<Option<Tensor<1>>> = prefixes
             .iter()
-            .map(|p| Linear::load(weights, p))
-            .collect::<Result<Vec<_>, _>>()?;
-        let bias = if layers.iter().any(|layer| layer.bias.is_some()) {
-            Some(Tensor::cat(
-                layers
-                    .iter()
-                    .map(|layer| {
-                        layer.bias.clone().unwrap_or_else(|| {
-                            Tensor::<1>::zeros([layer.weight.out_features()], weights.device())
-                                .cast(weights.dtype())
-                        })
-                    })
-                    .collect(),
-                0,
-            ))
+            .map(|p| weights.optional::<1>(&format!("{p}.bias")))
+            .collect::<Result<_, _>>()?;
+        let has_bias = bias_values.iter().any(Option::is_some);
+        let q4_names: Vec<String> = prefixes.iter().map(|p| format!("{p}.qweight_i4")).collect();
+        let q4_refs: Vec<&str> = q4_names.iter().map(String::as_str).collect();
+        let q8_names: Vec<String> = prefixes.iter().map(|p| format!("{p}.qweight_i8")).collect();
+        let q8_refs: Vec<&str> = q8_names.iter().map(String::as_str).collect();
+        let part_out_features = |weights: &W, suffix: &str| -> Option<Vec<usize>> {
+            prefixes
+                .iter()
+                .map(|p| {
+                    weights
+                        .tensor_shape(&format!("{p}.{suffix}"))
+                        .and_then(|shape| shape.first().copied())
+                })
+                .collect()
+        };
+        let (weight, out_sizes) = if let Some(qweight) = weights.cat_packed_axis0(&q4_refs)? {
+            let out_sizes = part_out_features(weights, "qweight_i4");
+            let scale_names: Vec<String> = prefixes.iter().map(|p| format!("{p}.scales")).collect();
+            let scale_refs: Vec<&str> = scale_names.iter().map(String::as_str).collect();
+            let scales = weights.cat_axis0(&scale_refs)?;
+            let linear = Linear::from_quantized_parts(&prefixes[0], qweight, scales, 4, None)?;
+            (linear.weight, out_sizes)
+        } else if let Some(qweight) = weights.cat_packed_axis0(&q8_refs)? {
+            let out_sizes = part_out_features(weights, "qweight_i8");
+            let scale_names: Vec<String> = prefixes.iter().map(|p| format!("{p}.scales")).collect();
+            let scale_refs: Vec<&str> = scale_names.iter().map(String::as_str).collect();
+            let scales = weights.cat_axis0(&scale_refs)?;
+            let linear = Linear::from_quantized_parts(&prefixes[0], qweight, scales, 8, None)?;
+            (linear.weight, out_sizes)
+        } else {
+            let out_sizes = part_out_features(weights, "weight");
+            let weight_names: Vec<String> =
+                prefixes.iter().map(|p| format!("{p}.weight")).collect();
+            let weight_refs: Vec<&str> = weight_names.iter().map(String::as_str).collect();
+            let joined = weights.cat_axis0(&weight_refs)?.transpose();
+            (LinearWeight::Dense(Box::new(joined)), out_sizes)
+        };
+        let bias = if has_bias {
+            let mut parts = Vec::with_capacity(prefixes.len());
+            for (index, item) in bias_values.into_iter().enumerate() {
+                match item {
+                    Some(b) => parts.push(b),
+                    None => {
+                        let out = out_sizes
+                            .as_ref()
+                            .and_then(|sizes| sizes.get(index).copied())
+                            .ok_or_else(|| Error::Tensor {
+                                name: format!("{}.bias", prefixes[index]),
+                                reason: "missing bias with unknown projection width".into(),
+                            })?;
+                        parts.push(Tensor::<1>::zeros(
+                            [out],
+                            (weights.device(), weights.dtype()),
+                        ));
+                    }
+                }
+            }
+            Some(Tensor::cat(parts, 0))
         } else {
             None
-        };
-        let weight = match &layers[0].weight {
-            LinearWeight::Dense(_) => {
-                // Preserve contiguous input features within each output row so decode
-                // lanes can cooperate on the reduction without repacking every token.
-                let mut rows = Vec::with_capacity(layers.len());
-                for layer in layers {
-                    let LinearWeight::Dense(w) = layer.weight else {
-                        return Err(Error::Tensor {
-                            name: prefixes[0].clone(),
-                            reason: "cannot join dense and quantized projections".into(),
-                        });
-                    };
-                    rows.push(w.as_ref().clone().transpose());
-                }
-                LinearWeight::Dense(Box::new(Tensor::cat(rows, 0).transpose()))
-            }
-            LinearWeight::Quantized(qw) => {
-                let (bits, group_size) = (qw.bits, qw.group_size);
-                let mut qweights = Vec::with_capacity(layers.len());
-                let mut scales = Vec::with_capacity(layers.len());
-                qweights.push(qw.qweight.clone());
-                scales.push(qw.scales.clone());
-
-                for layer in layers.into_iter().skip(1) {
-                    let LinearWeight::Quantized(qw_next) = layer.weight else {
-                        return Err(Error::Tensor {
-                            name: prefixes[0].clone(),
-                            reason: "cannot join quantized and dense projections".into(),
-                        });
-                    };
-                    if qw_next.bits != bits || qw_next.group_size != group_size {
-                        return Err(Error::Tensor {
-                            name: prefixes[0].clone(),
-                            reason: format!(
-                                "mismatched quantization in joined projection: W{}/g{} vs W{bits}/g{group_size}",
-                                qw_next.bits, qw_next.group_size
-                            ),
-                        });
-                    }
-                    qweights.push(qw_next.qweight);
-                    scales.push(qw_next.scales);
-                }
-                LinearWeight::Quantized(Box::new(QuantizedWeight {
-                    qweight: Tensor::cat(qweights, 0),
-                    scales: Tensor::cat(scales, 0),
-                    bits,
-                    group_size,
-                }))
-            }
         };
         Ok(Self {
             projection: Linear { weight, bias },
@@ -225,9 +217,6 @@ impl RmsNorm {
             weight: weights.tensor(&format!("{prefix}.weight"))?,
             epsilon,
         })
-    }
-    pub fn weight(&self) -> &Tensor<1> {
-        &self.weight
     }
     pub fn forward<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {
         super::fused::rms_norm(x, self.weight.clone(), self.epsilon)
@@ -317,6 +306,22 @@ impl<P: Padding> Conv<P> {
             padding,
         }
     }
+    fn from_prepacked(
+        weight: Tensor<3>,
+        bias: Option<Tensor<1>>,
+        options: burn::tensor::ops::ConvOptions<1>,
+        padding: P,
+    ) -> Self {
+        let kernel = weight.dims()[0];
+        Self {
+            weight,
+            bias,
+            options,
+            kernel,
+            packed: true,
+            padding,
+        }
+    }
     pub fn load(
         weights: &mut impl WeightSource,
         prefix: &str,
@@ -325,10 +330,27 @@ impl<P: Padding> Conv<P> {
         groups: usize,
         padding: P,
     ) -> Result<Self, Error> {
+        let weight_name = format!("{prefix}.weight");
+        let bias = weights.optional(&format!("{prefix}.bias"))?;
+        let options = burn::tensor::ops::ConvOptions::new([stride], [0], [dilation], groups);
+        let prepack = groups == 1
+            && (P::PAD_MODE != super::conv::PAD_REFLECT_SAME
+                || (stride == 1
+                    && weights
+                        .tensor_shape(&weight_name)
+                        .is_some_and(|shape| shape.len() == 3 && shape[2] > 1)));
+        if prepack {
+            return Ok(Self::from_prepacked(
+                weights.conv_packed(&weight_name, false)?,
+                bias,
+                options,
+                padding,
+            ));
+        }
         Ok(Self::from_parts(
-            weights.tensor(&format!("{prefix}.weight"))?,
-            weights.optional(&format!("{prefix}.bias"))?,
-            burn::tensor::ops::ConvOptions::new([stride], [0], [dilation], groups),
+            weights.tensor(&weight_name)?,
+            bias,
+            options,
             padding,
         ))
     }
@@ -435,6 +457,13 @@ impl<P: Padding> Conv<P> {
 pub(crate) struct ConvHistory {
     input: Option<Tensor<3>>,
 }
+fn detached_tail(x: &Tensor<3>, start: usize, end: usize) -> Tensor<3> {
+    let [b, c, t] = x.dims();
+    if start == 0 && end == t {
+        return x.clone();
+    }
+    super::conv::contiguous(x.clone().slice([0..b, 0..c, start..end]))
+}
 impl Conv<Causal> {
     pub fn stream(&self, x: Tensor<3>, history: &mut ConvHistory) -> Tensor<3> {
         self.stream_inner(x, history, None)
@@ -458,17 +487,17 @@ impl Conv<Causal> {
         let context = (self.kernel - 1) * self.options.dilation[0];
         let previous = history.input.take();
         if self.packed || self.is_causal_depthwise() {
-            let [b, c, t] = x.dims();
+            let [_, _, t] = x.dims();
             if context > 0 {
                 history.input = Some(if t >= context {
-                    x.clone().slice([0..b, 0..c, t - context..t])
+                    detached_tail(&x, t - context, t)
                 } else {
                     let combined = match &previous {
                         Some(prev) => Tensor::cat(vec![prev.clone(), x.clone()], 2),
                         None => self.padding.apply(x.clone(), context + 1, 1),
                     };
                     let ct = combined.dims()[2];
-                    combined.slice([0..b, 0..c, ct - context..ct])
+                    detached_tail(&combined, ct - context, ct)
                 });
             }
             return if self.packed {
@@ -513,9 +542,9 @@ impl Conv<Causal> {
             Some(previous) => Tensor::cat(vec![previous, x], 2),
             None => self.padding.apply(x, context + 1, 1),
         };
-        let [b, c, t] = x.dims();
+        let [_, _, t] = x.dims();
         if context > 0 {
-            history.input = Some(x.clone().slice([0..b, 0..c, t - context..t]));
+            history.input = Some(detached_tail(&x, t - context, t));
         }
         let out = self.convolve(x);
         match residual {
@@ -558,11 +587,10 @@ impl TransposeConv {
         prefix: &str,
         stride: usize,
     ) -> Result<Self, Error> {
-        let weight = weights.tensor::<3>(&format!("{prefix}.weight"))?;
         // Pack `[C_in, C_out, K]` to contiguous `[K, C_out, C_in]` once at load
         // so phase-grouped transposed convolutions read coalesced input channels.
         Ok(Self {
-            weight: super::conv::contiguous(weight.permute([2, 1, 0])),
+            weight: weights.conv_packed(&format!("{prefix}.weight"), true)?,
             bias: weights.optional(&format!("{prefix}.bias"))?,
             stride,
         })
@@ -570,17 +598,17 @@ impl TransposeConv {
     pub fn stream(&self, x: Tensor<3>, history: &mut ConvHistory) -> Tensor<3> {
         let context = (self.weight.dims()[0] - self.stride).div_ceil(self.stride);
         let previous = history.input.take();
-        let [b, c, t] = x.dims();
+        let [_, _, t] = x.dims();
         if context > 0 {
             history.input = Some(if t >= context {
-                x.clone().slice([0..b, 0..c, t - context..t])
+                detached_tail(&x, t - context, t)
             } else {
                 let combined = match &previous {
                     Some(prev) => Tensor::cat(vec![prev.clone(), x.clone()], 2),
                     None => x.clone(),
                 };
                 let ct = combined.dims()[2];
-                combined.slice([0..b, 0..c, ct.saturating_sub(context)..ct])
+                detached_tail(&combined, ct.saturating_sub(context), ct)
             });
         }
         super::conv::causal_conv_transpose1d(

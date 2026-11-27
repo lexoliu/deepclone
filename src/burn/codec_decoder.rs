@@ -27,16 +27,12 @@ impl Quantizer {
         let codebooks = (0..groups)
             .map(|i| {
                 let p = format!("{p}.vq.layers.{i}._codebook");
-                let raw_sum = w.tensor::<2>(&format!("{p}.embedding_sum"))?;
-                let dtype = raw_sum.dtype();
-                let sum = raw_sum.cast(DType::F32);
                 // EuclideanCodebook uses a 1e-5 floor for unused centroids.
-                let count = w
-                    .tensor::<1>(&format!("{p}.cluster_usage"))?
-                    .cast(DType::F32)
-                    .clamp_min(1e-5)
-                    .unsqueeze_dim(1);
-                Ok((sum / count).cast(dtype))
+                w.normalized_codebook(
+                    &format!("{p}.embedding_sum"),
+                    &format!("{p}.cluster_usage"),
+                    1e-5,
+                )
             })
             .collect::<Result<_, Error>>()?;
         Ok(Self {
@@ -325,27 +321,36 @@ impl CodecDecoder {
         if !extends {
             *cache = self.cache();
         }
-        let appended = frames - cache.frames;
-        if appended > 0 {
-            let suffix: Vec<_> = (0..groups)
-                .flat_map(|group| {
-                    packed[group * frames + cache.frames..(group + 1) * frames]
-                        .iter()
-                        .copied()
-                })
-                .collect();
-            let codes = Tensor::<3, Int>::from_data(
-                burn::tensor::TensorData::new(suffix, [1, groups, appended]),
-                device,
-            );
-            let samples = match super::read(self.stream(codes, &mut cache.history)).await {
-                Ok(samples) => samples,
-                Err(error) => {
-                    *cache = self.cache();
-                    return Err(error);
-                }
-            };
-            cache.samples.extend(samples);
+        let mut offset = cache.frames;
+        if offset < frames {
+            // Bound causal decode working memory to one streaming chunk (12 frames) so
+            // priming a long reference clip reuses the same small activation buffers as
+            // steady-state streaming synthesis instead of allocating full-clip buffers.
+            const MAX_STREAM_CHUNK_FRAMES: usize = 12;
+            while offset < frames {
+                let end = (offset + MAX_STREAM_CHUNK_FRAMES).min(frames);
+                let chunk_frames = end - offset;
+                let suffix: Vec<_> = (0..groups)
+                    .flat_map(|group| {
+                        packed[group * frames + offset..group * frames + end]
+                            .iter()
+                            .copied()
+                    })
+                    .collect();
+                let codes = Tensor::<3, Int>::from_data(
+                    burn::tensor::TensorData::new(suffix, [1, groups, chunk_frames]),
+                    device,
+                );
+                let samples = match super::read(self.stream(codes, &mut cache.history)).await {
+                    Ok(samples) => samples,
+                    Err(error) => {
+                        *cache = self.cache();
+                        return Err(error);
+                    }
+                };
+                cache.samples.extend(samples);
+                offset = end;
+            }
             cache.frames = frames;
             cache.packed = packed;
         }

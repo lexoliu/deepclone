@@ -38,13 +38,32 @@ export interface OpfsDirectoryHandleLike {
   entries?(): AsyncIterableIterator<[string, { kind: string }]>;
 }
 
+export interface OpenShardReader {
+  readInto(offset: number, target: Uint8Array): void;
+  close(): void;
+}
+
 export interface StoredFile {
   readonly path: string;
   readonly size: number;
   readAll(): Promise<Uint8Array>;
+  openReader(): Promise<OpenShardReader>;
   withReader<T>(
     fn: (readInto: (offset: number, target: Uint8Array) => void) => T,
   ): Promise<T>;
+}
+
+export interface IndexedTensor {
+  shard: number;
+  dtype: string;
+  shape: number[];
+  start: number;
+  length: number;
+}
+
+export interface ShardIndex {
+  indexJson: string;
+  files: StoredFile[];
 }
 
 export interface SafetensorsTensorInfo {
@@ -67,10 +86,6 @@ export interface TextEmbeddingDescriptor {
   width: number;
   elementBytes: number;
   dataStart: number;
-}
-
-export interface ScratchBuffer {
-  buffer: Uint8Array;
 }
 
 interface VerifiedMetadata {
@@ -143,14 +158,22 @@ class OpfsStoredFile implements StoredFile {
     return out;
   }
 
+  async openReader(): Promise<OpenShardReader> {
+    const access = await this.handle.createSyncAccessHandle();
+    return {
+      readInto: (offset, target) => readExact(access, offset, target),
+      close: () => access.close(),
+    };
+  }
+
   async withReader<T>(
     fn: (readInto: (offset: number, target: Uint8Array) => void) => T,
   ): Promise<T> {
-    const access = await this.handle.createSyncAccessHandle();
+    const reader = await this.openReader();
     try {
-      return fn((offset, target) => readExact(access, offset, target));
+      return fn(reader.readInto);
     } finally {
-      access.close();
+      reader.close();
     }
   }
 }
@@ -170,15 +193,27 @@ export class BytesStoredFile implements StoredFile {
     return this.bytes.slice();
   }
 
+  async openReader(): Promise<OpenShardReader> {
+    return {
+      readInto: (offset, target) => {
+        if (offset < 0 || offset + target.byteLength > this.bytes.byteLength) {
+          throw new Error("Unexpected end of model file.");
+        }
+        target.set(this.bytes.subarray(offset, offset + target.byteLength));
+      },
+      close: () => {},
+    };
+  }
+
   async withReader<T>(
     fn: (readInto: (offset: number, target: Uint8Array) => void) => T,
   ): Promise<T> {
-    return fn((offset, target) => {
-      if (offset < 0 || offset + target.byteLength > this.bytes.byteLength) {
-        throw new Error("Unexpected end of model file.");
-      }
-      target.set(this.bytes.subarray(offset, offset + target.byteLength));
-    });
+    const reader = await this.openReader();
+    try {
+      return fn(reader.readInto);
+    } finally {
+      reader.close();
+    }
   }
 }
 
@@ -305,39 +340,65 @@ export async function findTextEmbedding(
   });
 }
 
-export async function uploadShardTensors(
-  file: StoredFile,
-  conditioning: boolean,
+export async function buildShardIndex(
+  files: StoredFile[],
   skipTensors: ReadonlySet<string>,
-  uploadTensor: (
-    name: string,
-    dtype: string,
-    shape: Uint32Array,
-    bytes: Uint8Array,
-    conditioning: boolean,
-  ) => void,
-  scratch: ScratchBuffer = { buffer: new Uint8Array(0) },
-): Promise<void> {
-  await file.withReader((readInto) => {
-    const header = parseSafetensorsHeader(readInto, file.size);
-    for (const tensor of header.tensors) {
-      if (skipTensors.has(tensor.name)) continue;
-      if (scratch.buffer.byteLength < tensor.length) {
-        scratch.buffer = new Uint8Array(tensor.length);
+): Promise<ShardIndex> {
+  const indexed: Record<string, IndexedTensor> = {};
+  const activeFiles: StoredFile[] = [];
+  for (const file of files) {
+    const header = await file.withReader((readInto) =>
+      parseSafetensorsHeader(readInto, file.size),
+    );
+    const kept = header.tensors.filter(
+      (tensor) => !skipTensors.has(tensor.name),
+    );
+    if (kept.length === 0) continue;
+    const shard = activeFiles.length;
+    activeFiles.push(file);
+    for (const tensor of kept) {
+      if (tensor.name in indexed) {
+        throw new Error(`Duplicate tensor in model shards: ${tensor.name}`);
       }
-      const view = scratch.buffer.subarray(0, tensor.length);
-      if (tensor.length > 0) {
-        readInto(tensor.start, view);
-      }
-      uploadTensor(
-        tensor.name,
-        tensor.dtype,
-        Uint32Array.from(tensor.shape),
-        view,
-        conditioning,
-      );
+      indexed[tensor.name] = {
+        shard,
+        dtype: tensor.dtype,
+        shape: tensor.shape,
+        start: tensor.start,
+        length: tensor.length,
+      };
     }
-  });
+  }
+  return { indexJson: JSON.stringify(indexed), files: activeFiles };
+}
+
+export async function withOpenShards<T>(
+  files: StoredFile[],
+  fn: (
+    readInto: (shard: number, offset: number, target: Uint8Array) => void,
+  ) => T,
+): Promise<T> {
+  const readers: OpenShardReader[] = [];
+  try {
+    for (const file of files) {
+      readers.push(await file.openReader());
+    }
+    return fn((shard, offset, target) => {
+      const reader = readers[shard];
+      if (!reader) {
+        throw new Error(`Unknown model shard index: ${shard}`);
+      }
+      reader.readInto(offset, target);
+    });
+  } finally {
+    for (const reader of readers) {
+      try {
+        reader.close();
+      } catch {
+        // Ignore close errors while releasing shard handles.
+      }
+    }
+  }
 }
 
 export async function readTextEmbeddingRows(

@@ -4,13 +4,17 @@ import {
   BytesStoredFile,
   TEXT_EMBEDDING_TENSOR,
   asset,
+  buildShardIndex,
   ensureStoredAsset,
   findTextEmbedding,
   openModelStorage,
   readTextEmbeddingRows,
-  uploadShardTensors,
+  withOpenShards,
+  type IndexedTensor,
   type OpfsDirectoryHandleLike,
   type OpfsFileHandleLike,
+  type OpenShardReader,
+  type StoredFile,
   type StreamingHasher,
   type SyncAccessHandleLike,
 } from "./assets";
@@ -246,57 +250,136 @@ test("incomplete and oversized downloads never enter the cache", async () => {
   }
 });
 
-test("safetensors streaming skips text embeddings and slices exact token rows", async () => {
+test("safetensors streaming skips text-embedding-only shards, reads exact slices, and closes handles", async () => {
   const embeddingBytes = new Uint8Array(4 * 3 * 2);
   for (let i = 0; i < embeddingBytes.length; i++) embeddingBytes[i] = i + 1;
   const smallBytes = new Uint8Array([10, 20, 30, 40]);
-  const shardBytes = buildSafetensors([
-    {
-      name: TEXT_EMBEDDING_TENSOR,
-      dtype: "F16",
-      shape: [4, 3],
-      bytes: embeddingBytes,
-    },
-    {
-      name: "talker.model.norm.weight",
-      dtype: "F16",
-      shape: [2],
-      bytes: smallBytes,
-    },
-  ]);
-  const stored = new BytesStoredFile("weights-0012.safetensors", shardBytes);
-  const uploaded: {
-    name: string;
-    dtype: string;
-    shape: number[];
-    bytes: number[];
-    conditioning: boolean;
-  }[] = [];
-  await uploadShardTensors(
-    stored,
-    false,
-    new Set([TEXT_EMBEDDING_TENSOR]),
-    (name, dtype, shape, bytes, conditioning) => {
-      uploaded.push({
-        name,
-        dtype,
-        shape: Array.from(shape),
-        bytes: Array.from(bytes),
-        conditioning,
-      });
-    },
-  );
-  expect(uploaded).toEqual([
-    {
-      name: "talker.model.norm.weight",
-      dtype: "F16",
-      shape: [2],
-      bytes: [10, 20, 30, 40],
-      conditioning: false,
-    },
-  ]);
+  const secondBytes = new Uint8Array([50, 60, 70, 80, 90, 100]);
 
-  const descriptor = await findTextEmbedding(stored);
+  const embeddingOnlyShard = new BytesStoredFile(
+    "weights-0012.safetensors",
+    buildSafetensors([
+      {
+        name: TEXT_EMBEDDING_TENSOR,
+        dtype: "F16",
+        shape: [4, 3],
+        bytes: embeddingBytes,
+      },
+    ]),
+  );
+  const firstActive = new BytesStoredFile(
+    "weights-0001.safetensors",
+    buildSafetensors([
+      {
+        name: TEXT_EMBEDDING_TENSOR,
+        dtype: "F16",
+        shape: [4, 3],
+        bytes: embeddingBytes,
+      },
+      {
+        name: "talker.model.norm.weight",
+        dtype: "F16",
+        shape: [2],
+        bytes: smallBytes,
+      },
+    ]),
+  );
+  const secondActive = new BytesStoredFile(
+    "weights-0002.safetensors",
+    buildSafetensors([
+      {
+        name: "talker.model.codec_embedding.weight",
+        dtype: "F16",
+        shape: [3],
+        bytes: secondBytes,
+      },
+    ]),
+  );
+
+  let openHandles = 0;
+  const wrapTracked = (inner: BytesStoredFile): StoredFile => ({
+    path: inner.path,
+    size: inner.size,
+    readAll: () => inner.readAll(),
+    openReader: async (): Promise<OpenShardReader> => {
+      const reader = await inner.openReader();
+      openHandles++;
+      let closed = false;
+      return {
+        readInto: (offset, target) => {
+          if (closed) throw new Error("reader closed");
+          reader.readInto(offset, target);
+        },
+        close: () => {
+          if (!closed) {
+            closed = true;
+            openHandles--;
+            reader.close();
+          }
+        },
+      };
+    },
+    withReader: async (fn) => inner.withReader(fn),
+  });
+
+  const trackedFiles = [
+    wrapTracked(embeddingOnlyShard),
+    wrapTracked(firstActive),
+    wrapTracked(secondActive),
+  ];
+  const index = await buildShardIndex(
+    trackedFiles,
+    new Set([TEXT_EMBEDDING_TENSOR]),
+  );
+  expect(index.files.map((file) => file.path)).toEqual([
+    "weights-0001.safetensors",
+    "weights-0002.safetensors",
+  ]);
+  const parsed = JSON.parse(index.indexJson) as Record<string, IndexedTensor>;
+  expect(Object.keys(parsed).sort()).toEqual([
+    "talker.model.codec_embedding.weight",
+    "talker.model.norm.weight",
+  ]);
+  expect(parsed["talker.model.norm.weight"]!.shard).toBe(0);
+  expect(parsed["talker.model.codec_embedding.weight"]!.shard).toBe(1);
+
+  const readBack = await withOpenShards(index.files, (readInto) => {
+    expect(openHandles).toBe(2);
+    const normEntry = parsed["talker.model.norm.weight"]!;
+    const normBuf = new Uint8Array(normEntry.length);
+    readInto(normEntry.shard, normEntry.start, normBuf);
+    const embEntry = parsed["talker.model.codec_embedding.weight"]!;
+    const embBuf = new Uint8Array(embEntry.length);
+    readInto(embEntry.shard, embEntry.start, embBuf);
+    return {
+      norm: Array.from(normBuf),
+      emb: Array.from(embBuf),
+    };
+  });
+  expect(openHandles).toBe(0);
+  expect(readBack).toEqual({
+    norm: [10, 20, 30, 40],
+    emb: [50, 60, 70, 80, 90, 100],
+  });
+
+  await expect(
+    withOpenShards(index.files, () => {
+      expect(openHandles).toBe(2);
+      throw new Error("boom");
+    }),
+  ).rejects.toThrow("boom");
+  expect(openHandles).toBe(0);
+
+  await expect(
+    buildShardIndex(
+      [firstActive, firstActive],
+      new Set([TEXT_EMBEDDING_TENSOR]),
+    ),
+  ).rejects.toThrow(
+    "Duplicate tensor in model shards: talker.model.norm.weight",
+  );
+
+  const descriptor = await findTextEmbedding(embeddingOnlyShard);
   expect(descriptor).not.toBeNull();
   expect(descriptor!.vocabSize).toBe(4);
   expect(descriptor!.width).toBe(3);

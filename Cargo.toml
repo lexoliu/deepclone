@@ -61,6 +61,14 @@ ondevice-coreml = { git = "https://github.com/May-Agent/ondevice", branch = "dev
 inherits = "release"
 lto = "thin"
 
+# Size-optimized profile for browser WebAssembly to lower WebKit JIT memory on mobile Safari.
+[profile.browser]
+inherits = "release"
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = { version = "0.2.130", default-features = false, features = ["std"], optional = true }
 wasm-bindgen-futures = { version = "0.4.80", default-features = false, features = ["std"], optional = true }
@@ -87,24 +95,24 @@ cubek-random = { git = "https://github.com/lexoliu/cubek", branch = "fix/webgpu-
 cubek-reduce = { git = "https://github.com/lexoliu/cubek", branch = "fix/webgpu-capabilities" }
 cubek-std = { git = "https://github.com/lexoliu/cubek", branch = "fix/webgpu-capabilities" }
 cubek-tile = { git = "https://github.com/lexoliu/cubek", branch = "fix/webgpu-capabilities" }
-cubecl = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
-cubecl-common = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
-cubecl-core = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
-cubecl-cpp = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
-cubecl-cpu = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
-cubecl-cuda = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
-cubecl-environment = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
-cubecl-hip = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
-cubecl-ir = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
-cubecl-llvm = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
-cubecl-macros = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
-cubecl-macros-internal = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
-cubecl-metal = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
-cubecl-monitoring = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
-cubecl-opt = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
-cubecl-runtime = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
-cubecl-server = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
-cubecl-spirv = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
-cubecl-std = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
-cubecl-wgpu = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
-cubecl-zspace = { git = "https://github.com/lexoliu/cubecl", branch = "fix/webgpu-tuning" }
+cubecl = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }
+cubecl-common = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }
+cubecl-core = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }
+cubecl-cpp = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }
+cubecl-cpu = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }
+cubecl-cuda = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }
+cubecl-environment = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }
+cubecl-hip = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }
+cubecl-ir = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }
+cubecl-llvm = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }
+cubecl-macros = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }
+cubecl-macros-internal = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }
+cubecl-metal = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }
+cubecl-monitoring = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }
+cubecl-opt = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }
+cubecl-runtime = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }
+cubecl-server = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }
+cubecl-spirv = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }
+cubecl-std = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }
+cubecl-wgpu = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }
+cubecl-zspace = { git = "https://github.com/lexoliu/cubecl", branch = "deepclone/webgpu" }

@@ -71,13 +71,12 @@ impl Quantizer {
         let codebooks = (0..groups)
             .map(|i| {
                 let p = format!("{p}.layers.{i}.codebook");
-                let sum = w.tensor::<2>(&format!("{p}.embed_sum"))?;
                 // MimiEuclideanCodebook normalizes centroids with epsilon 1e-5.
-                let count = w
-                    .tensor::<1>(&format!("{p}.cluster_usage"))?
-                    .clamp_min(1e-5)
-                    .unsqueeze_dim(1);
-                Ok(sum / count)
+                w.normalized_codebook(
+                    &format!("{p}.embed_sum"),
+                    &format!("{p}.cluster_usage"),
+                    1e-5,
+                )
             })
             .collect::<Result<Vec<_>, Error>>()?;
         let codebooks_t = codebooks.iter().map(|b| b.clone().transpose()).collect();

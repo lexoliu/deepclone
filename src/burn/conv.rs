@@ -209,7 +209,15 @@ pub(super) fn causal_conv_transpose1d(
 
 impl CodecConv for CubeBackend {
     fn contiguous(input: FloatTensor<Self>) -> FloatTensor<Self> {
-        into_contiguous(input)
+        if !input.is_contiguous() {
+            into_contiguous(input)
+        } else if input.handle.offset_start.is_some() || input.handle.offset_end.is_some() {
+            // Detach sub-slice views so retaining a small tail (e.g. ConvHistory) cannot
+            // pin a much larger parent activation buffer in GPU memory.
+            input.copy()
+        } else {
+            input
+        }
     }
 
     fn snake(

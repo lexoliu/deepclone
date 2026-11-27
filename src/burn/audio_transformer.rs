@@ -46,7 +46,7 @@ impl FeedForward for Gated {
     fn load(w: &mut impl WeightSource, p: &str) -> Result<Self, Error> {
         Ok(Self {
             gate_up: JoinedLinear::load(w, ["gate", "up"].map(|name| format!("{p}.{name}_proj")))?,
-            down: Linear::load(w, &format!("{p}.down_proj"))?.cast(DType::F32),
+            down: Linear::load_as(w, &format!("{p}.down_proj"), DType::F32)?,
         })
     }
     fn apply(&self, x: Tensor<3>) -> Tensor<3> {
@@ -173,8 +173,8 @@ impl<N: Norm, F: FeedForward> Layer<N, F> {
             let device = x.device();
             let dtype = x.dtype();
             (
-                Tensor::<4>::zeros(shape, &device).cast(dtype),
-                Tensor::<4>::zeros(shape, &device).cast(dtype),
+                Tensor::<4>::zeros(shape, (&device, dtype)),
+                Tensor::<4>::zeros(shape, (&device, dtype)),
             )
         });
         let n = self.input.apply(x.clone());
@@ -234,7 +234,7 @@ impl<N: Norm, F: FeedForward> AudioTransformer<N, F> {
                 reason: "invalid audio attention dimensions".into(),
             });
         }
-        let rotary = Some(rotary_packed_at(
+        let rotary = Some(rotary_packed_persistent(
             w.device(),
             w.dtype(),
             0,
@@ -333,8 +333,8 @@ impl<N: Norm, F: FeedForward> AudioTransformer<N, F> {
                     if let Some((k, v)) = past.take() {
                         let [_, kv_heads, _, head_dim] = k.dims();
                         let shape = [1, kv_heads, new_cap, head_dim];
-                        let mut nk = Tensor::<4>::zeros(shape, &device).cast(dtype);
-                        let mut nv = Tensor::<4>::zeros(shape, &device).cast(dtype);
+                        let mut nk = Tensor::<4>::zeros(shape, (&device, dtype));
+                        let mut nv = Tensor::<4>::zeros(shape, (&device, dtype));
                         if keep > 0 {
                             let src = [0..1, 0..kv_heads, start..history.cache_len, 0..head_dim];
                             let dst = [0..1, 0..kv_heads, 0..keep, 0..head_dim];
@@ -382,6 +382,40 @@ impl<N: Norm, F: FeedForward> AudioTransformer<N, F> {
         x
     }
 }
+fn rotary_packed_data(
+    dtype: DType,
+    start: usize,
+    frames: usize,
+    width: usize,
+    theta: f32,
+) -> TensorData {
+    let mut values = vec![0f32; 2 * frames * width];
+    let plane = frames * width;
+    for (local, position) in (start..start + frames).enumerate() {
+        let base = local * width;
+        for index in 0..width {
+            let frequency = theta.powf(-((2 * (index % (width / 2))) as f32) / width as f32);
+            let (s, c) = (position as f32 * frequency).sin_cos();
+            values[base + index] = c;
+            values[plane + base + index] = s;
+        }
+    }
+    TensorData::new(values, [2, frames, width]).convert_dtype(dtype)
+}
+pub(crate) fn rotary_packed_persistent(
+    device: &Device,
+    dtype: DType,
+    start: usize,
+    frames: usize,
+    width: usize,
+    theta: f32,
+) -> Tensor<3> {
+    super::upload_persistent(
+        device,
+        rotary_packed_data(dtype, start, frames, width, theta),
+        dtype,
+    )
+}
 fn rotary_packed_at(
     device: &Device,
     dtype: DType,
@@ -390,15 +424,12 @@ fn rotary_packed_at(
     width: usize,
     theta: f32,
 ) -> Tensor<3> {
-    let (cosine, sine) = rotary_tables_at(device, dtype, start, frames, width, theta);
-    Tensor::cat(
-        vec![
-            cosine.reshape([1, frames, width]),
-            sine.reshape([1, frames, width]),
-        ],
-        0,
+    Tensor::<3>::from_data(
+        rotary_packed_data(dtype, start, frames, width, theta),
+        (device, dtype),
     )
 }
+#[cfg(test)]
 pub(crate) fn rotary_tables(
     device: &Device,
     dtype: DType,
@@ -428,8 +459,14 @@ fn rotary_tables_at(
     }
     let shape = [1, 1, frames, width];
     (
-        Tensor::<4>::from_data(TensorData::new(cosines, shape), device).cast(dtype),
-        Tensor::<4>::from_data(TensorData::new(sines, shape), device).cast(dtype),
+        Tensor::<4>::from_data(
+            TensorData::new(cosines, shape).convert_dtype(dtype),
+            (device, dtype),
+        ),
+        Tensor::<4>::from_data(
+            TensorData::new(sines, shape).convert_dtype(dtype),
+            (device, dtype),
+        ),
     )
 }
 

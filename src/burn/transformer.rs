@@ -35,15 +35,10 @@ impl Layer {
         capacity: usize,
     ) -> Result<Self, Error> {
         let shape = [1, c.num_key_value_heads, capacity, c.head_dim];
-        let query_norm = RmsNorm::load(w, &format!("{prefix}.self_attn.q_norm"), c.rms_norm_eps)?;
-        let key_norm = RmsNorm::load(w, &format!("{prefix}.self_attn.k_norm"), c.rms_norm_eps)?;
-        let qk_norm = Tensor::cat(
-            vec![
-                query_norm.weight().clone().unsqueeze_dim(0),
-                key_norm.weight().clone().unsqueeze_dim(0),
-            ],
-            0,
-        );
+        let qk_norm = w.stack_1d(&[
+            &format!("{prefix}.self_attn.q_norm.weight"),
+            &format!("{prefix}.self_attn.k_norm.weight"),
+        ])?;
         Ok(Self {
             input: RmsNorm::load(w, &format!("{prefix}.input_layernorm"), c.rms_norm_eps)?,
             post: RmsNorm::load(
@@ -65,8 +60,8 @@ impl Layer {
             // retain model storage; GEMV converts each weight as it is read.
             down: Linear::load(w, &format!("{prefix}.mlp.down_proj"))?,
             kv: Some((
-                Tensor::<4>::zeros(shape, w.device()).cast(w.dtype()),
-                Tensor::<4>::zeros(shape, w.device()).cast(w.dtype()),
+                super::zeros_persistent(shape, w.device(), w.dtype()),
+                super::zeros_persistent(shape, w.device(), w.dtype()),
             )),
         })
     }
@@ -186,19 +181,13 @@ impl Decoder {
                 reason: "invalid rotary, grouped attention, or context dimensions".into(),
             });
         }
-        let (cosine, sine) = super::audio_transformer::rotary_tables(
+        let rotary = super::audio_transformer::rotary_packed_persistent(
             weights.device(),
             weights.dtype(),
+            0,
             capacity,
             config.head_dim,
             config.rope_theta,
-        );
-        let rotary = Tensor::cat(
-            vec![
-                cosine.reshape([1, capacity, config.head_dim]),
-                sine.reshape([1, capacity, config.head_dim]),
-            ],
-            0,
         );
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
