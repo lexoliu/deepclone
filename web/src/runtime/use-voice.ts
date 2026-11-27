@@ -1,6 +1,20 @@
 import { useEffect, useRef, useState } from "react";
 import type { Command, Event, ModelEntry } from "./contracts";
 import { Player, referenceAudio } from "./audio";
+
+export type VoicePhase =
+  | "ready"
+  | "conditioning"
+  | "generating"
+  | "playing"
+  | "done"
+  | "cancelled"
+  | "incomplete"
+  | "stopped";
+
+export type VoiceErrorKind =
+  "prepare_failed" | "stopped_empty" | "stopped_partial";
+
 export function useVoice() {
   const worker = useRef<Worker | null>(null);
   const player = useRef<Player | null>(null);
@@ -21,23 +35,15 @@ export function useVoice() {
     conditioned?: number;
     firstAudio?: number;
   } | null>(null);
-  const [status, setStatus] = useState("Your voice, ready for something new");
+  const [phase, setPhase] = useState<VoicePhase>("ready");
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState(0);
-  const [error, setError] = useState<string | null>(null);
+  const [errorKind, setErrorKind] = useState<VoiceErrorKind | null>(null);
   const [audio, setAudio] = useState<string | null>(null);
   const [seconds, setSeconds] = useState(0);
-  const [elapsed, setElapsed] = useState(0);
-  useEffect(() => {
-    if (!busy) return;
-    const timer = setInterval(() => {
-      if (timing.current)
-        setElapsed((performance.now() - timing.current.requested) / 1000);
-    }, 1000);
-    return () => clearInterval(timer);
-  }, [busy]);
+
   function send(command: Command, transfer: Transferable[] = []) {
     if (!worker.current) throw new Error("Inference worker is unavailable.");
     worker.current.postMessage(command, transfer);
@@ -57,16 +63,16 @@ export function useVoice() {
     stopWorker(value);
     player.current = null;
     void active?.close();
-    setError(
+    setErrorKind(
       partial
-        ? "Speech generation stopped before finishing. You can listen to or download the audio generated so far."
+        ? "stopped_partial"
         : timing.current?.conditioned === undefined
-          ? "Speech could not be prepared. Please try again."
-          : "Speech generation stopped before audio was produced. Please try again.",
+          ? "prepare_failed"
+          : "stopped_empty",
     );
     setBusy(false);
     setRunning(false);
-    setStatus(partial ? "Incomplete audio saved" : "Operation stopped");
+    setPhase(partial ? "incomplete" : "stopped");
   }
   function saveOutput(active: Player | null) {
     if (!active?.hasAudio) return false;
@@ -123,7 +129,7 @@ export function useVoice() {
             elapsedMs: timing.current.firstAudio - timing.current.requested,
           });
         }
-        setStatus("Generating and playing");
+        setPhase("playing");
         setSeconds((value) => value + event.samples.length / event.sampleRate);
         void player
           .current!.enqueue(event.samples, event.sampleRate)
@@ -145,7 +151,7 @@ export function useVoice() {
       }
       if (event.kind === "started") {
         setRunning(true);
-        setStatus("Generating speech");
+        setPhase("generating");
       }
       if (event.kind === "done") {
         const completed = performance.now();
@@ -171,7 +177,7 @@ export function useVoice() {
             void active.close();
             setRunning(false);
             setBusy(false);
-            setStatus("Ready to listen");
+            setPhase("done");
           })
           .catch((reason) => {
             if (instance === worker.current) fail(reason);
@@ -235,18 +241,16 @@ export function useVoice() {
     file: File,
     transcript: string,
     text: string,
-    language: string,
-    live: boolean,
+    language = "auto",
   ) {
     cancelling.current = false;
-    setError(null);
+    setErrorKind(null);
     setBusy(true);
     setSeconds(0);
-    setElapsed(0);
     if (audioUrl.current) URL.revokeObjectURL(audioUrl.current);
     audioUrl.current = null;
     setAudio(null);
-    setStatus("Preparing reference voice");
+    setPhase("conditioning");
     const current = ++operation.current;
     const times = { requested: performance.now() } as NonNullable<
       typeof timing.current
@@ -286,16 +290,12 @@ export function useVoice() {
       if (current !== operation.current) return;
       await push(text);
       if (current !== operation.current) return;
-      if (!live) send({ kind: "finish" });
+      send({ kind: "finish" });
     } catch (reason) {
       if (current === operation.current) {
         fail(reason);
       }
     }
-  }
-  function finish() {
-    send({ kind: "finish" });
-    setStatus("Finishing speech");
   }
   function cancel() {
     operation.current++;
@@ -307,23 +307,20 @@ export function useVoice() {
     void active?.close();
     setRunning(false);
     setBusy(false);
-    setError(null);
-    setStatus(partial ? "Cancelled · incomplete audio saved" : "Cancelled");
+    setErrorKind(null);
+    setPhase(partial ? "incomplete" : "cancelled");
     initializeWorker();
   }
   return {
-    status,
+    phase,
     loaded,
     busy,
     running,
     progress,
-    error,
+    errorKind,
     audio,
     seconds,
-    elapsed,
     start,
-    push,
-    finish,
     cancel,
   };
 }

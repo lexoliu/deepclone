@@ -1,4 +1,5 @@
 @import "tailwindcss";
+
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -8,57 +9,124 @@
   --color-secondary-foreground: var(--foreground);
   --color-muted: var(--secondary);
   --color-muted-foreground: var(--muted-foreground);
-  --color-accent: var(--secondary);
-  --color-accent-foreground: var(--foreground);
-  --color-destructive: #b64040;
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: #a63a3a;
   --color-border: var(--border);
   --color-input: var(--border);
-  --color-ring: #8b8b93;
-  --radius-sm: 4px;
-  --radius-md: 6px;
-  --radius-lg: 8px;
+  --color-ring: #6e6d68;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 18px;
 }
+
 :root {
   font-family:
-    ui-sans-serif,
+    "Avenir Next",
+    "Plus Jakarta Sans",
     -apple-system,
     BlinkMacSystemFont,
+    "PingFang SC",
+    "Hiragino Sans",
+    "Apple SD Gothic Neo",
     "Segoe UI",
     sans-serif;
   color-scheme: light;
-  --background: #fafafa;
-  --foreground: #242429;
-  --primary: #303036;
-  --primary-foreground: #fafafa;
-  --secondary: #ededf0;
-  --muted-foreground: #72727d;
-  --border: #e2e2e7;
+  --background: #f6f5f1;
+  --foreground: #191918;
+  --primary: #191918;
+  --primary-foreground: #faf9f6;
+  --secondary: #eceae3;
+  --muted-foreground: #6e6d68;
+  --accent: #1b5e4a;
+  --accent-foreground: #faf9f6;
+  --border: #e4e1d8;
   background: var(--background);
   color: var(--foreground);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
+
 * {
   box-sizing: border-box;
   border-color: var(--border);
 }
+
+html {
+  scroll-behavior: smooth;
+}
+
 body {
   margin: 0;
   min-width: 320px;
+  background: var(--background);
+  color: var(--foreground);
 }
+
+.grain-overlay {
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.025'/%3E%3C/svg%3E");
+}
+
+.surface-card {
+  background: #ffffff;
+  border: 1px solid var(--border);
+  box-shadow:
+    0 18px 40px -20px rgba(25, 25, 24, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.8);
+}
+
+@keyframes step-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.step-enter {
+  animation: step-enter 0.28s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes record-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.85;
+    transform: scale(1.45);
+  }
+}
+
+.record-pulse {
+  animation: record-pulse 1.8s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
 button:not(:disabled),
 a {
   cursor: pointer;
 }
+
 button:active:not(:disabled) {
   transform: scale(0.98);
 }
+
 button {
   transition:
-    background-color 0.15s,
-    transform 0.1s;
+    background-color 0.18s cubic-bezier(0.16, 1, 0.3, 1),
+    border-color 0.18s cubic-bezier(0.16, 1, 0.3, 1),
+    color 0.18s cubic-bezier(0.16, 1, 0.3, 1),
+    transform 0.12s cubic-bezier(0.16, 1, 0.3, 1);
 }
+
 textarea {
-  resize: vertical;
+  resize: none;
 }
+
 ::selection {
-  background: #dcdce4;
+  background: #dfddd4;
 }

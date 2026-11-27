@@ -140,18 +140,57 @@ try {
       fallback: info.isFallbackAdapter,
     };
   });
-  await page.getByRole("button", { name: "Upload audio", exact: true }).click();
   await page
-    .getByLabel("Reference recording", { exact: true })
-    .setInputFiles(values.reference!);
+    .locator('[data-testid="continue-step-2"], [data-testid="prompt-input"]')
+    .first()
+    .waitFor({ state: "visible", timeout });
+  const referenceBytes = Array.from(await readFile(values.reference!));
   const transcript: { text: string } = JSON.parse(
     await readFile(values.transcript!, "utf8"),
   );
-  await page.getByLabel("Reference transcript").fill(transcript.text);
-  await page.getByLabel("What should your voice say?").fill(values.text!);
-  await page
-    .getByLabel("Language", { exact: true })
-    .selectOption(values.language!);
+  await page.evaluate(
+    async ({ bytes, text, language }) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open("deepclone-voices", 1);
+        request.onupgradeneeded = () => {
+          if (!request.result.objectStoreNames.contains("reference")) {
+            request.result.createObjectStore("reference");
+          }
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () =>
+          reject(request.error ?? new Error("IndexedDB open failed"));
+      });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const tx = db.transaction("reference", "readwrite");
+          tx.objectStore("reference").put(
+            {
+              file: new File([new Uint8Array(bytes)], "reference.wav", {
+                type: "audio/wav",
+              }),
+              transcript: text,
+              source: "record",
+              language,
+            },
+            "selected",
+          );
+          tx.oncomplete = () => resolve();
+          tx.onerror = () =>
+            reject(tx.error ?? new Error("IndexedDB write failed"));
+        });
+      } finally {
+        db.close();
+      }
+    },
+    {
+      bytes: referenceBytes,
+      text: transcript.text,
+      language: values.language!,
+    },
+  );
+  await page.reload();
+  await page.getByTestId("prompt-input").fill(values.text!);
   if (profiler) {
     const { targetInfos } = await profiler.send("Target.getTargets");
     const target = targetInfos.find(
@@ -207,7 +246,7 @@ try {
       predicate: (event) => event.text().startsWith("Speech generation timing"),
       timeout,
     });
-    await page.getByRole("button", { name: "Generate speech" }).click();
+    await page.getByTestId("synthesize-button").click();
     const failed = page
       .getByRole("alert")
       .waitFor({ state: "visible", timeout })
@@ -234,7 +273,7 @@ try {
       join(values.output!, `run-${run}-timing.json`),
       JSON.stringify(timing, null, 2),
     );
-    const download = page.getByRole("link", { name: "Download WAV" });
+    const download = page.getByTestId("download-wav");
     await download.waitFor({ state: "visible", timeout });
     const audio = await download.evaluate(async (link: HTMLAnchorElement) => {
       const response = await fetch(link.href);
