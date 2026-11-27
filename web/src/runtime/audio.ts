@@ -205,6 +205,10 @@ export class Player {
   get hasAudio() {
     return this.chunks.some((chunk) => chunk.length > 0);
   }
+  get durationSeconds() {
+    const total = this.chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    return total / this.rate;
+  }
   diagnostics() {
     return {
       underruns: this.underruns,

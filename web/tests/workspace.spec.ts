@@ -1008,3 +1008,159 @@ test("legacy cached conditioning is ignored and quiet stereo-with-silent-channel
   expect(observed.receivedRms).toBeLessThan(0.095);
   expect(observed.receivedPeak).toBeLessThanOrEqual(0.895);
 });
+
+test("generated audio history persists across reloads and supports downloading, single delete, and clear all", async ({
+  page,
+}) => {
+  await seedSavedVoice(page, { language: "Chinese" });
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "gpu", { value: {}, configurable: true });
+    let runCount = 0;
+    class HistoryWorker {
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onerror = null;
+      postMessage(command: { kind: string; id?: number }) {
+        if (command.kind === "load") {
+          this.onmessage?.(
+            new MessageEvent("message", { data: { kind: "ready" } }),
+          );
+          return;
+        }
+        if (command.kind === "reference") {
+          this.onmessage?.(
+            new MessageEvent("message", {
+              data: {
+                kind: "conditioned",
+                conditioning: {
+                  modelSha256: "0".repeat(64),
+                  audioVersion: 2,
+                  speaker: new Float32Array([0.5]),
+                  speakerShape: [1, 1, 1],
+                  codes: new Uint32Array([1, 2]),
+                  groups: 2,
+                },
+              },
+            }),
+          );
+          return;
+        }
+        if (command.kind === "start") {
+          this.onmessage?.(
+            new MessageEvent("message", { data: { kind: "started" } }),
+          );
+          return;
+        }
+        if (command.kind === "text") {
+          this.onmessage?.(
+            new MessageEvent("message", {
+              data: { kind: "accepted", id: command.id },
+            }),
+          );
+          return;
+        }
+        if (command.kind === "finish") {
+          runCount++;
+          const samples = new Float32Array(2400 * runCount).fill(
+            runCount === 1 ? 0.25 : -0.25,
+          );
+          this.onmessage?.(
+            new MessageEvent("message", {
+              data: {
+                kind: "audio",
+                id: runCount,
+                samples,
+                sampleRate: 24000,
+              },
+            }),
+          );
+          this.onmessage?.(
+            new MessageEvent("message", { data: { kind: "done" } }),
+          );
+        }
+      }
+      terminate() {}
+    }
+    Object.defineProperty(window, "Worker", { value: HistoryWorker });
+  });
+  await page.route("**/models.json", (route) =>
+    route.fulfill({
+      json: [
+        {
+          size: "0.6b",
+          manifest: "https://example.test/model.json",
+          sha256: "0".repeat(64),
+        },
+      ],
+    }),
+  );
+
+  await page.setViewportSize({ width: 320, height: 640 });
+  await page.goto("/");
+  await expect(page.getByTestId("history-section")).toHaveCount(0);
+
+  await page.getByTestId("prompt-input").fill(CJK_SAMPLE);
+  await page.getByTestId("synthesize-button").click();
+  await expect(page.getByTestId("download-wav")).toBeVisible();
+  await expect(page.getByTestId("history-item")).toHaveCount(1);
+  await expect(page.getByTestId("history-item-text").first()).toHaveText(
+    CJK_SAMPLE,
+  );
+
+  const secondPrompt = "你好，这是第二条测试。";
+  await page.getByTestId("prompt-input").fill(secondPrompt);
+  await page.getByTestId("synthesize-button").click();
+  await expect(page.getByTestId("history-item")).toHaveCount(2);
+  await expect(page.getByTestId("history-item-text").nth(0)).toHaveText(
+    secondPrompt,
+  );
+  await expect(page.getByTestId("history-item-text").nth(1)).toHaveText(
+    CJK_SAMPLE,
+  );
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth,
+    ),
+  ).toBe(true);
+
+  // Reloading restores both history items with playable and downloadable WAV blobs.
+  await page.reload();
+  await expect(page.getByTestId("history-item")).toHaveCount(2);
+  await expect(page.getByTestId("history-item-text").nth(0)).toHaveText(
+    secondPrompt,
+  );
+  const wavHeader = await page
+    .getByTestId("history-download")
+    .first()
+    .evaluate(async (link) => {
+      const buf = await (
+        await fetch((link as HTMLAnchorElement).href)
+      ).arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      return {
+        riff: String.fromCharCode(...bytes.slice(0, 4)),
+        wave: String.fromCharCode(...bytes.slice(8, 12)),
+        size: bytes.byteLength,
+      };
+    });
+  expect(wavHeader.riff).toBe("RIFF");
+  expect(wavHeader.wave).toBe("WAVE");
+  expect(wavHeader.size).toBeGreaterThan(44);
+
+  // Deleting one item removes only that entry and persists across reload.
+  await page.getByTestId("history-delete").first().click();
+  await expect(page.getByTestId("history-item")).toHaveCount(1);
+  await expect(page.getByTestId("history-item-text").first()).toHaveText(
+    CJK_SAMPLE,
+  );
+  await page.reload();
+  await expect(page.getByTestId("history-item")).toHaveCount(1);
+  await expect(page.getByTestId("history-item-text").first()).toHaveText(
+    CJK_SAMPLE,
+  );
+
+  // Clearing all removes remaining entries and hides the history section.
+  await page.getByTestId("history-clear").click();
+  await expect(page.getByTestId("history-section")).toHaveCount(0);
+  await page.reload();
+  await expect(page.getByTestId("history-section")).toHaveCount(0);
+});

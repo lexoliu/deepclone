@@ -21,6 +21,13 @@ export type VoicePhase =
 export type VoiceErrorKind =
   "prepare_failed" | "stopped_empty" | "stopped_partial";
 
+export interface GeneratedOutput {
+  text: string;
+  wav: Blob;
+  seconds: number;
+  complete: boolean;
+}
+
 interface ConditionedResult {
   conditioning?: SavedConditioning;
   recycle?: boolean;
@@ -49,6 +56,10 @@ export function useVoice(referenceReady = true, hasCachedConditioning = false) {
   const cancelling = useRef(false);
   const operation = useRef(0);
   const audioUrl = useRef<string | null>(null);
+  const currentPrompt = useRef("");
+  const outputHandler = useRef<((output: GeneratedOutput) => void) | null>(
+    null,
+  );
   const timing = useRef<{
     requested: number;
     ready?: number;
@@ -79,7 +90,7 @@ export function useVoice(referenceReady = true, hasCachedConditioning = false) {
     if (cancelling.current) return;
     operation.current++;
     const active = player.current;
-    const partial = saveOutput(active);
+    const partial = saveOutput(active, false);
     stopWorker(value);
     player.current = null;
     void active?.close();
@@ -94,11 +105,20 @@ export function useVoice(referenceReady = true, hasCachedConditioning = false) {
     setRunning(false);
     setPhase(partial ? "incomplete" : "stopped");
   }
-  function saveOutput(active: Player | null) {
+  function saveOutput(active: Player | null, complete: boolean) {
     if (!active?.hasAudio) return false;
+    const wav = active.wav();
     if (audioUrl.current) URL.revokeObjectURL(audioUrl.current);
-    audioUrl.current = URL.createObjectURL(active.wav());
+    audioUrl.current = URL.createObjectURL(wav);
     setAudio(audioUrl.current);
+    const handler = outputHandler.current;
+    outputHandler.current = null;
+    handler?.({
+      text: currentPrompt.current,
+      wav,
+      seconds: active.durationSeconds,
+      complete,
+    });
     console.info("Speech playback timing", active.diagnostics());
     return true;
   }
@@ -192,7 +212,7 @@ export function useVoice(referenceReady = true, hasCachedConditioning = false) {
           ?.finish()
           .then(() => {
             if (instance !== worker.current || cancelling.current) return;
-            saveOutput(active);
+            saveOutput(active, true);
             player.current = null;
             void active.close();
             setRunning(false);
@@ -284,8 +304,11 @@ export function useVoice(referenceReady = true, hasCachedConditioning = false) {
     language = "auto",
     savedConditioning?: SavedConditioning,
     onConditioned?: (conditioning: SavedConditioning) => void,
+    onOutput?: (output: GeneratedOutput) => void,
   ) {
     cancelling.current = false;
+    currentPrompt.current = text.trim();
+    outputHandler.current = onOutput ?? null;
     setErrorKind(null);
     setBusy(true);
     setSeconds(0);
@@ -396,7 +419,8 @@ export function useVoice(referenceReady = true, hasCachedConditioning = false) {
     operation.current++;
     cancelling.current = true;
     const active = player.current;
-    const partial = saveOutput(active);
+    const partial = saveOutput(active, false);
+    outputHandler.current = null;
     stopWorker();
     player.current = null;
     void active?.close();
