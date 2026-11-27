@@ -1,5 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import type { Command, Event, ModelEntry } from "./contracts";
+import type {
+  Command,
+  Event,
+  ModelEntry,
+  SavedConditioning,
+} from "./contracts";
 import { Player, referenceAudio } from "./audio";
 
 export type VoicePhase =
@@ -15,15 +20,29 @@ export type VoicePhase =
 export type VoiceErrorKind =
   "prepare_failed" | "stopped_empty" | "stopped_partial";
 
-export function useVoice() {
+interface ConditionedResult {
+  conditioning?: SavedConditioning;
+  recycle?: boolean;
+  recycleSamples?: Float32Array;
+}
+
+export function useVoice(referenceReady = true, hasCachedConditioning = false) {
   const worker = useRef<Worker | null>(null);
   const player = useRef<Player | null>(null);
   const pending = useRef(
-    new Map<string, { resolve: () => void; reject: (error: Error) => void }>(),
+    new Map<
+      string,
+      {
+        resolve: (value?: ConditionedResult) => void;
+        reject: (error: Error) => void;
+      }
+    >(),
   );
   const preparation = useRef<Promise<void> | null>(null);
   const catalogAbort = useRef<AbortController | null>(null);
   const prepared = useRef(false);
+  const hasCachedConditioningRef = useRef(hasCachedConditioning);
+  hasCachedConditioningRef.current = hasCachedConditioning;
   const reference = useRef<{ file: File; transcript: string } | null>(null);
   const sequence = useRef(0);
   const cancelling = useRef(false);
@@ -49,7 +68,7 @@ export function useVoice() {
     worker.current.postMessage(command, transfer);
   }
   function wait(key: string) {
-    return new Promise<void>((resolve, reject) =>
+    return new Promise<ConditionedResult | undefined>((resolve, reject) =>
       pending.current.set(key, { resolve, reject }),
     );
   }
@@ -99,7 +118,7 @@ export function useVoice() {
     reference.current = null;
     setLoaded(false);
   }
-  function initializeWorker() {
+  function initializeWorker(autoPrepare = true, skipVoice?: boolean) {
     const instance = new Worker(
       new URL("./inference.worker.ts", import.meta.url),
       { type: "module" },
@@ -184,26 +203,36 @@ export function useVoice() {
           });
       }
       const key = event.kind === "accepted" ? `text:${event.id}` : event.kind;
-      pending.current.get(key)?.resolve();
+      pending.current.get(key)?.resolve(
+        event.kind === "conditioned"
+          ? {
+              conditioning: event.conditioning,
+              recycle: event.recycle,
+              recycleSamples: event.recycleSamples,
+            }
+          : undefined,
+      );
       pending.current.delete(key);
     };
-    if ((navigator as Navigator & { gpu?: unknown }).gpu) {
-      void ensurePrepared().catch((reason) => {
+    if (autoPrepare && (navigator as Navigator & { gpu?: unknown }).gpu) {
+      const deferVoice = skipVoice ?? !hasCachedConditioningRef.current;
+      void ensurePrepared(deferVoice).catch((reason) => {
         if (!(reason instanceof DOMException && reason.name === "AbortError"))
           console.error("Background preparation failed", reason);
       });
     }
   }
   useEffect(() => {
-    initializeWorker();
+    if (!referenceReady) return;
+    initializeWorker(true, !hasCachedConditioningRef.current);
     return () => {
       operation.current++;
       stopWorker();
       void player.current?.close();
       if (audioUrl.current) URL.revokeObjectURL(audioUrl.current);
     };
-  }, []);
-  function ensurePrepared(): Promise<void> {
+  }, [referenceReady]);
+  function ensurePrepared(skipVoice = false): Promise<void> {
     if (prepared.current) return Promise.resolve();
     if (preparation.current) return preparation.current;
     const controller = new AbortController();
@@ -221,7 +250,7 @@ export function useVoice() {
       controller.signal.throwIfAborted();
       const ready = wait("ready");
       // Browser inference defaults: context capacity and reproducible sampling.
-      send({ kind: "load", model, context: 2048, seed: 42n });
+      send({ kind: "load", model, context: 2048, seed: 42n, skipVoice });
       await ready;
     })();
     preparation.current = task;
@@ -229,6 +258,16 @@ export function useVoice() {
       if (preparation.current === task) preparation.current = null;
     });
     return task;
+  }
+  async function recycleWorker(
+    skipVoice: boolean,
+    current: number,
+  ): Promise<boolean> {
+    stopWorker();
+    if (current !== operation.current) return false;
+    initializeWorker(false);
+    await ensurePrepared(skipVoice);
+    return current === operation.current;
   }
   async function push(text: string) {
     if (!text) return;
@@ -242,6 +281,8 @@ export function useVoice() {
     transcript: string,
     text: string,
     language = "auto",
+    savedConditioning?: SavedConditioning,
+    onConditioned?: (conditioning: SavedConditioning) => void,
   ) {
     cancelling.current = false;
     setErrorKind(null);
@@ -257,7 +298,8 @@ export function useVoice() {
     >;
     timing.current = times;
     try {
-      if (!worker.current) initializeWorker();
+      const skipInitialVoice = !savedConditioning;
+      if (!worker.current) initializeWorker(true, skipInitialVoice);
       const previous = player.current;
       const active = new Player();
       player.current = active;
@@ -268,24 +310,73 @@ export function useVoice() {
       const [, , , samples] = await Promise.all([
         active.resume(),
         previous?.close(),
-        ensurePrepared(),
+        ensurePrepared(skipInitialVoice),
         reusable ? Promise.resolve(null) : referenceAudio(file),
       ]);
       if (current !== operation.current) return;
       times.ready = performance.now();
       if (samples) {
         reference.current = null;
-        const conditioned = wait("conditioned");
-        send({ kind: "reference", samples, transcript }, [samples.buffer]);
-        await conditioned;
+        let currentSamples = samples;
+        let activeConditioning = savedConditioning;
+        const firstConditioned = wait("conditioned");
+        send(
+          {
+            kind: "reference",
+            samples: currentSamples,
+            transcript,
+            conditioning: activeConditioning,
+          },
+          [currentSamples.buffer],
+        );
+        let result = await firstConditioned;
         if (current !== operation.current) return;
+        if (result?.recycleSamples) {
+          // Cached conditioning did not match the loaded model revision.
+          currentSamples = result.recycleSamples;
+          activeConditioning = undefined;
+          if (!(await recycleWorker(true, current))) return;
+          const extractedWait = wait("conditioned");
+          send(
+            {
+              kind: "reference",
+              samples: currentSamples,
+              transcript,
+            },
+            [currentSamples.buffer],
+          );
+          result = await extractedWait;
+          if (current !== operation.current) return;
+        }
+        if (result?.conditioning) {
+          onConditioned?.(result.conditioning);
+          activeConditioning = result.conditioning;
+        }
+        if (result?.recycle) {
+          // Terminate the conditioning worker so Safari frees its GPUDevice
+          // immediately, then load synthesis weights once in a fresh worker.
+          if (!(await recycleWorker(false, current))) return;
+          const empty = new Float32Array(0);
+          const readyReference = wait("conditioned");
+          send(
+            {
+              kind: "reference",
+              samples: empty,
+              transcript,
+              conditioning: activeConditioning,
+            },
+            [empty.buffer],
+          );
+          await readyReference;
+          if (current !== operation.current) return;
+        }
         reference.current = { file, transcript };
       }
       times.conditioned = performance.now();
       if (current !== operation.current) return;
       const started = wait("started");
       // Bound each utterance and deliver roughly one second per audio chunk.
-      send({ kind: "start", language, frames: 512, chunkFrames: 12 });
+      send({ kind: "start", language, frames: 512, chunkFrames: 12, text });
       await started;
       if (current !== operation.current) return;
       await push(text);
@@ -309,7 +400,7 @@ export function useVoice() {
     setBusy(false);
     setErrorKind(null);
     setPhase(partial ? "incomplete" : "cancelled");
-    initializeWorker();
+    initializeWorker(true, !hasCachedConditioningRef.current);
   }
   return {
     phase,

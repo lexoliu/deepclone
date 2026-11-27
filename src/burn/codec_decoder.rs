@@ -23,7 +23,7 @@ struct Quantizer {
     output: Conv<Causal>,
 }
 impl Quantizer {
-    fn load(w: &impl WeightSource, p: &str, groups: usize) -> Result<Self, Error> {
+    fn load(w: &mut impl WeightSource, p: &str, groups: usize) -> Result<Self, Error> {
         let codebooks = (0..groups)
             .map(|i| {
                 let p = format!("{p}.vq.layers.{i}._codebook");
@@ -65,7 +65,7 @@ struct Snake {
     inverse_beta: Tensor<1>,
 }
 impl Snake {
-    fn load(w: &impl WeightSource, p: &str) -> Result<Self, Error> {
+    fn load(w: &mut impl WeightSource, p: &str) -> Result<Self, Error> {
         let raw_alpha = w.tensor::<1>(&format!("{p}.alpha"))?;
         let dtype = raw_alpha.dtype();
         let alpha = raw_alpha.cast(DType::F32).exp().cast(dtype);
@@ -89,7 +89,7 @@ struct Residual {
     conv2: Conv<Causal>,
 }
 impl Residual {
-    fn load(w: &impl WeightSource, p: &str, dilation: usize) -> Result<Self, Error> {
+    fn load(w: &mut impl WeightSource, p: &str, dilation: usize) -> Result<Self, Error> {
         Ok(Self {
             act1: Snake::load(w, &format!("{p}.act1"))?,
             conv1: Conv::load(w, &format!("{p}.conv1.conv"), 1, dilation, 1, Causal)?,
@@ -116,7 +116,7 @@ struct Upsample {
     residuals: Vec<Residual>,
 }
 impl Upsample {
-    fn load(w: &impl WeightSource, p: &str, stride: usize) -> Result<Self, Error> {
+    fn load(w: &mut impl WeightSource, p: &str, stride: usize) -> Result<Self, Error> {
         Ok(Self {
             activation: Snake::load(w, &format!("{p}.block.0"))?,
             conv: TransposeConv::load(w, &format!("{p}.block.1.conv"), stride)?,
@@ -161,7 +161,7 @@ struct ConvNext {
     gamma: Tensor<1>,
 }
 impl ConvNext {
-    fn load(w: &impl WeightSource, p: &str, channels: usize) -> Result<Self, Error> {
+    fn load(w: &mut impl WeightSource, p: &str, channels: usize) -> Result<Self, Error> {
         Ok(Self {
             depthwise: Conv::load(w, &format!("{p}.dwconv.conv"), 1, 1, channels, Causal)?,
             // Qwen3TTSTokenizerV2ConvNeXtBlock fixes LayerNorm epsilon to 1e-6.
@@ -224,7 +224,7 @@ pub struct CodecDecoder {
     last: Conv<Causal>,
 }
 impl CodecDecoder {
-    pub fn load(w: &impl WeightSource, c: &CodecDecoderConfig) -> Result<Self, Error> {
+    pub fn load(w: &mut impl WeightSource, c: &CodecDecoderConfig) -> Result<Self, Error> {
         if c.num_semantic_quantizers == 0 || c.num_quantizers <= c.num_semantic_quantizers {
             return Err(Error::Tensor {
                 name: "codec quantizer".into(),
@@ -233,58 +233,72 @@ impl CodecDecoder {
         }
         let p = "decoder.pre_transformer";
         let end = c.upsample_rates.len() + 1;
+        let semantic =
+            Quantizer::load(w, "decoder.quantizer.rvq_first", c.num_semantic_quantizers)?;
+        let acoustic = Quantizer::load(
+            w,
+            "decoder.quantizer.rvq_rest",
+            c.num_quantizers - c.num_semantic_quantizers,
+        )?;
+        w.device()
+            .flush()
+            .map_err(|error| Error::Execution(error.to_string()))?;
+        let preconv = Conv::load(w, "decoder.pre_conv.conv", 1, 1, 1, Causal)?;
+        let input = Linear::load(w, &format!("{p}.input_proj"))?;
+        let transformer = AudioTransformer::load(
+            w,
+            p,
+            c.attention.clone(),
+            c.rms_norm_eps,
+            Some(c.sliding_window),
+        )?;
+        let norm = RmsNorm::load(w, &format!("{p}.norm"), c.rms_norm_eps)?;
+        let output = Linear::load(w, &format!("{p}.output_proj"))?;
+        let mut preupsample = Vec::with_capacity(c.upsampling_ratios.len());
+        for (i, &stride) in c.upsampling_ratios.iter().enumerate() {
+            preupsample.push(PreUpsample {
+                conv: TransposeConv::load(w, &format!("decoder.upsample.{i}.0.conv"), stride)?,
+                block: ConvNext::load(w, &format!("decoder.upsample.{i}.1"), c.latent_dim)?,
+            });
+            w.device()
+                .flush()
+                .map_err(|error| Error::Execution(error.to_string()))?;
+        }
+        let first = Conv::load(w, "decoder.decoder.0.conv", 1, 1, 1, Causal)?;
+        let mut upsample = Vec::with_capacity(c.upsample_rates.len());
+        for (i, &stride) in c.upsample_rates.iter().enumerate() {
+            upsample.push(Upsample::load(
+                w,
+                &format!("decoder.decoder.{}", i + 1),
+                stride,
+            )?);
+            w.device()
+                .flush()
+                .map_err(|error| Error::Execution(error.to_string()))?;
+        }
+        let last_activation = Snake::load(w, &format!("decoder.decoder.{end}"))?;
+        let last = Conv::load(
+            w,
+            &format!("decoder.decoder.{}.conv", end + 1),
+            1,
+            1,
+            1,
+            Causal,
+        )?;
         Ok(Self {
-            semantic: Quantizer::load(w, "decoder.quantizer.rvq_first", c.num_semantic_quantizers)?,
-            acoustic: Quantizer::load(
-                w,
-                "decoder.quantizer.rvq_rest",
-                c.num_quantizers - c.num_semantic_quantizers,
-            )?,
+            semantic,
+            acoustic,
             semantic_groups: c.num_semantic_quantizers,
-            preconv: Conv::load(w, "decoder.pre_conv.conv", 1, 1, 1, Causal)?,
-            input: Linear::load(w, &format!("{p}.input_proj"))?,
-            transformer: AudioTransformer::load(
-                w,
-                p,
-                c.attention.clone(),
-                c.rms_norm_eps,
-                Some(c.sliding_window),
-            )?,
-            norm: RmsNorm::load(w, &format!("{p}.norm"), c.rms_norm_eps)?,
-            output: Linear::load(w, &format!("{p}.output_proj"))?,
-            preupsample: c
-                .upsampling_ratios
-                .iter()
-                .enumerate()
-                .map(|(i, &stride)| {
-                    Ok(PreUpsample {
-                        conv: TransposeConv::load(
-                            w,
-                            &format!("decoder.upsample.{i}.0.conv"),
-                            stride,
-                        )?,
-                        block: ConvNext::load(w, &format!("decoder.upsample.{i}.1"), c.latent_dim)?,
-                    })
-                })
-                .collect::<Result<_, Error>>()?,
-            first: Conv::load(w, "decoder.decoder.0.conv", 1, 1, 1, Causal)?,
-            upsample: c
-                .upsample_rates
-                .iter()
-                .enumerate()
-                .map(|(i, &stride)| {
-                    Upsample::load(w, &format!("decoder.decoder.{}", i + 1), stride)
-                })
-                .collect::<Result<_, _>>()?,
-            last_activation: Snake::load(w, &format!("decoder.decoder.{end}"))?,
-            last: Conv::load(
-                w,
-                &format!("decoder.decoder.{}.conv", end + 1),
-                1,
-                1,
-                1,
-                Causal,
-            )?,
+            preconv,
+            input,
+            transformer,
+            norm,
+            output,
+            preupsample,
+            first,
+            upsample,
+            last_activation,
+            last,
         })
     }
     pub(crate) fn cache(&self) -> CodecCache {
@@ -422,8 +436,8 @@ mod tests {
                 serde_json::from_value(config["decoder_config"].clone()).unwrap();
             let device = Device::wgpu_options().init_async().await.unwrap();
             let bytes = std::fs::read(source.join("speech_tokenizer/model.safetensors")).unwrap();
-            let weights = Weights::new(&bytes, device.clone(), DType::F32).unwrap();
-            let decoder = CodecDecoder::load(&weights, &config).unwrap();
+            let mut weights = Weights::new(&bytes, device.clone(), DType::F32).unwrap();
+            let decoder = CodecDecoder::load(&mut weights, &config).unwrap();
             let bytes = std::fs::read(fixture.join("audio-fixtures.safetensors")).unwrap();
             let data = Weights::new(&bytes, device.clone(), DType::F32).unwrap();
             let codes = data.indices::<3>("codes.80").unwrap();
@@ -533,8 +547,8 @@ mod tests {
                 serde_json::from_value(config["decoder_config"].clone()).unwrap();
             let device = Device::wgpu_options().init_async().await.unwrap();
             let bytes = std::fs::read(source.join("speech_tokenizer/model.safetensors")).unwrap();
-            let weights = Weights::new(&bytes, device.clone(), DType::F16).unwrap();
-            let decoder = CodecDecoder::load(&weights, &config).unwrap();
+            let mut weights = Weights::new(&bytes, device.clone(), DType::F16).unwrap();
+            let decoder = CodecDecoder::load(&mut weights, &config).unwrap();
             let bytes = std::fs::read(fixture.join("audio-fixtures.safetensors")).unwrap();
             let data = Weights::new(&bytes, device.clone(), DType::F32).unwrap();
             let codes = data.indices::<3>("codes.80").unwrap();

@@ -139,16 +139,30 @@ pub async fn read<const D: usize>(tensor: Tensor<D>) -> Result<Vec<f32>, Error> 
 }
 
 mod model;
-pub use model::{AudioConfig, Burn, BurnCodec, SpeechConfig};
+pub use model::{AudioConfig, Burn, BurnCodec, Conditioning, SpeechConfig};
+
+/// Parse a safetensors header dtype label into its typed representation.
+pub fn parse_safetensors_dtype(label: &str) -> Result<Dtype, Error> {
+    match label {
+        "F32" => Ok(Dtype::F32),
+        "F16" => Ok(Dtype::F16),
+        "BF16" => Ok(Dtype::BF16),
+        "U32" => Ok(Dtype::U32),
+        other => Err(Error::Tensor {
+            name: "dtype".into(),
+            reason: format!("unsupported safetensors dtype {other}"),
+        }),
+    }
+}
 
 /// Weight providers separate model construction from file or network storage.
 pub trait WeightSource {
     fn device(&self) -> &Device;
     fn dtype(&self) -> DType;
-    fn tensor<const D: usize>(&self, name: &str) -> Result<Tensor<D>, Error>;
-    fn optional<const D: usize>(&self, name: &str) -> Result<Option<Tensor<D>>, Error>;
+    fn tensor<const D: usize>(&mut self, name: &str) -> Result<Tensor<D>, Error>;
+    fn optional<const D: usize>(&mut self, name: &str) -> Result<Option<Tensor<D>>, Error>;
     fn optional_packed<const D: usize>(
-        &self,
+        &mut self,
         _name: &str,
     ) -> Result<Option<Tensor<D, Int>>, Error> {
         Ok(None)
@@ -161,20 +175,25 @@ impl WeightSource for Weights<'_> {
     fn dtype(&self) -> DType {
         self.dtype
     }
-    fn tensor<const D: usize>(&self, name: &str) -> Result<Tensor<D>, Error> {
-        self.tensor(name)
+    fn tensor<const D: usize>(&mut self, name: &str) -> Result<Tensor<D>, Error> {
+        Weights::tensor(self, name)
     }
-    fn optional<const D: usize>(&self, name: &str) -> Result<Option<Tensor<D>>, Error> {
-        self.optional(name)
+    fn optional<const D: usize>(&mut self, name: &str) -> Result<Option<Tensor<D>>, Error> {
+        Weights::optional(self, name)
     }
-    fn optional_packed<const D: usize>(&self, name: &str) -> Result<Option<Tensor<D, Int>>, Error> {
-        self.optional_packed(name)
+    fn optional_packed<const D: usize>(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<Tensor<D, Int>>, Error> {
+        Weights::optional_packed(self, name)
     }
 }
-/// GPU-resident shards. Each source byte buffer may be released after upload.
+/// GPU-resident shards. Each source byte buffer may be released after upload,
+/// and each tensor is moved out as its owning layer is constructed.
 pub struct UploadedWeights {
     device: Device,
     dtype: DType,
+    packed_bits: Option<u8>,
     tensors: std::collections::BTreeMap<String, (Tensor<1>, Vec<usize>)>,
     packed: std::collections::BTreeMap<String, (Tensor<1, Int>, Vec<usize>)>,
 }
@@ -183,58 +202,102 @@ impl UploadedWeights {
         Self {
             device,
             dtype,
+            packed_bits: None,
             tensors: Default::default(),
             packed: Default::default(),
         }
     }
     pub(crate) fn transformer_weight_bits(&self) -> u8 {
-        if self.packed.keys().any(|name| name.ends_with(".qweight_i4")) {
-            4
-        } else if self.packed.keys().any(|name| name.ends_with(".qweight_i8")) {
-            8
+        if let Some(bits) = self.packed_bits {
+            bits
         } else if self.dtype == DType::F16 {
             16
         } else {
             32
         }
     }
+    pub fn upload_tensor(
+        &mut self,
+        name: String,
+        source_dtype: Dtype,
+        shape: Vec<usize>,
+        bytes: Vec<u8>,
+        dtype: DType,
+    ) -> Result<(), Error> {
+        if self.tensors.contains_key(&name) || self.packed.contains_key(&name) {
+            return Err(Error::Tensor {
+                name,
+                reason: "duplicate tensor in weight shards".into(),
+            });
+        }
+        let elements = shape
+            .iter()
+            .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+            .ok_or_else(|| Error::Tensor {
+                name: name.clone(),
+                reason: format!("tensor shape overflow: {shape:?}"),
+            })?;
+        let element_bytes = match source_dtype {
+            Dtype::U32 | Dtype::F32 => 4,
+            Dtype::F16 | Dtype::BF16 => 2,
+            other => {
+                return Err(Error::Tensor {
+                    name,
+                    reason: format!("unsupported dtype {other:?}"),
+                });
+            }
+        };
+        let expected_bytes = elements
+            .checked_mul(element_bytes)
+            .ok_or_else(|| Error::Tensor {
+                name: name.clone(),
+                reason: format!("tensor byte length overflow: {shape:?}"),
+            })?;
+        if bytes.len() != expected_bytes {
+            return Err(Error::Tensor {
+                name,
+                reason: format!(
+                    "expected {expected_bytes} bytes for shape {shape:?} ({source_dtype:?}), got {}",
+                    bytes.len()
+                ),
+            });
+        }
+        if source_dtype == Dtype::U32 {
+            if name.ends_with(".qweight_i4") {
+                self.packed_bits = Some(4);
+            } else if name.ends_with(".qweight_i8") && self.packed_bits != Some(4) {
+                self.packed_bits = Some(8);
+            }
+            // Store raw 32-bit packed words in Burn's native i32 integer storage;
+            // kernels reinterpret bits as u32 so WGSL/Metal/Vulkan share one layout.
+            let data = TensorData::from_bytes_vec(bytes, [elements], DType::I32);
+            self.packed
+                .insert(name, (Tensor::from_data(data, &self.device), shape));
+            return Ok(());
+        }
+        let from_dtype = match source_dtype {
+            Dtype::F32 => DType::F32,
+            Dtype::F16 => DType::F16,
+            Dtype::BF16 => DType::BF16,
+            _ => unreachable!("validated above"),
+        };
+        let data = TensorData::from_bytes_vec(bytes, [elements], from_dtype).convert_dtype(dtype);
+        self.tensors.insert(
+            name,
+            (Tensor::from_data(data, (&self.device, dtype)), shape),
+        );
+        Ok(())
+    }
     pub fn upload(&mut self, bytes: &[u8], dtype: DType) -> Result<(), Error> {
         let shard = SafeTensors::deserialize(bytes)?;
         for (name, source) in shard.tensors() {
-            if self.tensors.contains_key(&name) || self.packed.contains_key(&name) {
-                return Err(Error::Tensor {
-                    name,
-                    reason: "duplicate tensor in weight shards".into(),
-                });
-            }
-            let shape = source.shape().to_vec();
-            let elements = shape.iter().product::<usize>();
-            if source.dtype() == Dtype::U32 {
-                // Store raw 32-bit packed words in Burn's native i32 integer storage;
-                // kernels reinterpret bits as u32 so WGSL/Metal/Vulkan share one layout.
-                let data =
-                    TensorData::from_bytes_vec(source.data().to_vec(), [elements], DType::I32);
-                self.packed
-                    .insert(name, (Tensor::from_data(data, &self.device), shape));
-                continue;
-            }
-            let source_dtype = match source.dtype() {
-                Dtype::F32 => DType::F32,
-                Dtype::F16 => DType::F16,
-                Dtype::BF16 => DType::BF16,
-                other => {
-                    return Err(Error::Tensor {
-                        name,
-                        reason: format!("unsupported dtype {other:?}"),
-                    });
-                }
-            };
-            let data = TensorData::from_bytes_vec(source.data().to_vec(), [elements], source_dtype)
-                .convert_dtype(dtype);
-            self.tensors.insert(
+            self.upload_tensor(
                 name,
-                (Tensor::from_data(data, (&self.device, dtype)), shape),
-            );
+                source.dtype(),
+                source.shape().to_vec(),
+                source.data().to_vec(),
+                dtype,
+            )?;
         }
         Ok(())
     }
@@ -246,33 +309,36 @@ impl WeightSource for UploadedWeights {
     fn dtype(&self) -> DType {
         self.dtype
     }
-    fn tensor<const D: usize>(&self, name: &str) -> Result<Tensor<D>, Error> {
-        let (tensor, shape) = self.tensors.get(name).ok_or_else(|| Error::Tensor {
+    fn tensor<const D: usize>(&mut self, name: &str) -> Result<Tensor<D>, Error> {
+        let (tensor, shape) = self.tensors.remove(name).ok_or_else(|| Error::Tensor {
             name: name.into(),
             reason: "missing tensor".into(),
         })?;
-        let shape: [usize; D] = shape.clone().try_into().map_err(|_| Error::Tensor {
+        let shape: [usize; D] = shape.try_into().map_err(|_| Error::Tensor {
             name: name.into(),
             reason: format!("expected rank {D}"),
         })?;
-        Ok(tensor.clone().reshape(shape))
+        Ok(tensor.reshape(shape))
     }
-    fn optional<const D: usize>(&self, name: &str) -> Result<Option<Tensor<D>>, Error> {
+    fn optional<const D: usize>(&mut self, name: &str) -> Result<Option<Tensor<D>>, Error> {
         if self.tensors.contains_key(name) {
             self.tensor(name).map(Some)
         } else {
             Ok(None)
         }
     }
-    fn optional_packed<const D: usize>(&self, name: &str) -> Result<Option<Tensor<D, Int>>, Error> {
-        let Some((tensor, shape)) = self.packed.get(name) else {
+    fn optional_packed<const D: usize>(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<Tensor<D, Int>>, Error> {
+        let Some((tensor, shape)) = self.packed.remove(name) else {
             return Ok(None);
         };
-        let shape: [usize; D] = shape.clone().try_into().map_err(|_| Error::Tensor {
+        let shape: [usize; D] = shape.try_into().map_err(|_| Error::Tensor {
             name: name.into(),
             reason: format!("expected rank {D}"),
         })?;
-        Ok(Some(tensor.clone().reshape(shape)))
+        Ok(Some(tensor.reshape(shape)))
     }
 }
 

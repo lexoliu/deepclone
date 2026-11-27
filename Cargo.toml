@@ -12,7 +12,7 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 default = []
-browser = ["dep:getrandom","tokenizers/unstable_wasm", "burn", "streaming", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:gloo-timers", "dep:web-time", "rand/std_rng"]
+browser = ["dep:getrandom","tokenizers/unstable_wasm", "burn", "streaming", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:gloo-timers", "dep:web-time", "dep:sha2", "rand/std_rng"]
 burn = ["dep:burn", "dep:safetensors", "inference"]
 sampling = ["dep:rand", "dep:thiserror"]
 coreml = ["dep:ondevice-coreml", "dep:safetensors", "dep:thiserror"]
@@ -67,6 +67,7 @@ wasm-bindgen-futures = { version = "0.4.80", default-features = false, features 
 js-sys = { version = "0.3.107", default-features = false, features = ["std"], optional = true }
 gloo-timers = { version = "0.4.0", default-features = false, features = ["futures"], optional = true }
 web-time = { version = "1.1.0", default-features = false, optional = true }
+sha2 = { version = "0.11.1", default-features = false, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.getrandom]
 version = "0.4.3"

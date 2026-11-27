@@ -20,7 +20,7 @@ use burn::{
     tensor::{DType, Device, Int, Shape, Tensor as BurnTensor, TensorData, activation},
 };
 use serde::Deserialize;
-use std::num::NonZeroUsize;
+use std::{collections::HashMap, num::NonZeroUsize};
 
 const EMBED_LANES: usize = 256;
 
@@ -161,10 +161,122 @@ pub struct AudioConfig {
     pub output_sample_rate: u32,
 }
 
+enum TextEmbeddings {
+    Full(BurnTensor<2>),
+    Compact {
+        table: Option<BurnTensor<2>>,
+        rows: HashMap<u32, usize>,
+    },
+}
+impl TextEmbeddings {
+    fn embed(&self, token: u32) -> Result<BurnTensor<3>, Error> {
+        match self {
+            Self::Full(table) => {
+                let [vocabulary, width] = table.dims();
+                let row = token as usize;
+                if row >= vocabulary {
+                    return Err(Error::Contract("token outside embedding vocabulary"));
+                }
+                // A known row needs no uploaded integer index or embedding gather kernel.
+                Ok(table
+                    .clone()
+                    .slice([row..row + 1, 0..width])
+                    .reshape([1, 1, width]))
+            }
+            Self::Compact { table, rows } => {
+                let table = table.as_ref().ok_or(Error::Contract(
+                    "text embeddings were not prepared for this utterance",
+                ))?;
+                let &row = rows.get(&token).ok_or(Error::Contract(
+                    "token missing from prepared text embeddings",
+                ))?;
+                let width = table.dims()[1];
+                Ok(table
+                    .clone()
+                    .slice([row..row + 1, 0..width])
+                    .reshape([1, 1, width]))
+            }
+        }
+    }
+}
+
+/// Standalone FP32 speaker and reference-audio encoder.
+/// Dropping this releases conditioning weights before synthesis loads.
+pub struct Conditioning {
+    speaker: Speaker,
+    encoder: CodecEncoder,
+    device: Device,
+}
+impl Conditioning {
+    pub fn load(
+        weights: &mut impl WeightSource,
+        config: &SpeechConfig,
+        codec: &AudioConfig,
+    ) -> Result<Self, Error> {
+        let device = weights.device().clone();
+        let speaker = Speaker::load(weights, &config.speaker_encoder_config)?;
+        device
+            .flush()
+            .map_err(|error| super::Error::Execution(error.to_string()))?;
+        let encoder = CodecEncoder::load(
+            weights,
+            &codec.encoder_config,
+            codec.encoder_valid_num_quantizers,
+            codec.encode_downsample_rate,
+        )?;
+        device
+            .flush()
+            .map_err(|error| super::Error::Execution(error.to_string()))?;
+        device.memory_cleanup();
+        Ok(Self {
+            speaker,
+            encoder,
+            device,
+        })
+    }
+    pub async fn extract(
+        &self,
+        samples: &[f32],
+        mel: &[f32],
+        channels: usize,
+    ) -> Result<(Vec<f32>, [usize; 3], Vec<Vec<u32>>), Error> {
+        let mel = BurnTensor::<3>::from_data(
+            TensorData::new(mel.to_vec(), [1, mel.len() / channels, channels]),
+            &self.device,
+        );
+        let speaker = self.speaker.forward(mel).swap_dims(1, 2);
+        let speaker_shape = speaker.dims();
+        let speaker_values = super::read(speaker).await?;
+        let audio = BurnTensor::<3>::from_data(
+            TensorData::new(samples.to_vec(), [1, 1, samples.len()]),
+            &self.device,
+        );
+        let codes = self.encoder.forward(audio);
+        let [_, groups, frames] = codes.dims();
+        let values = codes
+            .into_data_async()
+            .await
+            .map_err(|e| super::Error::Execution(e.to_string()))?
+            .try_into_vec::<i32>()
+            .map_err(|e| super::Error::Execution(e.to_string()))?;
+        let codes = (0..frames)
+            .map(|f| {
+                (0..groups)
+                    .map(|g| {
+                        u32::try_from(values[g * frames + f])
+                            .map_err(|_| Error::Contract("negative reference code"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((speaker_values, speaker_shape, codes))
+    }
+}
+
 pub struct Burn {
     talker: Decoder,
     predictor: Decoder,
-    text: BurnTensor<2>,
+    text: TextEmbeddings,
     text_first: Linear,
     text_last: Linear,
     code_table: BurnTensor<2>,
@@ -173,8 +285,8 @@ pub struct Burn {
     talker_head: Linear,
     predictor_heads: Vec<Linear>,
     projection: Option<Linear>,
-    speaker: Speaker,
-    encoder: CodecEncoder,
+    speaker: Option<Speaker>,
+    encoder: Option<CodecEncoder>,
     device: Device,
     dtype: DType,
 }
@@ -185,18 +297,17 @@ pub struct BurnCodec {
     device: Device,
 }
 impl Burn {
-    pub fn load(
-        speech: &impl WeightSource,
-        conditioning: &impl WeightSource,
-        audio: &impl WeightSource,
-        config: SpeechConfig,
-        codec: AudioConfig,
+    fn load_speech(
+        speech: &mut impl WeightSource,
+        c: TalkerConfig,
         capacity: NonZeroUsize,
-    ) -> Result<(Self, BurnCodec), Error> {
-        let c = config.talker_config;
+        load_full_text: bool,
+    ) -> Result<Self, Error> {
         if c.hidden_act != "silu" {
             return Err(Error::Contract("unsupported text projection activation"));
         }
+        let device = speech.device().clone();
+        let dtype = speech.dtype();
         let mut codes: Vec<BurnTensor<2>> =
             vec![speech.tensor("talker.model.codec_embedding.weight")?];
         for group in 0..c.num_code_groups - 1 {
@@ -218,6 +329,9 @@ impl Burn {
             offset += vocab;
         }
         let code_table = BurnTensor::cat(codes, 0);
+        device
+            .flush()
+            .map_err(|error| super::Error::Execution(error.to_string()))?;
         let projection = if c.decoder.hidden_size != c.code_predictor_config.hidden_size {
             Some(Linear::load(
                 speech,
@@ -226,58 +340,204 @@ impl Burn {
         } else {
             None
         };
+        let text = if load_full_text {
+            TextEmbeddings::Full(speech.tensor("talker.model.text_embedding.weight")?)
+        } else {
+            TextEmbeddings::Compact {
+                table: None,
+                rows: HashMap::new(),
+            }
+        };
+        let text_first = Linear::load(speech, "talker.text_projection.linear_fc1")?;
+        let text_last = Linear::load(speech, "talker.text_projection.linear_fc2")?;
+        let talker_head = Linear::load(speech, "talker.codec_head")?;
+        let predictor_heads = (0..c.num_code_groups - 1)
+            .map(|i| Linear::load(speech, &format!("talker.code_predictor.lm_head.{i}")))
+            .collect::<Result<_, _>>()?;
+        let predictor = Decoder::load(
+            speech,
+            "talker.code_predictor.model",
+            c.code_predictor_config,
+            NonZeroUsize::new(c.num_code_groups + 1).ok_or(Error::Contract("empty code groups"))?,
+        )?;
+        // Load Talker last so its full-context KV cache allocates after smaller
+        // modules have released their source tensors back to CubeCL's pool.
+        let talker = Decoder::load(speech, "talker.model", c.decoder, capacity)?;
+        device.memory_cleanup();
+        Ok(Self {
+            talker,
+            predictor,
+            text,
+            text_first,
+            text_last,
+            code_table,
+            code_offsets,
+            code_vocabs,
+            talker_head,
+            predictor_heads,
+            projection,
+            speaker: None,
+            encoder: None,
+            device,
+            dtype,
+        })
+    }
+    pub fn load(
+        speech: &mut impl WeightSource,
+        conditioning: &mut impl WeightSource,
+        audio: &mut impl WeightSource,
+        config: SpeechConfig,
+        codec: AudioConfig,
+        capacity: NonZeroUsize,
+    ) -> Result<(Self, BurnCodec), Error> {
         let decoder = CodecDecoder::load(audio, &codec.decoder_config)?;
+        audio
+            .device()
+            .flush()
+            .map_err(|error| super::Error::Execution(error.to_string()))?;
         let decoder_cache = decoder.cache();
+        let speaker = Speaker::load(conditioning, &config.speaker_encoder_config)?;
+        let encoder = CodecEncoder::load(
+            audio,
+            &codec.encoder_config,
+            codec.encoder_valid_num_quantizers,
+            codec.encode_downsample_rate,
+        )?;
+        audio
+            .device()
+            .flush()
+            .map_err(|error| super::Error::Execution(error.to_string()))?;
+        let mut model = Self::load_speech(speech, config.talker_config, capacity, true)?;
+        model.speaker = Some(speaker);
+        model.encoder = Some(encoder);
+        let device = model.device.clone();
         Ok((
-            Self {
-                talker: Decoder::load(speech, "talker.model", c.decoder, capacity)?,
-                predictor: Decoder::load(
-                    speech,
-                    "talker.code_predictor.model",
-                    c.code_predictor_config,
-                    NonZeroUsize::new(c.num_code_groups + 1)
-                        .ok_or(Error::Contract("empty code groups"))?,
-                )?,
-                text: speech.tensor("talker.model.text_embedding.weight")?,
-                text_first: Linear::load(speech, "talker.text_projection.linear_fc1")?,
-                text_last: Linear::load(speech, "talker.text_projection.linear_fc2")?,
-                code_table,
-                code_offsets,
-                code_vocabs,
-                talker_head: Linear::load(speech, "talker.codec_head")?,
-                predictor_heads: (0..c.num_code_groups - 1)
-                    .map(|i| Linear::load(speech, &format!("talker.code_predictor.lm_head.{i}")))
-                    .collect::<Result<_, _>>()?,
-                projection,
-                speaker: Speaker::load(conditioning, &config.speaker_encoder_config)?,
-                encoder: CodecEncoder::load(
-                    audio,
-                    &codec.encoder_config,
-                    codec.encoder_valid_num_quantizers,
-                    codec.encode_downsample_rate,
-                )?,
-                device: speech.device().clone(),
-                dtype: speech.dtype(),
-            },
+            model,
             BurnCodec {
                 decoder,
                 decoder_cache,
                 reference_decoder_cache: None,
-                device: speech.device().clone(),
+                device,
             },
         ))
     }
-    fn embed(&self, table: &BurnTensor<2>, token: u32) -> Result<BurnTensor<3>, Error> {
-        let [vocabulary, width] = table.dims();
-        let row = token as usize;
-        if row >= vocabulary {
-            return Err(Error::Contract("token outside embedding vocabulary"));
+    pub fn load_unified(
+        weights: &mut impl WeightSource,
+        config: SpeechConfig,
+        codec: AudioConfig,
+        capacity: NonZeroUsize,
+    ) -> Result<(Self, BurnCodec), Error> {
+        let device = weights.device().clone();
+        let decoder = CodecDecoder::load(weights, &codec.decoder_config)?;
+        device
+            .flush()
+            .map_err(|error| super::Error::Execution(error.to_string()))?;
+        let decoder_cache = decoder.cache();
+        let speaker = Speaker::load(weights, &config.speaker_encoder_config)?;
+        let encoder = CodecEncoder::load(
+            weights,
+            &codec.encoder_config,
+            codec.encoder_valid_num_quantizers,
+            codec.encode_downsample_rate,
+        )?;
+        device
+            .flush()
+            .map_err(|error| super::Error::Execution(error.to_string()))?;
+        let mut model = Self::load_speech(weights, config.talker_config, capacity, true)?;
+        model.speaker = Some(speaker);
+        model.encoder = Some(encoder);
+        Ok((
+            model,
+            BurnCodec {
+                decoder,
+                decoder_cache,
+                reference_decoder_cache: None,
+                device,
+            },
+        ))
+    }
+    /// Load synthesis-only weights without the full text vocabulary table or
+    /// reference conditioning encoders.
+    pub fn load_synthesis(
+        weights: &mut impl WeightSource,
+        config: SpeechConfig,
+        codec: AudioConfig,
+        capacity: NonZeroUsize,
+    ) -> Result<(Self, BurnCodec), Error> {
+        let device = weights.device().clone();
+        let decoder = CodecDecoder::load(weights, &codec.decoder_config)?;
+        device
+            .flush()
+            .map_err(|error| super::Error::Execution(error.to_string()))?;
+        let decoder_cache = decoder.cache();
+        let model = Self::load_speech(weights, config.talker_config, capacity, false)?;
+        Ok((
+            model,
+            BurnCodec {
+                decoder,
+                decoder_cache,
+                reference_decoder_cache: None,
+                device,
+            },
+        ))
+    }
+    pub fn set_text_embeddings(
+        &mut self,
+        token_ids: &[u32],
+        source_dtype: safetensors::Dtype,
+        bytes: Vec<u8>,
+        width: usize,
+    ) -> Result<(), Error> {
+        if token_ids.is_empty() || width == 0 {
+            return Err(Error::Contract("compact text embeddings must be nonempty"));
         }
-        // A known row needs no uploaded integer index or embedding gather kernel.
-        Ok(table
-            .clone()
-            .slice([row..row + 1, 0..width])
-            .reshape([1, 1, width]))
+        let (from_dtype, element_bytes) = match source_dtype {
+            safetensors::Dtype::F16 => (DType::F16, 2usize),
+            safetensors::Dtype::BF16 => (DType::BF16, 2usize),
+            safetensors::Dtype::F32 => (DType::F32, 4usize),
+            _ => return Err(Error::Contract("unsupported text embedding dtype")),
+        };
+        let expected = token_ids
+            .len()
+            .checked_mul(width)
+            .and_then(|elements| elements.checked_mul(element_bytes))
+            .ok_or(Error::Contract("compact text embedding size overflow"))?;
+        if bytes.len() != expected {
+            return Err(Error::Contract(
+                "compact text embedding byte length does not match token count and width",
+            ));
+        }
+        let mut rows = HashMap::with_capacity(token_ids.len());
+        for (row, &id) in token_ids.iter().enumerate() {
+            rows.insert(id, row);
+        }
+        let data = TensorData::from_bytes_vec(bytes, [token_ids.len(), width], from_dtype)
+            .convert_dtype(self.dtype);
+        let table = BurnTensor::<2>::from_data(data, (&self.device, self.dtype));
+        self.text = TextEmbeddings::Compact {
+            table: Some(table),
+            rows,
+        };
+        Ok(())
+    }
+    pub fn speaker_tensor(
+        &self,
+        values: Vec<f32>,
+        shape: [usize; 3],
+    ) -> Result<BurnTensor<3>, Error> {
+        let expected = shape[0]
+            .checked_mul(shape[1])
+            .and_then(|elements| elements.checked_mul(shape[2]))
+            .ok_or(Error::Contract("speaker embedding shape overflow"))?;
+        if values.len() != expected {
+            return Err(Error::Contract(
+                "speaker embedding length does not match shape",
+            ));
+        }
+        Ok(
+            BurnTensor::<3>::from_data(TensorData::new(values, shape), &self.device)
+                .cast(self.dtype),
+        )
     }
 }
 impl Model for Burn {
@@ -314,7 +574,7 @@ impl Model for Burn {
     }
     fn text(&mut self, token: u32) -> Result<Self::Hidden, Error> {
         Ok(self.text_last.forward(activation::silu(
-            self.text_first.forward(self.embed(&self.text, token)?),
+            self.text_first.forward(self.text.embed(token)?),
         )))
     }
     fn code(&mut self, group: usize, token: u32) -> Result<Self::Hidden, Error> {
@@ -406,16 +666,22 @@ impl Model for Burn {
         mel: &[f32],
         channels: usize,
     ) -> Result<(Self::Hidden, Vec<Vec<u32>>), Error> {
+        let speaker_net = self.speaker.as_ref().ok_or(Error::Contract(
+            "conditioning weights are not loaded in synthesis-only mode",
+        ))?;
+        let encoder_net = self.encoder.as_ref().ok_or(Error::Contract(
+            "conditioning weights are not loaded in synthesis-only mode",
+        ))?;
         let mel = BurnTensor::<3>::from_data(
             TensorData::new(mel.to_vec(), [1, mel.len() / channels, channels]),
             &self.device,
         );
-        let speaker = self.speaker.forward(mel).swap_dims(1, 2).cast(self.dtype);
+        let speaker = speaker_net.forward(mel).swap_dims(1, 2).cast(self.dtype);
         let audio = BurnTensor::<3>::from_data(
             TensorData::new(samples.to_vec(), [1, 1, samples.len()]),
             &self.device,
         );
-        let codes = self.encoder.forward(audio);
+        let codes = encoder_net.forward(audio);
         let [_, groups, frames] = codes.dims();
         let values = codes
             .into_data_async()

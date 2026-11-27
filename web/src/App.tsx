@@ -42,8 +42,11 @@ function VoiceMark() {
 }
 
 export default function App() {
-  const voice = useVoice();
   const reference = useReference();
+  const voice = useVoice(
+    reference.ready,
+    Boolean(reference.value?.conditioning),
+  );
   const [setupOpen, setSetupOpen] = useState(false);
   const [step, setStep] = useState<1 | 2>(1);
   const [recordingBusy, setRecordingBusy] = useState(false);
@@ -86,7 +89,15 @@ export default function App() {
 
   async function generate() {
     if (!file || !transcript.trim() || !text.trim()) return;
-    await voice.start(file, transcript, text, "auto");
+    await voice.start(
+      file,
+      transcript,
+      text,
+      "auto",
+      reference.value?.conditioning,
+      (conditioning) =>
+        reference.saveConditioning(file, transcript, conditioning),
+    );
   }
 
   const statusText =

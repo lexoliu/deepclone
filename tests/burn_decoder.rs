@@ -43,11 +43,11 @@ fn check_decoder(dtype: DType, prefix: &str, config_file: &str, fixture_prefix: 
         let fixture = PathBuf::from(std::env::var_os("DEEPCLONE_BURN_FIXTURES").unwrap());
         let device = Device::wgpu_options().init_async().await.unwrap();
         let bytes = std::fs::read(source.join("model.safetensors")).unwrap();
-        let weights = Weights::new(&bytes, device.clone(), dtype).unwrap();
+        let mut weights = Weights::new(&bytes, device.clone(), dtype).unwrap();
         let config: DecoderConfig =
             serde_json::from_slice(&std::fs::read(fixture.join(config_file)).unwrap()).unwrap();
         let mut decoder =
-            Decoder::load(&weights, prefix, config, NonZeroUsize::new(64).unwrap()).unwrap();
+            Decoder::load(&mut weights, prefix, config, NonZeroUsize::new(64).unwrap()).unwrap();
         drop(weights);
         drop(bytes);
         let bytes = std::fs::read(fixture.join("decoder-fixtures.safetensors")).unwrap();

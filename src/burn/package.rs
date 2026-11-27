@@ -63,12 +63,13 @@ impl<T: crate::sampling::TokenSampler, S: crate::sampling::TokenSampler>
                 },
             )?;
         }
-        let (backend, codec) = Burn::load(&weights, &weights, &weights, config, audio, capacity)?;
+        let weight_bits = weights.transformer_weight_bits();
+        let (backend, codec) = Burn::load_unified(&mut weights, config, audio, capacity)?;
         Self::new(
             backend,
             codec,
             Assets {
-                weight_bits: weights.transformer_weight_bits(),
+                weight_bits,
                 config: json(path.join("config.json"))?,
                 encoder_contract,
                 decoder_contract,
