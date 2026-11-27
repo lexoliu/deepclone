@@ -30,20 +30,40 @@ jobs:
           RUN_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
         run: |
           main_sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq '.sha')
+          has_browser_artifact() {
+            local candidate="$1"
+            local count
+            count=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate}/artifacts" \
+              --jq '[.artifacts[] | select(.name == "deepclone-browser" and (.expired | not))] | length')
+            [ "$count" -gt 0 ]
+          }
           if [ "$EVENT_NAME" = "workflow_run" ]; then
             if [ "$RUN_REPO" != "$GITHUB_REPOSITORY" ] || [ "$RUN_SHA" != "$main_sha" ]; then
+              echo "deploy=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if ! has_browser_artifact "$RUN_ID"; then
+              echo "CI run ${RUN_ID} did not produce deepclone-browser; skipping Pages deploy."
               echo "deploy=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             run_id="$RUN_ID"
             target_sha="$RUN_SHA"
           else
-            run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --branch main --event push --status success --commit "$main_sha" --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+            run_id=""
+            target_sha=""
+            while IFS=$'\t' read -r candidate sha; do
+              [ -n "$candidate" ] || continue
+              if has_browser_artifact "$candidate"; then
+                run_id="$candidate"
+                target_sha="$sha"
+                break
+              fi
+            done < <(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --branch main --event push --status success --limit 20 --json databaseId,headSha --jq '.[] | "\(.databaseId)\t\(.headSha)"')
             if [ -z "$run_id" ]; then
-              echo "No successful CI run found for main (${main_sha})." >&2
+              echo "No successful CI run with a deepclone-browser artifact found on main." >&2
               exit 1
             fi
-            target_sha="$main_sha"
           fi
           {
             echo "deploy=true"
