@@ -1,391 +1,458 @@
-import { useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ArrowDownIcon,
+  ArrowLeftIcon,
   ArrowRightIcon,
-  SpeakerLoudIcon,
+  CheckIcon,
+  ReloadIcon,
   StopIcon,
-  UploadIcon,
+  TrashIcon,
 } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
 import { Progress } from "@/components/ui/progress";
-import { useVoice } from "@/runtime/use-voice";
-
-import { ReferenceRecorder } from "./ReferenceRecorder";
-import { SavedVoice } from "./SavedVoice";
+import { Textarea } from "@/components/ui/textarea";
 import { useReference } from "@/runtime/use-reference";
+import { useVoice } from "@/runtime/use-voice";
+import {
+  COPY,
+  LANGUAGES,
+  detectBrowserLanguage,
+  resolveLanguage,
+  type LanguageId,
+} from "./i18n";
+import { ReferenceRecorder } from "./ReferenceRecorder";
+
+function VoiceMark() {
+  return (
+    <svg
+      viewBox="0 0 20 20"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.7"
+      strokeLinecap="round"
+      className="size-4"
+      aria-hidden="true"
+    >
+      <path d="M4 8.5v3" />
+      <path d="M8 5.5v9" />
+      <path d="M12 3.5v13" />
+      <path d="M16 7v6" />
+    </svg>
+  );
+}
 
 export default function App() {
-  const [referenceMode, setReferenceMode] = useState<"record" | "upload">(
-    "record",
-  );
   const voice = useVoice();
   const reference = useReference();
-  const [replacing, setReplacing] = useState(false);
-  const file = reference.value?.file ?? null;
-  const transcript = reference.value?.transcript ?? "";
-  const [draftTranscript, setDraftTranscript] = useState("");
-  function chooseFile(file: File | null) {
-    if (file)
-      reference.save({
-        file,
-        transcript: draftTranscript,
-        source: "upload",
-        language: "auto",
-      });
-  }
-  const referenceDisabled = voice.busy || !reference.ready;
+  const [setupOpen, setSetupOpen] = useState(false);
+  const [step, setStep] = useState<1 | 2>(1);
+  const [recordingBusy, setRecordingBusy] = useState(false);
+  const [selectedLanguage, setSelectedLanguage] = useState<LanguageId>(() =>
+    detectBrowserLanguage(),
+  );
   const [text, setText] = useState("");
-  const [language, setLanguage] = useState("auto");
-  const [live, setLive] = useState(false);
-  const [inputEnded, setInputEnded] = useState(false);
-  const [formError, setFormError] = useState<string | null>(null);
-  const sent = useRef("");
-  const sending = useRef(Promise.resolve());
-  const picker = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (reference.value?.language) {
+      setSelectedLanguage(resolveLanguage(reference.value.language));
+    }
+  }, [reference.value?.language]);
+
+  const hasSavedVoice = Boolean(
+    reference.value?.file && reference.value.transcript.trim(),
+  );
+  const inSetup = !hasSavedVoice || setupOpen;
+  const activeLanguage = inSetup
+    ? selectedLanguage
+    : resolveLanguage(reference.value?.language);
+  const copy = COPY[activeLanguage];
+
+  useEffect(() => {
+    const bcp47 =
+      LANGUAGES.find((entry) => entry.id === activeLanguage)?.bcp47 ?? "en";
+    document.documentElement.lang = bcp47;
+  }, [activeLanguage]);
+
   const supported =
     typeof navigator !== "undefined" &&
     Boolean((navigator as Navigator & { gpu?: unknown }).gpu);
+
+  const file = reference.value?.file ?? null;
+  const transcript = reference.value?.transcript ?? "";
   const canGenerate =
-    supported && file && transcript.trim() && text.trim() && !voice.busy;
-  function updateText(value: string) {
-    if (voice.running && live && !inputEnded) {
-      if (!value.startsWith(sent.current)) {
-        setFormError(
-          "During streaming, append new text after the text already sent.",
-        );
-        return;
-      }
-      const delta = value.slice(sent.current.length);
-      sent.current = value;
-      sending.current = sending.current
-        .then(() => voice.push(delta))
-        .catch((error) => {
-          console.error("Text stream failed", error);
-          setFormError("Text could not be sent. Please try again.");
-        });
-    }
-    setText(value);
-  }
+    supported &&
+    Boolean(file && transcript.trim() && text.trim()) &&
+    !voice.busy;
+
   async function generate() {
-    if (!file) return;
-    setFormError(null);
-    sent.current = text;
-    setInputEnded(false);
-    await voice.start(file, transcript, text, language, live);
+    if (!file || !transcript.trim() || !text.trim()) return;
+    await voice.start(file, transcript, text, "auto");
   }
-  const error = formError || voice.error || reference.error;
+
+  const statusText =
+    voice.phase === "conditioning"
+      ? copy.statusConditioning
+      : voice.phase === "generating"
+        ? copy.statusGenerating
+        : voice.phase === "playing"
+          ? copy.statusPlaying
+          : voice.phase === "done"
+            ? copy.statusDone
+            : voice.phase === "cancelled"
+              ? copy.statusCancelled
+              : voice.phase === "incomplete"
+                ? copy.statusIncomplete
+                : voice.phase === "stopped"
+                  ? copy.statusStopped
+                  : copy.statusReady;
+
+  const voiceError =
+    voice.errorKind === "prepare_failed"
+      ? copy.errorPrepareFailed
+      : voice.errorKind === "stopped_empty"
+        ? copy.errorStoppedEmpty
+        : voice.errorKind === "stopped_partial"
+          ? copy.errorStoppedPartial
+          : null;
+
+  const referenceError =
+    reference.errorKind === "restore_failed"
+      ? copy.errorRestoreFailed
+      : reference.errorKind === "save_failed"
+        ? copy.errorSaveFailed
+        : null;
+
+  const errorMessage = voiceError || referenceError;
+
+  if (!reference.ready) {
+    return (
+      <div className="mx-auto flex min-h-[100dvh] w-full max-w-[32rem] flex-col px-5 pt-5 pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:px-6 sm:py-8">
+        <div className="flex h-11 items-center justify-between">
+          <div className="h-6 w-28 animate-pulse rounded-lg bg-secondary" />
+          <div className="h-8 w-20 animate-pulse rounded-full bg-secondary" />
+        </div>
+        <div className="mt-8 space-y-3">
+          <div className="h-8 w-52 animate-pulse rounded-xl bg-secondary" />
+          <div className="h-5 w-72 animate-pulse rounded-lg bg-secondary" />
+        </div>
+        <div className="mt-7 h-64 animate-pulse rounded-3xl bg-white/70" />
+      </div>
+    );
+  }
+
   return (
-    <div className="min-h-[100dvh]">
-      <header className="flex h-16 items-center justify-between border-b px-5 md:px-9">
-        <a
-          href="/"
-          className="flex items-center gap-2.5 text-sm font-semibold tracking-tight"
-        >
-          <span className="flex size-7 items-center justify-center rounded-md border bg-white">
-            <SpeakerLoudIcon />
-          </span>
-          deepclone
-        </a>
-        <span className="text-xs text-muted-foreground">
-          Local voice workspace
-        </span>
-      </header>
-      <div className="mx-auto max-w-6xl">
-        <main className="min-w-0 px-5 py-9 md:px-12 md:py-12">
-          <div className="mb-10">
-            <div className="mb-3 text-xs text-muted-foreground">
-              Workspace / Voice cloning
-            </div>
-            <h1 className="text-2xl font-semibold tracking-tight">
-              Make it your voice.
-            </h1>
-            <p className="mt-2 text-sm text-muted-foreground">
-              Add a reference recording, then write something new.
-            </p>
-          </div>
-          {!supported ? (
+    <div className="relative min-h-[100dvh]">
+      <div
+        aria-hidden="true"
+        className="grain-overlay pointer-events-none fixed inset-0"
+      />
+      <div className="relative mx-auto flex min-h-[100dvh] w-full max-w-[32rem] flex-col px-5 pt-4 pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:px-6 sm:py-8">
+        <header className="flex h-12 items-center justify-between gap-3">
+          {inSetup && step === 2 ? (
+            <button
+              type="button"
+              data-testid="step-back"
+              disabled={recordingBusy || reference.saving}
+              onClick={() => setStep(1)}
+              className="inline-flex h-9 items-center gap-1.5 rounded-full px-2.5 text-sm font-medium text-muted-foreground hover:bg-secondary/80 hover:text-foreground disabled:opacity-40"
+            >
+              <ArrowLeftIcon className="size-4" />
+              {copy.back}
+            </button>
+          ) : inSetup && step === 1 && hasSavedVoice ? (
+            <button
+              type="button"
+              data-testid="cancel-setup"
+              disabled={reference.saving}
+              onClick={() => setSetupOpen(false)}
+              className="inline-flex h-9 items-center gap-1.5 rounded-full px-2.5 text-sm font-medium text-muted-foreground hover:bg-secondary/80 hover:text-foreground disabled:opacity-40"
+            >
+              <ArrowLeftIcon className="size-4" />
+              {copy.cancel}
+            </button>
+          ) : (
+            <a
+              href="/"
+              className="inline-flex items-center gap-2 text-sm font-semibold tracking-tight"
+            >
+              <span className="flex size-8 items-center justify-center rounded-xl border bg-white text-foreground">
+                <VoiceMark />
+              </span>
+              <span>deepclone</span>
+            </a>
+          )}
+
+          {inSetup ? (
+            <span className="text-xs font-medium tabular-nums text-muted-foreground">
+              {copy.stepIndicator(step, 2)}
+            </span>
+          ) : (
+            <button
+              type="button"
+              data-testid="re-setup"
+              disabled={voice.busy || reference.saving}
+              onClick={() => {
+                setSelectedLanguage(resolveLanguage(reference.value?.language));
+                setStep(1);
+                setSetupOpen(true);
+              }}
+              className="inline-flex h-9 items-center gap-1.5 rounded-full border bg-white px-3.5 text-xs font-medium text-foreground hover:bg-secondary/70 disabled:opacity-40"
+            >
+              <ReloadIcon className="size-3.5" />
+              {copy.resetSetup}
+            </button>
+          )}
+        </header>
+
+        <main className="mt-6 flex flex-1 flex-col">
+          {!supported && !inSetup ? (
             <div
               role="alert"
-              className="mb-7 rounded-md border border-destructive/30 bg-white p-4 text-sm"
+              className="mb-5 rounded-2xl border border-destructive/25 bg-white px-4 py-3.5 text-sm leading-relaxed text-destructive"
             >
-              This browser cannot generate speech on your device. Try an updated
-              browser with hardware acceleration enabled.
+              {copy.errorUnsupportedBrowser}
             </div>
           ) : null}
-          <div className="grid gap-9 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
-            <section className="min-w-0">
-              <div className="mb-5 flex items-center gap-2 text-sm font-medium">
-                <span className="text-muted-foreground">01</span>Reference voice
+
+          {inSetup && referenceError ? (
+            <div
+              role="alert"
+              className="mb-5 rounded-2xl border border-destructive/25 bg-white px-4 py-3.5 text-sm leading-relaxed text-destructive"
+            >
+              {referenceError}
+            </div>
+          ) : null}
+
+          {inSetup && step === 1 ? (
+            <section
+              key="setup-step-1"
+              className="step-enter flex flex-1 flex-col"
+            >
+              <div className="mb-6">
+                <h1 className="text-[1.75rem] leading-[1.15] font-semibold tracking-tight text-balance sm:text-3xl">
+                  {copy.step1Title}
+                </h1>
+                <p className="mt-2.5 text-sm leading-relaxed text-pretty text-muted-foreground sm:text-base">
+                  {copy.step1Subtitle}
+                </p>
               </div>
+
               <div
-                className="mb-5 flex gap-1 rounded-md bg-secondary/60 p-1"
-                role="group"
-                aria-label="Reference source"
+                role="radiogroup"
+                aria-label={copy.languageGroupLabel}
+                className="grid grid-cols-2 gap-2.5"
               >
-                <Button
-                  className="flex-1"
-                  size="sm"
-                  variant={referenceMode === "record" ? "outline" : "ghost"}
-                  disabled={referenceDisabled}
-                  onClick={() => {
-                    if (referenceMode === "record") return;
-                    setReferenceMode("record");
-                    setReplacing(false);
-                  }}
-                >
-                  Record my voice
-                </Button>
-                <Button
-                  className="flex-1"
-                  size="sm"
-                  variant={referenceMode === "upload" ? "outline" : "ghost"}
-                  disabled={referenceDisabled}
-                  onClick={() => {
-                    if (referenceMode === "upload") return;
-                    setReferenceMode("upload");
-                    setReplacing(false);
-                  }}
-                >
-                  Upload audio
-                </Button>
+                {LANGUAGES.map((item) => {
+                  const checked = selectedLanguage === item.id;
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      role="radio"
+                      aria-checked={checked}
+                      data-testid={`lang-${item.id}`}
+                      lang={item.bcp47}
+                      onClick={() => setSelectedLanguage(item.id)}
+                      className={`flex min-h-13 items-center justify-between rounded-2xl border px-4 py-3 text-left text-base font-medium ${
+                        checked
+                          ? "border-accent bg-accent text-accent-foreground"
+                          : "border-border bg-white text-foreground hover:bg-secondary/60"
+                      }`}
+                    >
+                      <span className="truncate">{item.nativeLabel}</span>
+                      {checked ? (
+                        <CheckIcon className="size-4 shrink-0" />
+                      ) : null}
+                    </button>
+                  );
+                })}
               </div>
-              {referenceMode === "record" ? (
-                reference.value && !replacing ? (
-                  <SavedVoice
-                    reference={reference.value}
-                    disabled={referenceDisabled}
-                    saving={reference.saving}
-                    error={reference.error}
-                    onReplace={() => setReplacing(true)}
-                    onDelete={() => {
-                      reference.save(null);
-                      setReplacing(false);
-                    }}
-                  />
-                ) : (
-                  <ReferenceRecorder
-                    initialLanguage={
-                      reference.value?.source === "record"
-                        ? reference.value.language
-                        : undefined
-                    }
-                    disabled={referenceDisabled}
-                    onUse={(recording, words, language) => {
-                      if (recording) {
-                        reference.save({
-                          file: recording,
-                          transcript: words,
-                          source: "record",
-                          language,
-                        });
-                        setReplacing(false);
-                      }
-                    }}
-                  />
-                )
-              ) : (
-                <>
-                  <input
-                    ref={picker}
-                    type="file"
-                    accept="audio/*"
-                    className="sr-only"
-                    aria-label="Reference recording"
-                    disabled={referenceDisabled}
-                    onChange={(event) =>
-                      chooseFile(event.target.files?.[0] ?? null)
-                    }
-                  />
+
+              {hasSavedVoice ? (
+                <div className="mt-5 flex justify-center">
                   <button
                     type="button"
-                    disabled={referenceDisabled}
-                    onClick={() => picker.current?.click()}
-                    onDragOver={(event) => event.preventDefault()}
-                    onDrop={(event) => {
-                      event.preventDefault();
-                      if (!voice.busy)
-                        chooseFile(event.dataTransfer.files[0] ?? null);
+                    data-testid="delete-voice"
+                    disabled={reference.saving}
+                    onClick={() => {
+                      reference.save(null);
+                      setSetupOpen(false);
+                      setStep(1);
                     }}
-                    className="flex min-h-36 w-full flex-col items-center justify-center rounded-lg border border-dashed bg-white px-5 text-center hover:bg-secondary/30 disabled:opacity-50"
+                    className="inline-flex h-9 items-center gap-1.5 rounded-full px-3 text-xs font-medium text-muted-foreground hover:bg-secondary/80 hover:text-destructive disabled:opacity-40"
                   >
-                    <UploadIcon className="mb-3 size-5 text-muted-foreground" />
-                    <span className="max-w-full truncate text-sm font-medium">
-                      {file ? file.name : "Choose a recording"}
-                    </span>
-                    <span className="mt-1 text-xs text-muted-foreground">
-                      {file
-                        ? "Click to replace"
-                        : "Drop an audio file here, or browse"}
-                    </span>
+                    <TrashIcon className="size-3.5" />
+                    {copy.deleteSavedVoice}
                   </button>
-                  <label
-                    htmlFor="transcript"
-                    className="mt-6 mb-2 block text-xs font-medium"
-                  >
-                    Reference transcript
-                  </label>
-                  <Textarea
-                    id="transcript"
-                    value={file ? transcript : draftTranscript}
-                    onChange={(event) => {
-                      const transcript = event.target.value;
-                      setDraftTranscript(transcript);
-                      if (reference.value)
-                        reference.save({ ...reference.value, transcript });
-                    }}
-                    disabled={referenceDisabled}
-                    placeholder="The exact words spoken in your recording"
-                    className="min-h-36 bg-white text-sm shadow-none"
-                  />
-                  <p className="mt-2 text-xs leading-5 text-muted-foreground">
-                    Use a clear recording and its exact transcript for the
-                    closest match.
-                  </p>
-                </>
-              )}
-            </section>
-            <section className="min-w-0">
-              <div className="mb-5 flex items-center gap-2 text-sm font-medium">
-                <span className="text-muted-foreground">02</span>New speech
-              </div>
-              <label htmlFor="text" className="mb-2 block text-xs font-medium">
-                What should your voice say?
-              </label>
-              <Textarea
-                id="text"
-                value={text}
-                onChange={(event) => updateText(event.target.value)}
-                disabled={voice.busy && (!voice.running || !live || inputEnded)}
-                placeholder="Write the words you want to hear…"
-                className="min-h-52 bg-white text-sm shadow-none"
-              />
-              <div className="mt-4 flex flex-wrap items-end justify-between gap-4">
-                <div>
-                  <label
-                    htmlFor="language"
-                    className="mb-2 block text-xs font-medium"
-                  >
-                    Language
-                  </label>
-                  <select
-                    id="language"
-                    value={language}
-                    disabled={referenceDisabled}
-                    onChange={(event) => setLanguage(event.target.value)}
-                    className="h-9 rounded-md border bg-white px-3 text-sm"
-                  >
-                    {[
-                      "auto",
-                      "English",
-                      "Chinese",
-                      "Japanese",
-                      "Korean",
-                      "French",
-                      "German",
-                      "Spanish",
-                      "Italian",
-                      "Portuguese",
-                      "Russian",
-                    ].map((value) => (
-                      <option key={value} value={value}>
-                        {value === "auto" ? "Automatic" : value}
-                      </option>
-                    ))}
-                  </select>
                 </div>
-                <label className="flex items-center gap-2 pb-2 text-xs">
-                  <input
-                    type="checkbox"
-                    checked={live}
-                    disabled={referenceDisabled}
-                    onChange={(event) => setLive(event.target.checked)}
-                  />
-                  Stream as I type
-                </label>
+              ) : null}
+
+              <div className="mt-auto pt-8">
+                <Button
+                  data-testid="continue-step-2"
+                  size="lg"
+                  className="h-14 w-full rounded-2xl text-base font-medium"
+                  onClick={() => setStep(2)}
+                >
+                  {copy.continueStep}
+                  <ArrowRightIcon className="size-4" />
+                </Button>
               </div>
-              <div className="mt-7 flex items-center gap-2">
-                {voice.busy ? (
-                  <>
-                    <Button variant="outline" onClick={voice.cancel}>
-                      <StopIcon />
-                      Cancel
-                    </Button>
-                    {voice.running && live && !inputEnded ? (
-                      <Button
-                        onClick={() => {
-                          setInputEnded(true);
-                          void sending.current.then(voice.finish);
-                        }}
-                      >
-                        Finish text
-                        <ArrowRightIcon />
+            </section>
+          ) : inSetup && step === 2 ? (
+            <section
+              key="setup-step-2"
+              className="step-enter flex flex-1 flex-col"
+            >
+              <div className="mb-6">
+                <h1 className="text-[1.75rem] leading-[1.15] font-semibold tracking-tight text-balance sm:text-3xl">
+                  {copy.step2Title}
+                </h1>
+                <p className="mt-2.5 text-sm leading-relaxed text-pretty text-muted-foreground sm:text-base">
+                  {copy.step2Subtitle}
+                </p>
+              </div>
+
+              <ReferenceRecorder
+                language={selectedLanguage}
+                disabled={voice.busy}
+                saving={reference.saving}
+                onRecordingChange={setRecordingBusy}
+                onSave={(recordedFile, spokenTranscript, language) => {
+                  reference.save({
+                    file: recordedFile,
+                    transcript: spokenTranscript,
+                    source: "record",
+                    language,
+                  });
+                  setSetupOpen(false);
+                  setStep(1);
+                }}
+              />
+            </section>
+          ) : (
+            <section
+              key="main-workspace"
+              className="step-enter flex flex-1 flex-col"
+            >
+              <div className="mb-6">
+                <h1 className="text-[1.75rem] leading-[1.15] font-semibold tracking-tight text-balance sm:text-3xl">
+                  {copy.mainTitle}
+                </h1>
+                <p className="mt-2 text-sm leading-relaxed text-pretty text-muted-foreground sm:text-base">
+                  {copy.mainSubtitle}
+                </p>
+              </div>
+
+              <div className="surface-card rounded-3xl p-4 sm:p-5">
+                <label
+                  htmlFor="speech-text"
+                  className="mb-2.5 block text-xs font-medium text-muted-foreground"
+                >
+                  {copy.promptLabel}
+                </label>
+                <Textarea
+                  id="speech-text"
+                  data-testid="prompt-input"
+                  value={text}
+                  onChange={(event) => setText(event.target.value)}
+                  disabled={voice.busy}
+                  placeholder={copy.promptPlaceholder}
+                  className="min-h-40 border-0 bg-transparent px-0 py-1 text-base leading-relaxed shadow-none focus-visible:ring-0 sm:min-h-48 sm:text-base"
+                />
+              </div>
+
+              {voice.busy && !voice.loaded ? (
+                <div
+                  className="surface-card mt-4 rounded-2xl p-4"
+                  role="status"
+                >
+                  <div className="mb-2 flex items-center justify-between text-xs text-muted-foreground">
+                    <span>{copy.preparingModel}</span>
+                    <span className="font-mono tabular-nums">
+                      {Math.round(voice.progress)}%
+                    </span>
+                  </div>
+                  <Progress
+                    value={voice.progress}
+                    aria-label={copy.preparationProgressLabel}
+                  />
+                </div>
+              ) : null}
+
+              {errorMessage ? (
+                <div
+                  role="alert"
+                  className="mt-4 rounded-2xl border border-destructive/25 bg-white px-4 py-3 text-sm leading-relaxed text-destructive"
+                >
+                  {errorMessage}
+                </div>
+              ) : null}
+
+              {voice.audio || voice.busy || voice.phase !== "ready" ? (
+                <div className="surface-card mt-4 rounded-2xl p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <p
+                      role="status"
+                      data-testid="voice-status"
+                      className="text-xs font-medium tabular-nums text-muted-foreground"
+                    >
+                      {statusText}
+                      {voice.seconds > 0
+                        ? ` · ${copy.generatedDuration(voice.seconds.toFixed(1))}`
+                        : ""}
+                    </p>
+                    {voice.audio ? (
+                      <Button asChild variant="outline" size="sm">
+                        <a
+                          data-testid="download-wav"
+                          href={voice.audio}
+                          download="deepclone.wav"
+                          className="rounded-xl"
+                        >
+                          <ArrowDownIcon className="size-3.5" />
+                          {copy.downloadWav}
+                        </a>
                       </Button>
                     ) : null}
-                  </>
+                  </div>
+                  {voice.audio ? (
+                    <audio
+                      controls
+                      src={voice.audio}
+                      className="mt-3.5 h-10 w-full"
+                    />
+                  ) : null}
+                </div>
+              ) : null}
+
+              <div className="mt-auto pt-8">
+                {voice.busy ? (
+                  <Button
+                    data-testid="cancel-button"
+                    variant="outline"
+                    size="lg"
+                    className="h-14 w-full rounded-2xl bg-white text-base font-medium"
+                    onClick={voice.cancel}
+                  >
+                    <StopIcon className="size-4" />
+                    {copy.cancel}
+                  </Button>
                 ) : (
                   <Button
+                    data-testid="synthesize-button"
+                    size="lg"
                     disabled={!canGenerate}
+                    className="h-14 w-full rounded-2xl text-base font-medium"
                     onClick={() => void generate()}
                   >
-                    Generate speech
-                    <ArrowRightIcon />
+                    {copy.synthesize}
+                    <ArrowRightIcon className="size-4" />
                   </Button>
                 )}
               </div>
             </section>
-          </div>
-          {voice.busy && !voice.loaded ? (
-            <div className="mt-6" role="status">
-              <p className="mb-2 text-xs text-muted-foreground">
-                Preparing your voice workspace…
-              </p>
-              <Progress
-                value={voice.progress}
-                aria-label="Preparation progress"
-              />
-            </div>
-          ) : null}
-          {error ? (
-            <div
-              role="alert"
-              className="mt-6 rounded-md border border-destructive/30 bg-white px-4 py-3 text-sm text-destructive"
-            >
-              {error}
-            </div>
-          ) : null}
-          <section className="mt-10 border-t pt-6">
-            <div className="flex items-center justify-between gap-4">
-              <div>
-                <h2 className="text-sm font-medium">Output</h2>
-                <p role="status" className="mt-1 text-xs text-muted-foreground">
-                  {voice.status}
-                  {voice.busy ? ` · ${Math.floor(voice.elapsed)}s elapsed` : ""}
-                  {voice.seconds > 0
-                    ? ` · ${voice.seconds.toFixed(1)}s generated`
-                    : ""}
-                </p>
-              </div>
-              {voice.audio ? (
-                <Button asChild variant="outline" size="sm">
-                  <a href={voice.audio} download="deepclone.wav">
-                    <ArrowDownIcon />
-                    Download WAV
-                  </a>
-                </Button>
-              ) : null}
-            </div>
-            {voice.audio ? (
-              <audio controls src={voice.audio} className="mt-5 w-full" />
-            ) : (
-              <div className="mt-5 flex min-h-24 items-center justify-center gap-3 rounded-md bg-secondary/40 px-5 text-sm text-muted-foreground">
-                <SpeakerLoudIcon />
-                {voice.running
-                  ? "Audio plays as it is generated."
-                  : "Your generated speech will appear here."}
-              </div>
-            )}
-          </section>
+          )}
         </main>
       </div>
     </div>

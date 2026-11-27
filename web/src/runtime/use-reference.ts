@@ -7,6 +7,8 @@ export interface SavedReference {
   source: "record" | "upload";
   language: string;
 }
+export type ReferenceErrorKind = "restore_failed" | "save_failed";
+
 interface VoiceDatabase extends DBSchema {
   reference: { key: string; value: SavedReference };
 }
@@ -14,7 +16,7 @@ export function useReference() {
   const [value, setValue] = useState<SavedReference | null>(null);
   const [ready, setReady] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [errorKind, setErrorKind] = useState<ReferenceErrorKind | null>(null);
   const database = useRef<ReturnType<typeof openDB<VoiceDatabase>> | null>(
     null,
   );
@@ -38,8 +40,7 @@ export function useReference() {
       })
       .catch((reason) => {
         console.error("Saved voice could not be restored", reason);
-        if (alive)
-          setError("Your saved voice could not be opened. Please try again.");
+        if (alive) setErrorKind("restore_failed");
       })
       .finally(() => {
         if (alive) setReady(true);
@@ -56,7 +57,7 @@ export function useReference() {
   function save(reference: SavedReference | null) {
     setValue(reference);
     setSaving(true);
-    setError(null);
+    setErrorKind(null);
     const current = ++sequence.current;
     // Serialize edits so an earlier transcript cannot overwrite a newer one.
     writes.current = writes.current
@@ -67,13 +68,11 @@ export function useReference() {
       })
       .catch((reason) => {
         console.error("Voice storage failed", reason);
-        setError(
-          "Your voice could not be saved on this device. Please try again.",
-        );
+        setErrorKind("save_failed");
       })
       .finally(() => {
         if (current === sequence.current) setSaving(false);
       });
   }
-  return { value, ready, saving, error, save };
+  return { value, ready, saving, errorKind, save };
 }
