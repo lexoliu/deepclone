@@ -275,9 +275,11 @@ export default function App() {
                     data-testid="delete-voice"
                     disabled={reference.saving}
                     onClick={() => {
-                      reference.save(null);
-                      setSetupOpen(false);
-                      setStep(1);
+                      void reference.save(null).then((saved) => {
+                        if (!saved) return;
+                        setSetupOpen(false);
+                        setStep(1);
+                      });
                     }}
                     className="inline-flex h-9 items-center gap-1.5 rounded-full px-3 text-xs font-medium text-muted-foreground hover:bg-secondary/80 hover:text-destructive disabled:opacity-40"
                   >
@@ -319,14 +321,18 @@ export default function App() {
                 saving={reference.saving}
                 onRecordingChange={setRecordingBusy}
                 onSave={(recordedFile, spokenTranscript, language) => {
-                  reference.save({
-                    file: recordedFile,
-                    transcript: spokenTranscript,
-                    source: "record",
-                    language,
-                  });
-                  setSetupOpen(false);
-                  setStep(1);
+                  void reference
+                    .save({
+                      file: recordedFile,
+                      transcript: spokenTranscript,
+                      source: "record",
+                      language,
+                    })
+                    .then((saved) => {
+                      if (!saved) return;
+                      setSetupOpen(false);
+                      setStep(1);
+                    });
                 }}
               />
             </section>

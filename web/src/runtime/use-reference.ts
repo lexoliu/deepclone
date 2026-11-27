@@ -54,25 +54,29 @@ export function useReference() {
         );
     };
   }, []);
-  function save(reference: SavedReference | null) {
-    setValue(reference);
+  function save(reference: SavedReference | null): Promise<boolean> {
     setSaving(true);
     setErrorKind(null);
     const current = ++sequence.current;
-    // Serialize edits so an earlier transcript cannot overwrite a newer one.
-    writes.current = writes.current
+    // Commit to IndexedDB before updating UI state so reloads cannot lose a saved voice.
+    const task = writes.current
       .then(async () => {
         const db = await database.current!;
         if (reference) await db.put("reference", reference, "selected");
         else await db.delete("reference", "selected");
+        if (current === sequence.current) setValue(reference);
+        return true;
       })
       .catch((reason) => {
         console.error("Voice storage failed", reason);
-        setErrorKind("save_failed");
+        if (current === sequence.current) setErrorKind("save_failed");
+        return false;
       })
       .finally(() => {
         if (current === sequence.current) setSaving(false);
       });
+    writes.current = task.then(() => undefined);
+    return task;
   }
   return { value, ready, saving, errorKind, save };
 }
