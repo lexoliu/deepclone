@@ -13,12 +13,23 @@ export interface Manifest {
   files: Asset[];
   shards: { path: string; conditioning: boolean }[];
 }
+// Bump when browser reference audio preprocessing changes so cached IndexedDB
+// conditioning from older frontends is transparently re-extracted.
+export const REFERENCE_AUDIO_VERSION = 2;
+
 export interface SavedConditioning {
   modelSha256: string;
+  audioVersion?: number;
   speaker: Float32Array;
   speakerShape: [number, number, number];
   codes: Uint32Array;
   groups: number;
+}
+
+export function isCurrentConditioning(
+  conditioning: SavedConditioning | undefined,
+): conditioning is SavedConditioning {
+  return conditioning?.audioVersion === REFERENCE_AUDIO_VERSION;
 }
 export type Command =
   | {

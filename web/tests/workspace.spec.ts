@@ -552,6 +552,7 @@ test("background preparation stays usable, reuses conditioning, re-conditions on
                 kind: "conditioned",
                 conditioning: {
                   modelSha256: "0".repeat(64),
+                  audioVersion: 2,
                   speaker: new Float32Array([0.5]),
                   speakerShape: [1, 1, 1],
                   codes: new Uint32Array([1, 2]),
@@ -794,4 +795,216 @@ test("cancel terminates a real worker that cannot process messages", async ({
     await expect(page.getByTestId("synthesize-button")).toBeEnabled();
     await expect(page.getByTestId("re-setup")).toBeEnabled();
   }
+});
+
+test("legacy cached conditioning is ignored and quiet stereo-with-silent-channel recordings are normalized", async ({
+  page,
+}) => {
+  // Build a 48 kHz 2-channel WAV with quiet speech-level sine on ch0 (~-40 dBFS) and silence on ch1.
+  const rate = 48000;
+  const frames = 24000;
+  const wav = Buffer.alloc(44 + frames * 4);
+  wav.write("RIFF");
+  wav.writeUInt32LE(wav.length - 8, 4);
+  wav.write("WAVEfmt ", 8);
+  wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20);
+  wav.writeUInt16LE(2, 22);
+  wav.writeUInt32LE(rate, 24);
+  wav.writeUInt32LE(rate * 4, 28);
+  wav.writeUInt16LE(4, 32);
+  wav.writeUInt16LE(16, 34);
+  wav.write("data", 36);
+  wav.writeUInt32LE(frames * 4, 40);
+  for (let i = 0; i < frames; i++) {
+    const sample = Math.round(
+      0.014 * Math.sin((2 * Math.PI * 220 * i) / rate) * 32767,
+    );
+    wav.writeInt16LE(sample, 44 + i * 4);
+    wav.writeInt16LE(0, 44 + i * 4 + 2);
+  }
+
+  await page.route("**/__seed_legacy__", (route) =>
+    route.fulfill({
+      contentType: "text/html",
+      headers: {
+        "Cross-Origin-Opener-Policy": "same-origin",
+        "Cross-Origin-Embedder-Policy": "require-corp",
+      },
+      body: "<!doctype html><title>seed</title>",
+    }),
+  );
+  await page.goto("/__seed_legacy__");
+  await page.evaluate(
+    async ({ bytes, transcript }) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open("deepclone-voices", 1);
+        request.onupgradeneeded = () => {
+          if (!request.result.objectStoreNames.contains("reference")) {
+            request.result.createObjectStore("reference");
+          }
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () =>
+          reject(request.error ?? new Error("IndexedDB open failed"));
+      });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const tx = db.transaction("reference", "readwrite");
+          tx.objectStore("reference").put(
+            {
+              file: new File([new Uint8Array(bytes)], "legacy.wav", {
+                type: "audio/wav",
+              }),
+              transcript,
+              source: "record",
+              language: "Chinese",
+              // Legacy conditioning lacks audioVersion and must trigger re-extraction.
+              conditioning: {
+                modelSha256: "0".repeat(64),
+                speaker: new Float32Array([0.1]),
+                speakerShape: [1, 1, 1],
+                codes: new Uint32Array([1, 2]),
+                groups: 2,
+              },
+            },
+            "selected",
+          );
+          tx.oncomplete = () => resolve();
+          tx.onerror = () =>
+            reject(tx.error ?? new Error("IndexedDB write failed"));
+        });
+      } finally {
+        db.close();
+      }
+    },
+    { bytes: Array.from(wav), transcript: CJK_SAMPLE },
+  );
+  await page.unroute("**/__seed_legacy__");
+
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "gpu", { value: {}, configurable: true });
+    class RecordingWorker {
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onerror = null;
+      postMessage(command: {
+        kind: string;
+        id?: number;
+        skipVoice?: boolean;
+        samples?: Float32Array;
+        conditioning?: { modelSha256: string; audioVersion?: number };
+      }) {
+        if (command.kind === "load") {
+          Object.assign(window, { initialSkipVoice: command.skipVoice });
+          this.onmessage?.(
+            new MessageEvent("message", { data: { kind: "ready" } }),
+          );
+          return;
+        }
+        if (command.kind === "reference") {
+          const samples = command.samples ?? new Float32Array(0);
+          let sumSq = 0;
+          let max = 0;
+          for (let i = 0; i < samples.length; i++) {
+            const v = samples[i]!;
+            sumSq += v * v;
+            const abs = Math.abs(v);
+            if (abs > max) max = abs;
+          }
+          Object.assign(window, {
+            receivedConditioning: command.conditioning ?? null,
+            receivedSampleCount: samples.length,
+            receivedRms: Math.sqrt(sumSq / Math.max(1, samples.length)),
+            receivedPeak: max,
+          });
+          this.onmessage?.(
+            new MessageEvent("message", {
+              data: {
+                kind: "conditioned",
+                conditioning: {
+                  modelSha256: "0".repeat(64),
+                  audioVersion: 2,
+                  speaker: new Float32Array([0.5]),
+                  speakerShape: [1, 1, 1],
+                  codes: new Uint32Array([1, 2]),
+                  groups: 2,
+                },
+              },
+            }),
+          );
+          return;
+        }
+        if (command.kind === "start") {
+          this.onmessage?.(
+            new MessageEvent("message", { data: { kind: "started" } }),
+          );
+          return;
+        }
+        if (command.kind === "text") {
+          this.onmessage?.(
+            new MessageEvent("message", {
+              data: { kind: "accepted", id: command.id },
+            }),
+          );
+          return;
+        }
+        if (command.kind === "finish") {
+          this.onmessage?.(
+            new MessageEvent("message", {
+              data: {
+                kind: "audio",
+                id: 0,
+                samples: new Float32Array([0.25]),
+                sampleRate: 24000,
+              },
+            }),
+          );
+          this.onmessage?.(
+            new MessageEvent("message", { data: { kind: "done" } }),
+          );
+        }
+      }
+      terminate() {}
+    }
+    Object.defineProperty(window, "Worker", { value: RecordingWorker });
+  });
+  await page.route("**/models.json", (route) =>
+    route.fulfill({
+      json: [
+        {
+          size: "0.6b",
+          manifest: "https://example.test/model.json",
+          sha256: "0".repeat(64),
+        },
+      ],
+    }),
+  );
+
+  await page.goto("/");
+  await page.getByTestId("prompt-input").fill(CJK_SAMPLE);
+  await page.getByTestId("synthesize-button").click();
+  await expect(page.getByTestId("download-wav")).toBeVisible();
+
+  const observed = await page.evaluate(() => {
+    const w = window as unknown as {
+      initialSkipVoice?: boolean;
+      receivedConditioning: unknown;
+      receivedSampleCount: number;
+      receivedRms: number;
+      receivedPeak: number;
+    };
+    return {
+      initialSkipVoice: w.initialSkipVoice,
+      receivedConditioning: w.receivedConditioning,
+      receivedSampleCount: w.receivedSampleCount,
+      receivedRms: w.receivedRms,
+      receivedPeak: w.receivedPeak,
+    };
+  });
+  expect(observed.initialSkipVoice).toBe(true);
+  expect(observed.receivedConditioning).toBeNull();
+  expect(observed.receivedSampleCount).toBe(12000);
+  expect(observed.receivedRms).toBeGreaterThan(0.065);
+  expect(observed.receivedRms).toBeLessThan(0.095);
+  expect(observed.receivedPeak).toBeLessThanOrEqual(0.895);
 });

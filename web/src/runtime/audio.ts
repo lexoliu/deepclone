@@ -1,18 +1,145 @@
+const REFERENCE_SAMPLE_RATE = 24000;
+// Channels more than 40 dB below the loudest channel are treated as silent
+// (e.g. mobile WebKit MediaRecorder packing a mono mic into stereo with a zero right channel).
+const SILENT_CHANNEL_RATIO = 0.01;
+// 50 ms frame window for gated active-speech RMS estimation.
+const LEVEL_WINDOW_SECONDS = 0.05;
+// Gate frames within 20 dB of the 95th-percentile frame RMS so pauses do not dilute speech level.
+const ACTIVE_FRAME_RATIO = 0.1;
+// Target -22 dBFS active speech RMS with a -1 dBFS peak ceiling for Mimi and speaker conditioning.
+const TARGET_ACTIVE_RMS = 0.08;
+const MAX_PEAK = 0.89;
+// Cap boost at +24 dB (16x) and leave near-silent captures unboosted.
+const MAX_GAIN = 16;
+const MIN_ACTIVE_RMS = 1e-4;
+const MIN_PEAK = 1e-3;
+
+export function mixActiveChannels(
+  channels: readonly Float32Array[],
+): Float32Array {
+  if (channels.length === 0) return new Float32Array(0);
+  const length = channels[0]!.length;
+  if (channels.length === 1) return channels[0]!.slice();
+  const rms = channels.map((channel) => {
+    let sumSq = 0;
+    for (let i = 0; i < length; i++) {
+      const sample = channel[i]!;
+      sumSq += sample * sample;
+    }
+    return Math.sqrt(sumSq / Math.max(1, length));
+  });
+  let maxRms = 0;
+  for (const value of rms) {
+    if (value > maxRms) maxRms = value;
+  }
+  if (maxRms === 0) return new Float32Array(length);
+  const threshold = maxRms * SILENT_CHANNEL_RATIO;
+  const active = channels.filter((_, index) => rms[index]! >= threshold);
+  if (active.length === 1) return active[0]!.slice();
+  const mono = new Float32Array(length);
+  const scale = 1 / active.length;
+  for (let i = 0; i < length; i++) {
+    let sum = 0;
+    for (let c = 0; c < active.length; c++) sum += active[c]![i]!;
+    mono[i] = sum * scale;
+  }
+  return mono;
+}
+
+export function normalizeReferenceLevel(
+  samples: Float32Array,
+  sampleRate: number,
+): Float32Array {
+  const length = samples.length;
+  if (length === 0) return samples.slice();
+  let sum = 0;
+  for (let i = 0; i < length; i++) sum += samples[i]!;
+  const mean = sum / length;
+  const centered = new Float32Array(length);
+  let peak = 0;
+  for (let i = 0; i < length; i++) {
+    const value = samples[i]! - mean;
+    centered[i] = value;
+    const abs = Math.abs(value);
+    if (abs > peak) peak = abs;
+  }
+  if (peak < MIN_PEAK) return centered;
+
+  const windowSize = Math.max(1, Math.round(sampleRate * LEVEL_WINDOW_SECONDS));
+  const frameRms: number[] = [];
+  for (let start = 0; start < length; start += windowSize) {
+    const end = Math.min(length, start + windowSize);
+    const count = end - start;
+    if (count < windowSize / 2 && frameRms.length > 0) continue;
+    let sumSq = 0;
+    for (let i = start; i < end; i++) {
+      const value = centered[i]!;
+      sumSq += value * value;
+    }
+    frameRms.push(Math.sqrt(sumSq / count));
+  }
+  if (frameRms.length === 0) return centered;
+  frameRms.sort((a, b) => a - b);
+  const p95 =
+    frameRms[
+      Math.min(frameRms.length - 1, Math.floor(frameRms.length * 0.95))
+    ]!;
+  const gate = p95 * ACTIVE_FRAME_RATIO;
+  let voicedSq = 0;
+  let voicedCount = 0;
+  for (const value of frameRms) {
+    if (value >= gate) {
+      voicedSq += value * value;
+      voicedCount++;
+    }
+  }
+  const activeRms = Math.sqrt(voicedSq / Math.max(1, voicedCount));
+  if (activeRms < MIN_ACTIVE_RMS) return centered;
+
+  const gain = Math.min(
+    TARGET_ACTIVE_RMS / activeRms,
+    MAX_PEAK / peak,
+    MAX_GAIN,
+  );
+  for (let i = 0; i < length; i++) {
+    const scaled = centered[i]! * gain;
+    centered[i] = scaled < -1 ? -1 : scaled > 1 ? 1 : scaled;
+  }
+  return centered;
+}
+
 export async function referenceAudio(file: File): Promise<Float32Array> {
   const context = new AudioContext();
   try {
     const decoded = await context.decodeAudioData(await file.arrayBuffer());
-    // Qwen3-TTS's published reference frontend requires mono 24 kHz.
-    const offline = new OfflineAudioContext(
-      1,
-      Math.ceil(decoded.duration * 24000),
-      24000,
-    );
-    const source = offline.createBufferSource();
-    source.buffer = decoded;
-    source.connect(offline.destination);
-    source.start();
-    return (await offline.startRendering()).getChannelData(0).slice();
+    const channels: Float32Array[] = [];
+    for (let c = 0; c < decoded.numberOfChannels; c++) {
+      channels.push(decoded.getChannelData(c));
+    }
+    const mono = mixActiveChannels(channels);
+    let resampled: Float32Array;
+    if (decoded.sampleRate === REFERENCE_SAMPLE_RATE) {
+      resampled = mono;
+    } else {
+      // Qwen3-TTS's published reference frontend requires mono 24 kHz.
+      const offline = new OfflineAudioContext(
+        1,
+        Math.ceil(decoded.duration * REFERENCE_SAMPLE_RATE),
+        REFERENCE_SAMPLE_RATE,
+      );
+      const monoBuffer = offline.createBuffer(
+        1,
+        mono.length,
+        decoded.sampleRate,
+      );
+      monoBuffer.copyToChannel(mono as Float32Array<ArrayBuffer>, 0);
+      const source = offline.createBufferSource();
+      source.buffer = monoBuffer;
+      source.connect(offline.destination);
+      source.start();
+      resampled = (await offline.startRendering()).getChannelData(0).slice();
+    }
+    return normalizeReferenceLevel(resampled, REFERENCE_SAMPLE_RATE);
   } finally {
     await context.close();
   }

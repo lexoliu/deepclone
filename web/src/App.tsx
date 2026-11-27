@@ -11,6 +11,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Textarea } from "@/components/ui/textarea";
+import { isCurrentConditioning } from "@/runtime/contracts";
 import { useReference } from "@/runtime/use-reference";
 import { useVoice } from "@/runtime/use-voice";
 import {
@@ -43,10 +44,10 @@ function VoiceMark() {
 
 export default function App() {
   const reference = useReference();
-  const voice = useVoice(
-    reference.ready,
-    Boolean(reference.value?.conditioning),
-  );
+  const savedConditioning = isCurrentConditioning(reference.value?.conditioning)
+    ? reference.value.conditioning
+    : undefined;
+  const voice = useVoice(reference.ready, Boolean(savedConditioning));
   const [setupOpen, setSetupOpen] = useState(false);
   const [step, setStep] = useState<1 | 2>(1);
   const [recordingBusy, setRecordingBusy] = useState(false);
@@ -94,7 +95,7 @@ export default function App() {
       transcript,
       text,
       "auto",
-      reference.value?.conditioning,
+      savedConditioning,
       (conditioning) =>
         reference.saveConditioning(file, transcript, conditioning),
     );
