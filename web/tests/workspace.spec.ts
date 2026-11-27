@@ -267,6 +267,20 @@ test("mobile-first onboarding, UDHR passages, localization, and narrow viewports
       () => document.documentElement.scrollWidth <= window.innerWidth,
     ),
   ).toBe(true);
+
+  // Desktop viewport expands to a wide two-column layout without pinning CTAs to the bottom edge.
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const headerBox = await page.getByTestId("app-header").boundingBox();
+  const headingBox = await page.getByRole("heading").boundingBox();
+  const radioGroupBox = await page.getByRole("radiogroup").boundingBox();
+  const continueBox = await page.getByTestId("continue-step-2").boundingBox();
+  expect(headerBox).not.toBeNull();
+  expect(headingBox).not.toBeNull();
+  expect(radioGroupBox).not.toBeNull();
+  expect(continueBox).not.toBeNull();
+  expect(headerBox!.width).toBeGreaterThan(950);
+  expect(radioGroupBox!.x).toBeGreaterThan(headingBox!.x + headingBox!.width);
+  expect(continueBox!.y + continueBox!.height).toBeLessThan(700);
 });
 
 test("microphone denial surfaces an actionable alert and keeps recording retryable", async ({
