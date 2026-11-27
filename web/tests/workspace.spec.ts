@@ -378,21 +378,41 @@ test("completed voice setup persists to main screen across reloads, supports re-
   await context.close();
 });
 
-test("published wasm glue exports the browser inference contract", async ({
+test("published wasm glue and security headers honor the browser inference contract", async ({
   page,
 }) => {
-  await page.goto("/");
+  const response = await page.goto("/");
+  expect(response).not.toBeNull();
+  const headers = response!.headers();
+  expect(headers["content-security-policy"]).toContain(
+    "script-src 'self' 'wasm-unsafe-eval'",
+  );
+  expect(headers["content-security-policy"]).toContain(
+    "https://assets.deepclone.lexo.cool",
+  );
+  expect(headers["permissions-policy"]).toContain("microphone=(self)");
+  expect(headers["x-frame-options"]).toBe("DENY");
+
   const exports = await page.evaluate(async () => {
+    const manifestResponse = await fetch("/wasm.json");
+    if (!manifestResponse.ok) throw new Error("Missing /wasm.json");
+    const manifest = (await manifestResponse.json()) as { url: string };
     const url = "/wasm/deepclone.js";
     const module = await import(url);
-    await module.default();
+    await module.default({ module_or_path: manifest.url });
     return [
+      manifest.url,
       typeof module.BrowserRuntime.create,
       typeof module.TextInput,
       typeof module.BrowserVoice,
     ];
   });
-  expect(exports).toEqual(["function", "function", "function"]);
+  expect(exports).toEqual([
+    "/wasm/deepclone_bg.wasm",
+    "function",
+    "function",
+    "function",
+  ]);
 });
 
 test("a GPU runtime remains reusable after a rejected model shard", async ({

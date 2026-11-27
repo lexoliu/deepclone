@@ -2,6 +2,7 @@
 import type {
   Command,
   Event,
+  WasmManifest,
   WasmModule,
   WasmVoice,
   WasmInput,
@@ -36,8 +37,16 @@ async function execute(command: Command): Promise<void> {
         }
         if (!module) {
           const url = "/wasm/deepclone.js";
-          const loaded = (await import(/* @vite-ignore */ url)) as WasmModule;
-          await loaded.default();
+          const [loaded, wasmResponse] = await Promise.all([
+            import(/* @vite-ignore */ url) as Promise<WasmModule>,
+            fetch("/wasm.json", { signal: operation.signal }),
+          ]);
+          if (!wasmResponse.ok)
+            throw new Error("WebAssembly configuration could not be loaded.");
+          const wasmManifest = (await wasmResponse.json()) as WasmManifest;
+          if (typeof wasmManifest.url !== "string" || !wasmManifest.url)
+            throw new Error("Invalid WebAssembly configuration.");
+          await loaded.default({ module_or_path: wasmManifest.url });
           module = loaded;
         }
         const model = await manifest(command.model, operation.signal);
