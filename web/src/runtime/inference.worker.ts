@@ -13,13 +13,13 @@ import type {
 } from "./contracts";
 import {
   TEXT_EMBEDDING_TENSOR,
+  buildShardIndex,
   ensureStoredAsset,
   findTextEmbedding,
   manifest,
   openModelStorage,
   readTextEmbeddingRows,
-  uploadShardTensors,
-  type ScratchBuffer,
+  withOpenShards,
   type StoredFile,
   type TextEmbeddingDescriptor,
 } from "./assets";
@@ -65,37 +65,27 @@ function getFile(pkg: LoadedPackage, path: string): StoredFile {
 
 async function buildSynthesisVoice(pkg: LoadedPackage): Promise<WasmVoice> {
   if (!runtime) throw new Error("GPU runtime is not initialized.");
-  const tokenizer = await getFile(pkg, "tokenizer.json").readAll();
-  const builder = runtime.builder(true);
-  const scratch: ScratchBuffer = { buffer: new Uint8Array(0) };
-  let consumed = false;
-  try {
-    for (const shard of pkg.manifest.shards) {
-      if (shard.conditioning) continue;
-      await uploadShardTensors(
-        getFile(pkg, shard.path),
-        false,
-        SYNTHESIS_SKIP_TENSORS,
-        (name, dtype, shape, bytes, conditioning) => {
-          builder.upload_tensor(name, dtype, shape, bytes, conditioning);
-        },
-        scratch,
-      );
-    }
-    scratch.buffer = new Uint8Array(0);
-    consumed = true;
-    return builder.finish_synthesis(
+  const activeRuntime = runtime;
+  const shardFiles = pkg.manifest.shards
+    .filter((shard) => !shard.conditioning)
+    .map((shard) => getFile(pkg, shard.path));
+  const [tokenizer, index] = await Promise.all([
+    getFile(pkg, "tokenizer.json").readAll(),
+    buildShardIndex(shardFiles, SYNTHESIS_SKIP_TENSORS),
+  ]);
+  return withOpenShards(index.files, (readInto) =>
+    activeRuntime.load_synthesis_streaming(
+      true,
+      index.indexJson,
+      readInto,
       pkg.config,
       pkg.codec,
       pkg.mel,
       tokenizer,
       pkg.context,
       pkg.seed,
-    );
-  } finally {
-    scratch.buffer = new Uint8Array(0);
-    if (!consumed) builder.free();
-  }
+    ),
+  );
 }
 
 async function extractConditioning(
@@ -103,30 +93,20 @@ async function extractConditioning(
   samples: Float32Array,
 ): Promise<SavedConditioning> {
   if (!runtime) throw new Error("GPU runtime is not initialized.");
-  const builder = runtime.builder(true);
-  const scratch: ScratchBuffer = { buffer: new Uint8Array(0) };
-  let consumed = false;
-  let conditioner;
-  try {
-    for (const shard of pkg.manifest.shards) {
-      if (!shard.conditioning) continue;
-      await uploadShardTensors(
-        getFile(pkg, shard.path),
-        true,
-        CONDITIONING_SKIP_TENSORS,
-        (name, dtype, shape, bytes, conditioning) => {
-          builder.upload_tensor(name, dtype, shape, bytes, conditioning);
-        },
-        scratch,
-      );
-    }
-    scratch.buffer = new Uint8Array(0);
-    consumed = true;
-    conditioner = builder.finish_conditioning(pkg.config, pkg.codec, pkg.mel);
-  } finally {
-    scratch.buffer = new Uint8Array(0);
-    if (!consumed) builder.free();
-  }
+  const activeRuntime = runtime;
+  const shardFiles = pkg.manifest.shards
+    .filter((shard) => shard.conditioning)
+    .map((shard) => getFile(pkg, shard.path));
+  const index = await buildShardIndex(shardFiles, CONDITIONING_SKIP_TENSORS);
+  const conditioner = await withOpenShards(index.files, (readInto) =>
+    activeRuntime.load_conditioning_streaming(
+      index.indexJson,
+      readInto,
+      pkg.config,
+      pkg.codec,
+      pkg.mel,
+    ),
+  );
   try {
     const extracted = await conditioner.extract(samples, 24000);
     if (extracted.speakerShape.length !== 3) {
@@ -145,7 +125,7 @@ async function extractConditioning(
     };
   } finally {
     conditioner.free();
-    runtime.reclaim_memory();
+    activeRuntime.reclaim_memory();
   }
 }
 

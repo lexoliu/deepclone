@@ -424,10 +424,9 @@ test("published wasm glue and security headers honor the browser inference contr
       manifest.js,
       manifest.url,
       typeof module.BrowserRuntime.create,
+      typeof module.BrowserRuntime.prototype.load_conditioning_streaming,
+      typeof module.BrowserRuntime.prototype.load_synthesis_streaming,
       typeof module.BrowserRuntime.prototype.reclaim_memory,
-      typeof module.ModelBuilder.prototype.upload_tensor,
-      typeof module.ModelBuilder.prototype.finish_conditioning,
-      typeof module.ModelBuilder.prototype.finish_synthesis,
       typeof module.TextInput,
       typeof module.BrowserVoice,
       typeof module.BrowserVoice.prototype.set_reference_conditioning,
@@ -440,7 +439,6 @@ test("published wasm glue and security headers honor the browser inference contr
   expect(exports).toEqual([
     "/wasm/deepclone.js",
     "/wasm/deepclone_bg.wasm",
-    "function",
     "function",
     "function",
     "function",
@@ -469,19 +467,37 @@ test("a GPU runtime remains reusable after a rejected model shard", async ({
     const module = await import(manifest.js);
     await module.default({ module_or_path: manifest.url });
     const runtime = await module.BrowserRuntime.create("{}");
-    const first = runtime.builder(true);
-    let rejected = false;
+    let firstRejected = false;
     try {
-      first.upload(new Uint8Array([0]), false);
+      runtime.load_conditioning_streaming(
+        "not-json",
+        () => {},
+        "{}",
+        "{}",
+        "{}",
+      );
     } catch {
-      rejected = true;
-    } finally {
-      first.free();
+      firstRejected = true;
     }
-    const second = runtime.builder(true);
-    second.free();
+    runtime.reclaim_memory();
+    let secondRejected = false;
+    try {
+      runtime.load_synthesis_streaming(
+        true,
+        "not-json",
+        () => {},
+        "{}",
+        "{}",
+        "{}",
+        new Uint8Array(0),
+        2048,
+        0n,
+      );
+    } catch {
+      secondRejected = true;
+    }
     runtime.free();
-    return rejected;
+    return firstRejected && secondRejected;
   });
   expect(rejected).toBe(true);
 });

@@ -81,7 +81,6 @@ export interface WasmInput {
   free(): void;
 }
 export interface WasmVoice {
-  reference(samples: Float32Array, rate: number, text: string): Promise<void>;
   set_reference_conditioning(
     speaker: Float32Array,
     speakerShape: Uint32Array,
@@ -105,38 +104,6 @@ export interface WasmVoice {
   ): Promise<void>;
   free(): void;
 }
-export interface WasmBuilder {
-  upload(bytes: Uint8Array, conditioning: boolean): void;
-  upload_tensor(
-    name: string,
-    dtype: string,
-    shape: Uint32Array,
-    bytes: Uint8Array,
-    conditioning: boolean,
-  ): void;
-  finish(
-    config: string,
-    codec: string,
-    mel: string,
-    tokenizer: Uint8Array,
-    context: number,
-    seed: bigint,
-  ): WasmVoice;
-  finish_conditioning(
-    config: string,
-    codec: string,
-    mel: string,
-  ): WasmConditioner;
-  finish_synthesis(
-    config: string,
-    codec: string,
-    mel: string,
-    tokenizer: Uint8Array,
-    context: number,
-    seed: bigint,
-  ): WasmVoice;
-  free(): void;
-}
 export interface WasmManifest {
   js: string;
   url: string;
@@ -147,8 +114,30 @@ export interface WasmModule {
   TextInput: new (capacity: number) => WasmInput;
   Sha256Hasher: new () => WasmSha256Hasher;
 }
+export type StreamingShardReader = (
+  shard: number,
+  offset: number,
+  target: Uint8Array,
+) => void;
 export interface WasmRuntime {
-  builder(fp16: boolean): WasmBuilder;
+  load_conditioning_streaming(
+    indexJson: string,
+    readInto: StreamingShardReader,
+    config: string,
+    codec: string,
+    mel: string,
+  ): WasmConditioner;
+  load_synthesis_streaming(
+    fp16: boolean,
+    indexJson: string,
+    readInto: StreamingShardReader,
+    config: string,
+    codec: string,
+    mel: string,
+    tokenizer: Uint8Array,
+    context: number,
+    seed: bigint,
+  ): WasmVoice;
   reclaim_memory(): void;
   free(): void;
 }

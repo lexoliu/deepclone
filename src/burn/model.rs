@@ -308,30 +308,58 @@ impl Burn {
         }
         let device = speech.device().clone();
         let dtype = speech.dtype();
-        let mut codes: Vec<BurnTensor<2>> =
-            vec![speech.tensor("talker.model.codec_embedding.weight")?];
+        let mut code_names = Vec::with_capacity(c.num_code_groups);
+        code_names.push("talker.model.codec_embedding.weight".to_string());
         for group in 0..c.num_code_groups - 1 {
-            codes.push(speech.tensor(&format!(
+            code_names.push(format!(
                 "talker.code_predictor.model.codec_embedding.{group}.weight"
-            ))?);
+            ));
         }
-        let width = codes[0].dims()[1];
-        let mut code_offsets = Vec::with_capacity(codes.len());
-        let mut code_vocabs = Vec::with_capacity(codes.len());
-        let mut offset = 0usize;
-        for table in &codes {
-            let [vocab, w] = table.dims();
-            if w != width {
-                return Err(Error::Contract("mismatched codec embedding widths"));
+        let mut code_offsets = Vec::with_capacity(code_names.len());
+        let mut code_vocabs = Vec::with_capacity(code_names.len());
+        let code_table = if let Some(shapes) = code_names
+            .iter()
+            .map(|name| speech.tensor_shape(name))
+            .collect::<Option<Vec<_>>>()
+        {
+            let first = shapes[0].as_slice();
+            if first.len() != 2 {
+                return Err(Error::Contract("codec embedding must have rank 2"));
             }
-            code_offsets.push(offset);
-            code_vocabs.push(vocab);
-            offset += vocab;
-        }
-        let code_table = BurnTensor::cat(codes, 0);
-        device
-            .flush()
-            .map_err(|error| super::Error::Execution(error.to_string()))?;
+            let width = first[1];
+            let mut offset = 0usize;
+            for shape in &shapes {
+                if shape.len() != 2 || shape[1] != width {
+                    return Err(Error::Contract("mismatched codec embedding widths"));
+                }
+                code_offsets.push(offset);
+                code_vocabs.push(shape[0]);
+                offset += shape[0];
+            }
+            let refs: Vec<&str> = code_names.iter().map(String::as_str).collect();
+            speech.cat_axis0(&refs)?
+        } else {
+            let mut codes: Vec<BurnTensor<2>> = Vec::with_capacity(code_names.len());
+            for name in &code_names {
+                codes.push(speech.tensor(name)?);
+            }
+            let width = codes[0].dims()[1];
+            let mut offset = 0usize;
+            for table in &codes {
+                let [vocab, w] = table.dims();
+                if w != width {
+                    return Err(Error::Contract("mismatched codec embedding widths"));
+                }
+                code_offsets.push(offset);
+                code_vocabs.push(vocab);
+                offset += vocab;
+            }
+            let table = BurnTensor::cat(codes, 0);
+            device
+                .flush()
+                .map_err(|error| super::Error::Execution(error.to_string()))?;
+            table
+        };
         let projection = if c.decoder.hidden_size != c.code_predictor_config.hidden_size {
             Some(Linear::load(
                 speech,
