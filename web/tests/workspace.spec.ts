@@ -408,17 +408,20 @@ test("published wasm glue and security headers honor the browser inference contr
   expect(headers["x-frame-options"]).toBe("DENY");
 
   const exports = await page.evaluate(async () => {
-    const manifestResponse = await fetch("/wasm.json");
+    const manifestResponse = await fetch("/wasm.json", { cache: "no-cache" });
     if (!manifestResponse.ok) throw new Error("Missing /wasm.json");
-    const manifest = (await manifestResponse.json()) as { url: string };
-    const url = "/wasm/deepclone.js";
-    const module = await import(url);
+    const manifest = (await manifestResponse.json()) as {
+      js: string;
+      url: string;
+    };
+    const module = await import(manifest.js);
     await module.default({ module_or_path: manifest.url });
     const hasher = new module.Sha256Hasher();
     hasher.update(new Uint8Array([97, 98]));
     hasher.update(new Uint8Array([99]));
     const abcDigest = hasher.finalize();
     return [
+      manifest.js,
       manifest.url,
       typeof module.BrowserRuntime.create,
       typeof module.BrowserRuntime.prototype.reclaim_memory,
@@ -435,6 +438,7 @@ test("published wasm glue and security headers honor the browser inference contr
     ];
   });
   expect(exports).toEqual([
+    "/wasm/deepclone.js",
     "/wasm/deepclone_bg.wasm",
     "function",
     "function",
@@ -456,9 +460,14 @@ test("a GPU runtime remains reusable after a rejected model shard", async ({
 }) => {
   await page.goto("/");
   const rejected = await page.evaluate(async () => {
-    const url = "/wasm/deepclone.js";
-    const module = await import(url);
-    await module.default();
+    const manifestResponse = await fetch("/wasm.json", { cache: "no-cache" });
+    if (!manifestResponse.ok) throw new Error("Missing /wasm.json");
+    const manifest = (await manifestResponse.json()) as {
+      js: string;
+      url: string;
+    };
+    const module = await import(manifest.js);
+    await module.default({ module_or_path: manifest.url });
     const runtime = await module.BrowserRuntime.create("{}");
     const first = runtime.builder(true);
     let rejected = false;
