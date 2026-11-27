@@ -194,21 +194,21 @@ export function ReferenceRecorder({
 
   return (
     <div className="flex flex-1 flex-col">
-      <div className="surface-card rounded-3xl p-6 sm:p-7">
-        <div className="mb-3.5 text-xs font-medium tracking-wide text-muted-foreground">
+      <div className="surface-card rounded-3xl p-6 sm:p-8 lg:p-10">
+        <div className="mb-3.5 text-xs font-medium tracking-wide text-muted-foreground sm:mb-4 sm:text-sm">
           {passage.udhrCitation}
         </div>
         <p
           data-testid="udhr-passage"
           lang={passage.bcp47}
-          className="text-[1.125rem] leading-[1.85] tracking-[-0.01em] text-pretty text-foreground sm:text-xl"
+          className="text-[1.125rem] leading-[1.85] tracking-[-0.01em] text-pretty text-foreground sm:text-xl lg:text-[1.35rem] lg:leading-[1.9]"
         >
           {passage.udhrText}
         </p>
       </div>
 
       {preview && phase === "review" ? (
-        <div className="step-enter surface-card mt-4 rounded-2xl p-4">
+        <div className="step-enter surface-card mt-4 rounded-2xl p-4 sm:p-5">
           <div className="mb-2.5 text-xs font-medium text-muted-foreground">
             {copy.reviewLabel}
           </div>
@@ -231,12 +231,12 @@ export function ReferenceRecorder({
         </p>
       ) : null}
 
-      <div className="mt-auto pt-8">
+      <div className="mt-auto pt-8 md:mt-6 md:pt-0">
         {phase === "recording" ? (
-          <div className="space-y-3">
+          <div className="space-y-3 md:flex md:items-center md:justify-between md:gap-4 md:space-y-0 md:rounded-2xl md:border md:bg-white md:px-5 md:py-3">
             <div
               role="status"
-              className="flex items-center justify-center gap-2.5 text-sm font-medium tabular-nums"
+              className="flex items-center justify-center gap-2.5 text-sm font-medium tabular-nums md:justify-start"
             >
               <span className="relative flex size-2.5">
                 <span className="record-pulse absolute inline-flex h-full w-full rounded-full bg-accent" />
@@ -247,7 +247,7 @@ export function ReferenceRecorder({
             <Button
               data-testid="stop-recording"
               size="lg"
-              className="h-14 w-full rounded-2xl bg-accent text-base font-medium text-accent-foreground hover:bg-accent/90"
+              className="h-14 w-full rounded-2xl bg-accent text-base font-medium text-accent-foreground hover:bg-accent/90 md:h-12 md:w-auto md:min-w-44 md:px-7"
               onClick={() => recorder.current?.stop()}
             >
               <StopIcon className="size-4" />
@@ -255,13 +255,13 @@ export function ReferenceRecorder({
             </Button>
           </div>
         ) : phase === "review" ? (
-          <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+          <div className="grid grid-cols-1 gap-2.5 sm:flex sm:justify-end sm:gap-3">
             <Button
               data-testid="record-again"
               variant="outline"
               size="lg"
               disabled={disabled || saving}
-              className="h-13 rounded-2xl bg-white text-base font-medium"
+              className="h-13 rounded-2xl bg-white text-base font-medium sm:w-auto sm:min-w-40 sm:px-6"
               onClick={() => void start()}
             >
               <ReloadIcon className="size-4" />
@@ -271,7 +271,7 @@ export function ReferenceRecorder({
               data-testid="complete-setup"
               size="lg"
               disabled={disabled || saving || !recorded.current}
-              className="h-13 rounded-2xl text-base font-medium"
+              className="h-13 rounded-2xl text-base font-medium sm:w-auto sm:min-w-48 sm:px-7"
               onClick={() => {
                 if (recorded.current) {
                   onSave(recorded.current, passage.udhrText, language);
@@ -283,16 +283,18 @@ export function ReferenceRecorder({
             </Button>
           </div>
         ) : (
-          <Button
-            data-testid="start-recording"
-            size="lg"
-            disabled={disabled || phase === "requesting"}
-            className="h-14 w-full rounded-2xl text-base font-medium"
-            onClick={() => void start()}
-          >
-            <MicWaveIcon />
-            {phase === "requesting" ? copy.waitingMic : copy.startRecording}
-          </Button>
+          <div className="md:flex md:justify-end">
+            <Button
+              data-testid="start-recording"
+              size="lg"
+              disabled={disabled || phase === "requesting"}
+              className="h-14 w-full rounded-2xl text-base font-medium md:h-13 md:w-auto md:min-w-52 md:px-8"
+              onClick={() => void start()}
+            >
+              <MicWaveIcon />
+              {phase === "requesting" ? copy.waitingMic : copy.startRecording}
+            </Button>
+          </div>
         )}
       </div>
     </div>
