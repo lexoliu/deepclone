@@ -19,11 +19,20 @@ struct Residual {
     squeeze: Conv<ReflectSame>,
     excite: Conv<ReflectSame>,
 }
-fn conv(w: &impl WeightSource, prefix: &str, dilation: usize) -> Result<Conv<ReflectSame>, Error> {
+fn conv(
+    w: &mut impl WeightSource,
+    prefix: &str,
+    dilation: usize,
+) -> Result<Conv<ReflectSame>, Error> {
     Conv::load(w, prefix, 1, dilation, 1, ReflectSame)
 }
 impl Residual {
-    fn load(w: &impl WeightSource, p: &str, scale: usize, dilation: usize) -> Result<Self, Error> {
+    fn load(
+        w: &mut impl WeightSource,
+        p: &str,
+        scale: usize,
+        dilation: usize,
+    ) -> Result<Self, Error> {
         Ok(Self {
             first: conv(w, &format!("{p}.tdnn1.conv"), 1)?,
             blocks: (0..scale - 1)
@@ -67,7 +76,7 @@ pub struct Speaker {
     output: Conv<ReflectSame>,
 }
 impl Speaker {
-    pub fn load(w: &impl WeightSource, c: &SpeakerConfig) -> Result<Self, Error> {
+    pub fn load(w: &mut impl WeightSource, c: &SpeakerConfig) -> Result<Self, Error> {
         if c.enc_channels.len() < 3
             || c.enc_channels.len() != c.enc_dilations.len()
             || c.enc_channels.len() != c.enc_kernel_sizes.len()

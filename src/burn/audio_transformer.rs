@@ -15,11 +15,11 @@ pub struct AttentionConfig {
     pub rope_theta: f32,
 }
 pub(crate) trait Norm: Sized {
-    fn load(w: &impl WeightSource, p: &str, epsilon: f32) -> Result<Self, Error>;
+    fn load(w: &mut impl WeightSource, p: &str, epsilon: f32) -> Result<Self, Error>;
     fn apply(&self, x: Tensor<3>) -> Tensor<3>;
 }
 impl Norm for RmsNorm {
-    fn load(w: &impl WeightSource, p: &str, e: f32) -> Result<Self, Error> {
+    fn load(w: &mut impl WeightSource, p: &str, e: f32) -> Result<Self, Error> {
         Self::load(w, p, e)
     }
     fn apply(&self, x: Tensor<3>) -> Tensor<3> {
@@ -27,7 +27,7 @@ impl Norm for RmsNorm {
     }
 }
 impl Norm for LayerNorm {
-    fn load(w: &impl WeightSource, p: &str, e: f32) -> Result<Self, Error> {
+    fn load(w: &mut impl WeightSource, p: &str, e: f32) -> Result<Self, Error> {
         Self::load(w, p, e)
     }
     fn apply(&self, x: Tensor<3>) -> Tensor<3> {
@@ -35,7 +35,7 @@ impl Norm for LayerNorm {
     }
 }
 pub(crate) trait FeedForward: Sized {
-    fn load(w: &impl WeightSource, p: &str) -> Result<Self, Error>;
+    fn load(w: &mut impl WeightSource, p: &str) -> Result<Self, Error>;
     fn apply(&self, x: Tensor<3>) -> Tensor<3>;
 }
 pub(crate) struct Gated {
@@ -43,7 +43,7 @@ pub(crate) struct Gated {
     down: Linear,
 }
 impl FeedForward for Gated {
-    fn load(w: &impl WeightSource, p: &str) -> Result<Self, Error> {
+    fn load(w: &mut impl WeightSource, p: &str) -> Result<Self, Error> {
         Ok(Self {
             gate_up: JoinedLinear::load(w, ["gate", "up"].map(|name| format!("{p}.{name}_proj")))?,
             down: Linear::load(w, &format!("{p}.down_proj"))?.cast(DType::F32),
@@ -61,7 +61,7 @@ pub(crate) struct Gelu {
     last: Linear,
 }
 impl FeedForward for Gelu {
-    fn load(w: &impl WeightSource, p: &str) -> Result<Self, Error> {
+    fn load(w: &mut impl WeightSource, p: &str) -> Result<Self, Error> {
         Ok(Self {
             first: Linear::load(w, &format!("{p}.fc1"))?,
             last: Linear::load(w, &format!("{p}.fc2"))?,
@@ -81,7 +81,7 @@ struct Layer<N, F> {
     mlp_scale: Tensor<1>,
 }
 impl<N: Norm, F: FeedForward> Layer<N, F> {
-    fn load(w: &impl WeightSource, p: &str, e: f32) -> Result<Self, Error> {
+    fn load(w: &mut impl WeightSource, p: &str, e: f32) -> Result<Self, Error> {
         Ok(Self {
             input: N::load(w, &format!("{p}.input_layernorm"), e)?,
             post: N::load(w, &format!("{p}.post_attention_layernorm"), e)?,
@@ -217,7 +217,7 @@ pub(crate) struct AudioHistory {
 }
 impl<N: Norm, F: FeedForward> AudioTransformer<N, F> {
     pub fn load(
-        w: &impl WeightSource,
+        w: &mut impl WeightSource,
         p: &str,
         c: AttentionConfig,
         epsilon: f32,
@@ -242,10 +242,15 @@ impl<N: Norm, F: FeedForward> AudioTransformer<N, F> {
             c.head_dim,
             c.rope_theta,
         ));
+        let mut layers = Vec::with_capacity(c.num_hidden_layers);
+        for i in 0..c.num_hidden_layers {
+            layers.push(Layer::load(w, &format!("{p}.layers.{i}"), epsilon)?);
+            w.device()
+                .flush()
+                .map_err(|error| Error::Execution(error.to_string()))?;
+        }
         Ok(Self {
-            layers: (0..c.num_hidden_layers)
-                .map(|i| Layer::load(w, &format!("{p}.layers.{i}"), epsilon))
-                .collect::<Result<_, _>>()?,
+            layers,
             config: c,
             window,
             rotary,
@@ -441,13 +446,13 @@ mod tests {
         fn dtype(&self) -> DType {
             DType::F32
         }
-        fn tensor<const D: usize>(&self, name: &str) -> Result<Tensor<D>, Error> {
+        fn tensor<const D: usize>(&mut self, name: &str) -> Result<Tensor<D>, Error> {
             Err(Error::Tensor {
                 name: name.into(),
                 reason: "unused".into(),
             })
         }
-        fn optional<const D: usize>(&self, _name: &str) -> Result<Option<Tensor<D>>, Error> {
+        fn optional<const D: usize>(&mut self, _name: &str) -> Result<Option<Tensor<D>>, Error> {
             Ok(None)
         }
     }
@@ -463,8 +468,14 @@ mod tests {
             rope_theta: 10000.0,
         };
         assert!(
-            AudioTransformer::<RmsNorm, Gated>::load(&UnusedWeights, "test", config, 1e-6, Some(0))
-                .is_err()
+            AudioTransformer::<RmsNorm, Gated>::load(
+                &mut UnusedWeights,
+                "test",
+                config,
+                1e-6,
+                Some(0)
+            )
+            .is_err()
         );
     }
 }

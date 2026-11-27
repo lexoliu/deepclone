@@ -26,7 +26,7 @@ struct Residual {
 }
 impl Residual {
     fn load(
-        w: &impl WeightSource,
+        w: &mut impl WeightSource,
         p: &str,
         dilation: usize,
         shortcut: bool,
@@ -67,7 +67,7 @@ struct Quantizer {
     codebook_norms: Vec<Tensor<2>>,
 }
 impl Quantizer {
-    fn load(w: &impl WeightSource, p: &str, groups: usize) -> Result<Self, Error> {
+    fn load(w: &mut impl WeightSource, p: &str, groups: usize) -> Result<Self, Error> {
         let codebooks = (0..groups)
             .map(|i| {
                 let p = format!("{p}.layers.{i}.codebook");
@@ -126,7 +126,7 @@ pub struct CodecEncoder {
 }
 impl CodecEncoder {
     pub fn load(
-        w: &impl WeightSource,
+        w: &mut impl WeightSource,
         c: &EncoderConfig,
         groups: usize,
         downsample_rate: usize,
@@ -167,6 +167,9 @@ impl CodecEncoder {
             )?;
             index += 1;
             stages.push(Stage { residuals, down });
+            w.device()
+                .flush()
+                .map_err(|error| Error::Execution(error.to_string()))?;
         }
         index += 1;
         Ok(Self {
@@ -246,12 +249,12 @@ mod tests {
             .unwrap();
             let device = Device::wgpu_options().init_async().await.unwrap();
             let bytes = std::fs::read(source.join("speech_tokenizer/model.safetensors")).unwrap();
-            let w = Weights::new(&bytes, device.clone(), DType::F32).unwrap();
+            let mut w = Weights::new(&bytes, device.clone(), DType::F32).unwrap();
             let bytes = std::fs::read(fixture.join("audio-fixtures.safetensors")).unwrap();
             let data = Weights::new(&bytes, device, DType::F32).unwrap();
             let c = serde_json::from_value(config["encoder_config"].clone()).unwrap();
             let encoder = CodecEncoder::load(
-                &w,
+                &mut w,
                 &c,
                 config["encoder_valid_num_quantizers"].as_u64().unwrap() as usize,
                 config["encode_downsample_rate"].as_u64().unwrap() as usize,

@@ -27,7 +27,7 @@ pub(crate) struct Linear {
     bias: Option<Tensor<1>>,
 }
 impl Linear {
-    pub fn load(weights: &impl WeightSource, prefix: &str) -> Result<Self, Error> {
+    pub fn load(weights: &mut impl WeightSource, prefix: &str) -> Result<Self, Error> {
         let bias = weights.optional(&format!("{prefix}.bias"))?;
         if let Some(qweight) = weights.optional_packed::<2>(&format!("{prefix}.qweight_i4"))? {
             return Self::from_quantized(weights, prefix, qweight, 4, bias);
@@ -45,7 +45,7 @@ impl Linear {
         })
     }
     fn from_quantized(
-        weights: &impl WeightSource,
+        weights: &mut impl WeightSource,
         prefix: &str,
         qweight: Tensor<2, Int>,
         bits: u8,
@@ -131,7 +131,7 @@ pub(crate) struct JoinedLinear<const N: usize> {
     projection: Linear,
 }
 impl<const N: usize> JoinedLinear<N> {
-    pub fn load(weights: &impl WeightSource, prefixes: [String; N]) -> Result<Self, Error> {
+    pub fn load(weights: &mut impl WeightSource, prefixes: [String; N]) -> Result<Self, Error> {
         let layers = prefixes
             .iter()
             .map(|p| Linear::load(weights, p))
@@ -216,7 +216,11 @@ pub(crate) struct RmsNorm {
     epsilon: f32,
 }
 impl RmsNorm {
-    pub fn load(weights: &impl WeightSource, prefix: &str, epsilon: f32) -> Result<Self, Error> {
+    pub fn load(
+        weights: &mut impl WeightSource,
+        prefix: &str,
+        epsilon: f32,
+    ) -> Result<Self, Error> {
         Ok(Self {
             weight: weights.tensor(&format!("{prefix}.weight"))?,
             epsilon,
@@ -314,7 +318,7 @@ impl<P: Padding> Conv<P> {
         }
     }
     pub fn load(
-        weights: &impl WeightSource,
+        weights: &mut impl WeightSource,
         prefix: &str,
         stride: usize,
         dilation: usize,
@@ -527,7 +531,11 @@ pub(crate) struct LayerNorm {
     epsilon: f64,
 }
 impl LayerNorm {
-    pub fn load(weights: &impl WeightSource, prefix: &str, epsilon: f32) -> Result<Self, Error> {
+    pub fn load(
+        weights: &mut impl WeightSource,
+        prefix: &str,
+        epsilon: f32,
+    ) -> Result<Self, Error> {
         Ok(Self {
             weight: weights.tensor(&format!("{prefix}.weight"))?,
             bias: weights.optional(&format!("{prefix}.bias"))?,
@@ -545,7 +553,11 @@ pub(crate) struct TransposeConv {
     stride: usize,
 }
 impl TransposeConv {
-    pub fn load(weights: &impl WeightSource, prefix: &str, stride: usize) -> Result<Self, Error> {
+    pub fn load(
+        weights: &mut impl WeightSource,
+        prefix: &str,
+        stride: usize,
+    ) -> Result<Self, Error> {
         let weight = weights.tensor::<3>(&format!("{prefix}.weight"))?;
         // Pack `[C_in, C_out, K]` to contiguous `[K, C_out, C_in]` once at load
         // so phase-grouped transposed convolutions read coalesced input channels.

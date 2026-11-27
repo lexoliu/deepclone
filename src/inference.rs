@@ -266,6 +266,11 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Engine<B, T, S> {
         self.decoder_contract.sample_rate
     }
 
+    #[cfg(all(feature = "browser", target_arch = "wasm32"))]
+    pub(crate) fn backend_mut(&mut self) -> &mut B {
+        &mut self.generator.networks
+    }
+
     pub fn tokenize(&self, text: &str) -> Result<Vec<u32>, Error> {
         Ok(self
             .tokenizer
@@ -273,6 +278,102 @@ impl<B: Model, T: TokenSampler, S: TokenSampler> Engine<B, T, S> {
             .map_err(|e| Error::Tokenizer(e.to_string()))?
             .get_ids()
             .to_vec())
+    }
+
+    /// Collect every text token identifier that synthesis of `input_text` with
+    /// `reference` can request from the text embedding table.
+    pub fn required_text_tokens(
+        &self,
+        reference: &Reference<B::Hidden>,
+        input_text: &str,
+        options: &SynthesisOptions,
+    ) -> Result<Vec<u32>, Error> {
+        let mut tokens = Vec::new();
+        tokens.push(self.config.tts_pad_token_id);
+        tokens.push(self.config.tts_bos_token_id);
+        tokens.push(self.config.tts_eos_token_id);
+        tokens.extend(self.tokenize("<|im_start|>assistant\n")?);
+        tokens.extend_from_slice(&reference.text);
+        tokens.extend(self.tokenize(input_text)?);
+
+        let mut splitter = crate::utterances::Splitter::new(
+            options.text_segment_tokens.get(),
+            options.unstable_text_bytes.get(),
+        );
+        let mut pending: VecDeque<String> = splitter
+            .push(input_text, &self.tokenizer)?
+            .into_iter()
+            .collect();
+        pending.extend(splitter.finish(&self.tokenizer)?);
+
+        let mut text_buffer =
+            crate::text::TextBuffer::new(&self.tokenizer, options.unstable_text_bytes.get());
+        let mut current = String::new();
+        let capacity = options
+            .text_segment_tokens
+            .get()
+            .min(options.maximum_frames.get());
+
+        while let Some(next) = pending.pop_front() {
+            if current.is_empty() && next.trim().is_empty() {
+                continue;
+            }
+            tokens.extend(self.tokenize(&next)?);
+            let mut combined = current.clone();
+            combined.push_str(&next);
+            let count = self
+                .tokenizer
+                .encode(combined.as_str(), false)
+                .map_err(|e| Error::Tokenizer(e.to_string()))?
+                .len();
+            if count > capacity && !current.is_empty() {
+                tokens.extend(text_buffer.finish()?);
+                current.clear();
+                pending.push_front(next);
+                continue;
+            }
+            let paragraph = combined.contains("\n\n")
+                || combined.contains("\r\n\r\n")
+                || combined.contains('\u{2029}');
+            tokens.extend(text_buffer.push(&next)?);
+            current.push_str(&next);
+            if paragraph {
+                tokens.extend(text_buffer.finish()?);
+                current.clear();
+            }
+        }
+        tokens.extend(text_buffer.finish()?);
+        tokens.sort_unstable();
+        tokens.dedup();
+        Ok(tokens)
+    }
+
+    pub async fn reference_from_parts(
+        &mut self,
+        speaker: B::Hidden,
+        codes: Vec<Vec<u32>>,
+        transcript: &str,
+    ) -> Result<Reference<B::Hidden>, Error> {
+        if transcript.is_empty() {
+            return Err(Error::Contract(
+                "reference exceeds encoder capacity or lacks a transcript",
+            ));
+        }
+        if codes.is_empty()
+            || codes
+                .iter()
+                .any(|frame| frame.len() != self.encoder_contract.code_groups)
+        {
+            return Err(Error::Contract(
+                "reference codes do not match model code groups",
+            ));
+        }
+        self.codec.prepare_reference(&codes).await?;
+        Ok(Reference {
+            codes,
+            speaker,
+            text: self.tokenize(transcript)?,
+        })
     }
 
     pub async fn reference(

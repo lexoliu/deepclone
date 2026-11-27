@@ -414,11 +414,24 @@ test("published wasm glue and security headers honor the browser inference contr
     const url = "/wasm/deepclone.js";
     const module = await import(url);
     await module.default({ module_or_path: manifest.url });
+    const hasher = new module.Sha256Hasher();
+    hasher.update(new Uint8Array([97, 98]));
+    hasher.update(new Uint8Array([99]));
+    const abcDigest = hasher.finalize();
     return [
       manifest.url,
       typeof module.BrowserRuntime.create,
+      typeof module.BrowserRuntime.prototype.reclaim_memory,
+      typeof module.ModelBuilder.prototype.upload_tensor,
+      typeof module.ModelBuilder.prototype.finish_conditioning,
+      typeof module.ModelBuilder.prototype.finish_synthesis,
       typeof module.TextInput,
       typeof module.BrowserVoice,
+      typeof module.BrowserVoice.prototype.set_reference_conditioning,
+      typeof module.BrowserVoice.prototype.required_text_tokens,
+      typeof module.BrowserVoice.prototype.set_text_embeddings,
+      typeof module.BrowserConditioner,
+      abcDigest,
     ];
   });
   expect(exports).toEqual([
@@ -426,6 +439,15 @@ test("published wasm glue and security headers honor the browser inference contr
     "function",
     "function",
     "function",
+    "function",
+    "function",
+    "function",
+    "function",
+    "function",
+    "function",
+    "function",
+    "function",
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
   ]);
 });
 
@@ -488,15 +510,29 @@ test("background preparation stays usable, reuses conditioning, re-conditions on
           );
         }
         if (command.kind === "reference") {
+          const refCommand = command as {
+            conditioning?: { modelSha256: string };
+          };
           Object.assign(window, {
             referenceCount:
               ((window as unknown as { referenceCount?: number })
                 .referenceCount ?? 0) + 1,
+            lastReceivedConditioning:
+              refCommand.conditioning?.modelSha256 ?? null,
           });
         }
         const event =
           command.kind === "reference"
-            ? { kind: "conditioned" }
+            ? {
+                kind: "conditioned",
+                conditioning: {
+                  modelSha256: "0".repeat(64),
+                  speaker: new Float32Array([0.5]),
+                  speakerShape: [1, 1, 1],
+                  codes: new Uint32Array([1, 2]),
+                  groups: 2,
+                },
+              }
             : command.kind === "start"
               ? { kind: "started" }
               : command.kind === "text"
@@ -591,6 +627,28 @@ test("background preparation stays usable, reuses conditioning, re-conditions on
     ),
   ).toBe(1);
 
+  // Reloading restores cached conditioning from IndexedDB and forwards it to the worker.
+  await page.reload();
+  await page.waitForFunction(
+    () =>
+      (window as unknown as { preparationStarted: boolean }).preparationStarted,
+  );
+  await page.evaluate(() =>
+    (
+      window as unknown as { completePreparation: () => void }
+    ).completePreparation(),
+  );
+  await page.getByTestId("prompt-input").fill(CJK_SAMPLE);
+  await page.getByTestId("synthesize-button").click();
+  await expect(page.getByTestId("download-wav")).toBeVisible();
+  expect(
+    await page.evaluate(
+      () =>
+        (window as unknown as { lastReceivedConditioning: string | null })
+          .lastReceivedConditioning,
+    ),
+  ).toBe("0".repeat(64));
+
   // Re-running setup and saving a new recording triggers fresh conditioning.
   await page.getByTestId("re-setup").click();
   await page.getByTestId("continue-step-2").click();
@@ -609,6 +667,13 @@ test("background preparation stays usable, reuses conditioning, re-conditions on
       () => (window as unknown as { referenceCount: number }).referenceCount,
     ),
   ).toBe(2);
+  expect(
+    await page.evaluate(
+      () =>
+        (window as unknown as { lastReceivedConditioning: string | null })
+          .lastReceivedConditioning,
+    ),
+  ).toBeNull();
 });
 
 test("a crashed worker is discarded and the next request creates a fresh worker", async ({

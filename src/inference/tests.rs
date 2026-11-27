@@ -160,6 +160,7 @@ struct TestModel {
     ignore_eos: bool,
     generation_resets: usize,
     frame_inputs: Vec<Vec<(Vec<u32>, u32)>>,
+    requested_text: Vec<u32>,
 }
 impl Model for TestModel {
     type Hidden = u32;
@@ -185,6 +186,7 @@ impl Model for TestModel {
     }
     fn reset_predictor(&mut self) {}
     fn text(&mut self, token: u32) -> Result<u32, Error> {
+        self.requested_text.push(token);
         Ok(token)
     }
     fn code(&mut self, _: usize, token: u32) -> Result<u32, Error> {
@@ -266,6 +268,7 @@ fn engine() -> Engine<TestModel, Greedy, Greedy> {
             ignore_eos: false,
             generation_resets: 0,
             frame_inputs: Vec::new(),
+            requested_text: Vec::new(),
         },
         TestCodec::default(),
         Assets {
@@ -573,6 +576,39 @@ fn incremental_cjk_and_english_inputs_preserve_context_boundaries_and_pcm() {
                 "{text}"
             );
             assert_eq!(samples, expected.waveform.samples, "{text}");
+        }
+    });
+}
+
+#[test]
+fn required_text_tokens_covers_every_synthesized_token_across_cjk_and_rollovers() {
+    futures_lite::future::block_on(async {
+        for text in [
+            "法律。\n\n我们相信规则，明天一起出发！",
+            "今日は静かな道を歩きます。明日も一緒に出かけましょう。",
+            "오늘은 조용한 길을 걸어요. 내일도 함께 걸어요!",
+            "Hello there. ".repeat(40).as_str(),
+        ] {
+            let mut engine = engine();
+            let reference = engine
+                .reference_from_parts(0, vec![vec![0, 0]; 2], "a")
+                .await
+                .unwrap();
+            let opts = options();
+            let required = engine
+                .required_text_tokens(&reference, text, &opts)
+                .unwrap();
+            engine
+                .synthesize(&reference, text, "auto", opts)
+                .await
+                .unwrap();
+            assert!(!engine.generator.networks.requested_text.is_empty());
+            for &id in &engine.generator.networks.requested_text {
+                assert!(
+                    required.binary_search(&id).is_ok(),
+                    "missing required text token {id} for input {text:?}"
+                );
+            }
         }
     });
 }

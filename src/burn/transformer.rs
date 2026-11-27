@@ -29,7 +29,7 @@ struct Layer {
 }
 impl Layer {
     fn load(
-        w: &impl WeightSource,
+        w: &mut impl WeightSource,
         prefix: &str,
         c: &DecoderConfig,
         capacity: usize,
@@ -167,7 +167,7 @@ pub struct Decoder {
 }
 impl Decoder {
     pub fn load(
-        weights: &impl WeightSource,
+        weights: &mut impl WeightSource,
         prefix: &str,
         config: DecoderConfig,
         capacity: std::num::NonZeroUsize,
@@ -200,10 +200,23 @@ impl Decoder {
             ],
             0,
         );
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            layers.push(Layer::load(
+                weights,
+                &format!("{prefix}.layers.{i}"),
+                &config,
+                capacity,
+            )?);
+            // Submit per-layer concatenations so consumed source buffers return
+            // to CubeCL's allocator before the next layer allocates.
+            weights
+                .device()
+                .flush()
+                .map_err(|error| Error::Execution(error.to_string()))?;
+        }
         Ok(Self {
-            layers: (0..config.num_hidden_layers)
-                .map(|i| Layer::load(weights, &format!("{prefix}.layers.{i}"), &config, capacity))
-                .collect::<Result<_, _>>()?,
+            layers,
             norm: RmsNorm::load(weights, &format!("{prefix}.norm"), config.rms_norm_eps)?,
             rotary,
             config,

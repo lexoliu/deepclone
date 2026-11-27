@@ -38,10 +38,10 @@ fn wgpu_conditioning_and_codec_match_official_fp32() {
         let bytes = std::fs::read(fixture.join("audio-fixtures.safetensors")).unwrap();
         let data = Weights::new(&bytes, device.clone(), DType::F32).unwrap();
         let weights = std::fs::read(source.join("model.safetensors")).unwrap();
-        let w = Weights::new(&weights, device.clone(), DType::F32).unwrap();
+        let mut w = Weights::new(&weights, device.clone(), DType::F32).unwrap();
         let c: SpeakerConfig =
             serde_json::from_value(config["speaker_encoder_config"].clone()).unwrap();
-        let speaker = Speaker::load(&w, &c).unwrap();
+        let speaker = Speaker::load(&mut w, &c).unwrap();
         drop(w);
         drop(weights);
         compare(
@@ -52,10 +52,10 @@ fn wgpu_conditioning_and_codec_match_official_fp32() {
         .await;
         drop(speaker);
         let weights = std::fs::read(source.join("speech_tokenizer/model.safetensors")).unwrap();
-        let w = Weights::new(&weights, device, DType::F32).unwrap();
+        let mut w = Weights::new(&weights, device, DType::F32).unwrap();
         let c: EncoderConfig = serde_json::from_value(codec["encoder_config"].clone()).unwrap();
         let encoder = CodecEncoder::load(
-            &w,
+            &mut w,
             &c,
             codec["encoder_valid_num_quantizers"].as_u64().unwrap() as usize,
             codec["encode_downsample_rate"].as_u64().unwrap() as usize,
@@ -87,7 +87,7 @@ fn wgpu_conditioning_and_codec_match_official_fp32() {
         drop(encoder);
         let c: CodecDecoderConfig =
             serde_json::from_value(codec["decoder_config"].clone()).unwrap();
-        let decoder = CodecDecoder::load(&w, &c).unwrap();
+        let decoder = CodecDecoder::load(&mut w, &c).unwrap();
         for frames in [8, 80] {
             compare(
                 decoder.forward(data.indices(&format!("codes.{frames}")).unwrap()),
