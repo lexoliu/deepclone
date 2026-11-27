@@ -12,8 +12,10 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Textarea } from "@/components/ui/textarea";
 import { isCurrentConditioning } from "@/runtime/contracts";
+import { useHistory } from "@/runtime/use-history";
 import { useReference } from "@/runtime/use-reference";
 import { useVoice } from "@/runtime/use-voice";
+import { HistoryList } from "./HistoryList";
 import {
   COPY,
   LANGUAGES,
@@ -44,6 +46,7 @@ function VoiceMark() {
 
 export default function App() {
   const reference = useReference();
+  const history = useHistory();
   const savedConditioning = isCurrentConditioning(reference.value?.conditioning)
     ? reference.value.conditioning
     : undefined;
@@ -71,11 +74,12 @@ export default function App() {
     : resolveLanguage(reference.value?.language);
   const copy = COPY[activeLanguage];
 
+  const bcp47 =
+    LANGUAGES.find((entry) => entry.id === activeLanguage)?.bcp47 ?? "en";
+
   useEffect(() => {
-    const bcp47 =
-      LANGUAGES.find((entry) => entry.id === activeLanguage)?.bcp47 ?? "en";
     document.documentElement.lang = bcp47;
-  }, [activeLanguage]);
+  }, [bcp47]);
 
   const supported =
     typeof navigator !== "undefined" &&
@@ -98,6 +102,9 @@ export default function App() {
       savedConditioning,
       (conditioning) =>
         reference.saveConditioning(file, transcript, conditioning),
+      (output) => {
+        void history.add(output);
+      },
     );
   }
 
@@ -134,7 +141,8 @@ export default function App() {
         ? copy.errorSaveFailed
         : null;
 
-  const errorMessage = voiceError || referenceError;
+  const historyError = history.errorKind ? copy.errorHistoryFailed : null;
+  const errorMessage = voiceError || referenceError || historyError;
   const showPreparation = voice.busy && !voice.loaded;
   const showOutputCard =
     Boolean(voice.audio) || voice.busy || voice.phase !== "ready";
@@ -480,6 +488,18 @@ export default function App() {
                   </Button>
                 )}
               </div>
+
+              <HistoryList
+                items={history.items}
+                bcp47={bcp47}
+                copy={copy}
+                onDelete={(id) => {
+                  void history.remove(id);
+                }}
+                onClear={() => {
+                  void history.clear();
+                }}
+              />
             </section>
           )}
         </main>

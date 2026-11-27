@@ -187,6 +187,11 @@ export interface UiCopy {
   errorSaveFailed: string;
   downloadWav: string;
   generatedDuration: (seconds: string) => string;
+  historyTitle: string;
+  clearHistory: string;
+  deleteHistoryItem: string;
+  historyPartial: string;
+  errorHistoryFailed: string;
 }
 
 export const COPY: Record<LanguageId, UiCopy> = {
@@ -239,6 +244,11 @@ export const COPY: Record<LanguageId, UiCopy> = {
     errorSaveFailed: "无法在此设备上保存你的声音，请重试。",
     downloadWav: "下载 WAV",
     generatedDuration: (s) => `已生成 ${s}s`,
+    historyTitle: "历史记录",
+    clearHistory: "清空历史",
+    deleteHistoryItem: "删除这条记录",
+    historyPartial: "部分生成",
+    errorHistoryFailed: "无法更新历史记录，请重试。",
   },
   English: {
     stepIndicator: (current, total) => `Step ${current} of ${total}`,
@@ -296,6 +306,11 @@ export const COPY: Record<LanguageId, UiCopy> = {
       "Your voice could not be saved on this device. Please try again.",
     downloadWav: "Download WAV",
     generatedDuration: (s) => `${s}s generated`,
+    historyTitle: "History",
+    clearHistory: "Clear all",
+    deleteHistoryItem: "Delete recording",
+    historyPartial: "Partial",
+    errorHistoryFailed: "History could not be updated on this device.",
   },
   Japanese: {
     stepIndicator: (current, total) => `ステップ ${current} / ${total}`,
@@ -350,6 +365,11 @@ export const COPY: Record<LanguageId, UiCopy> = {
     errorSaveFailed: "この端末に声を保存できませんでした。再試行してください。",
     downloadWav: "WAV を保存",
     generatedDuration: (s) => `${s}s 生成`,
+    historyTitle: "履歴",
+    clearHistory: "すべて削除",
+    deleteHistoryItem: "この履歴を削除",
+    historyPartial: "途中まで",
+    errorHistoryFailed: "履歴を更新できませんでした。",
   },
   Korean: {
     stepIndicator: (current, total) => `${current} / ${total}단계`,
@@ -406,6 +426,11 @@ export const COPY: Record<LanguageId, UiCopy> = {
       "이 기기에 목소리를 저장할 수 없습니다. 다시 시도해 주세요.",
     downloadWav: "WAV 다운로드",
     generatedDuration: (s) => `${s}s 생성됨`,
+    historyTitle: "기록",
+    clearHistory: "전체 삭제",
+    deleteHistoryItem: "기록 삭제",
+    historyPartial: "일부 생성",
+    errorHistoryFailed: "기록을 업데이트할 수 없습니다.",
   },
   French: {
     stepIndicator: (current, total) => `Étape ${current} sur ${total}`,
@@ -463,6 +488,11 @@ export const COPY: Record<LanguageId, UiCopy> = {
       "Impossible d’enregistrer votre voix sur cet appareil. Réessayez.",
     downloadWav: "Télécharger WAV",
     generatedDuration: (s) => `${s}s générées`,
+    historyTitle: "Historique",
+    clearHistory: "Tout effacer",
+    deleteHistoryItem: "Supprimer l’enregistrement",
+    historyPartial: "Partiel",
+    errorHistoryFailed: "Impossible de mettre à jour l’historique.",
   },
   German: {
     stepIndicator: (current, total) => `Schritt ${current} von ${total}`,
@@ -521,6 +551,11 @@ export const COPY: Record<LanguageId, UiCopy> = {
       "Ihre Stimme konnte auf diesem Gerät nicht gespeichert werden. Bitte erneut versuchen.",
     downloadWav: "WAV herunterladen",
     generatedDuration: (s) => `${s}s erzeugt`,
+    historyTitle: "Verlauf",
+    clearHistory: "Alle löschen",
+    deleteHistoryItem: "Eintrag löschen",
+    historyPartial: "Unvollständig",
+    errorHistoryFailed: "Der Verlauf konnte nicht aktualisiert werden.",
   },
   Spanish: {
     stepIndicator: (current, total) => `Paso ${current} de ${total}`,
@@ -578,6 +613,11 @@ export const COPY: Record<LanguageId, UiCopy> = {
       "No se pudo guardar tu voz en este dispositivo. Inténtalo de nuevo.",
     downloadWav: "Descargar WAV",
     generatedDuration: (s) => `${s}s generados`,
+    historyTitle: "Historial",
+    clearHistory: "Borrar todo",
+    deleteHistoryItem: "Eliminar grabación",
+    historyPartial: "Parcial",
+    errorHistoryFailed: "No se pudo actualizar el historial.",
   },
   Italian: {
     stepIndicator: (current, total) => `Passaggio ${current} di ${total}`,
@@ -635,6 +675,11 @@ export const COPY: Record<LanguageId, UiCopy> = {
       "Impossibile salvare la tua voce su questo dispositivo. Riprova.",
     downloadWav: "Scarica WAV",
     generatedDuration: (s) => `${s}s generati`,
+    historyTitle: "Cronologia",
+    clearHistory: "Cancella tutto",
+    deleteHistoryItem: "Elimina registrazione",
+    historyPartial: "Parziale",
+    errorHistoryFailed: "Impossibile aggiornare la cronologia.",
   },
   Portuguese: {
     stepIndicator: (current, total) => `Passo ${current} de ${total}`,
@@ -692,6 +737,11 @@ export const COPY: Record<LanguageId, UiCopy> = {
       "Não foi possível salvar sua voz neste dispositivo. Tente novamente.",
     downloadWav: "Baixar WAV",
     generatedDuration: (s) => `${s}s gerados`,
+    historyTitle: "Histórico",
+    clearHistory: "Limpar tudo",
+    deleteHistoryItem: "Excluir gravação",
+    historyPartial: "Parcial",
+    errorHistoryFailed: "Não foi possível atualizar o histórico.",
   },
   Russian: {
     stepIndicator: (current, total) => `Шаг ${current} из ${total}`,
@@ -750,5 +800,10 @@ export const COPY: Record<LanguageId, UiCopy> = {
       "Не удалось сохранить ваш голос на этом устройстве. Повторите попытку.",
     downloadWav: "Скачать WAV",
     generatedDuration: (s) => `Создано ${s}s`,
+    historyTitle: "История",
+    clearHistory: "Очистить всё",
+    deleteHistoryItem: "Удалить запись",
+    historyPartial: "Частично",
+    errorHistoryFailed: "Не удалось обновить историю.",
   },
 };
